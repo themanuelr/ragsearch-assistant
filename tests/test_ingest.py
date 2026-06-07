@@ -20,6 +20,7 @@ import pytest
 import pdfplumber
 
 from scripts.ingest import (
+    PAPER_JSON_KEYS,
     _compute_registry_key,
     _detect_layout,
     _extract_with_llm,
@@ -203,6 +204,29 @@ def test_registry_dedup(sample_pdf_path):
     assert len(registry) == 1, (
         f"registry must contain exactly 1 entry after two ingests of the same paper; "
         f"got {len(registry)}: {list(registry.keys())}"
+    )
+
+
+def test_registry_dedup_schema_match(sample_pdf_path):
+    """
+    REG-02 schema: Second ingest returns a result whose keys equal exactly PAPER_JSON_KEYS.
+
+    Guards against D-14 metadata fields (summary, key_findings, projects, vault_note)
+    leaking through the cache-hit path. The cache-hit return must filter the registry
+    entry to only the 11 canonical PaperJSON keys.
+    """
+    # First ingest — populates registry
+    result1 = extract_paper(sample_pdf_path)
+    # Second ingest — must return from cache
+    result2 = extract_paper(sample_pdf_path)
+
+    assert result1 == result2, (
+        "Second ingest must return cached entry unchanged — REG-02"
+    )
+    assert set(result2.keys()) == set(PAPER_JSON_KEYS), (
+        f"Cache-hit return must contain exactly PAPER_JSON_KEYS keys; "
+        f"extra keys: {set(result2.keys()) - set(PAPER_JSON_KEYS)}, "
+        f"missing keys: {set(PAPER_JSON_KEYS) - set(result2.keys())}"
     )
 
 
