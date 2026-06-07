@@ -81,9 +81,18 @@ def _is_scanned(pdf_path: str, threshold: int = SCANNED_CHAR_THRESHOLD) -> bool:
 def _detect_layout(page) -> bool:
     """Return True if page appears to be two-column (D-06 heuristic).
 
-    # Plan 03 implements two-column detection here
+    Crops to the bottom 70% of the page (Pitfall 2 mitigation: the single-column
+    title block at the top of two-column papers would otherwise suppress detection).
+    Counts words whose x0 exceeds the page midpoint. Returns True when the right-half
+    word ratio exceeds TWO_COL_RIGHT_RATIO (0.30).
     """
-    return False
+    region = page.crop((0, page.height * 0.3, page.width, page.height))
+    words = region.extract_words()
+    if not words:
+        return False
+    mid = page.width / 2
+    right_count = sum(1 for w in words if w["x0"] > mid)
+    return (right_count / len(words)) > TWO_COL_RIGHT_RATIO
 
 
 def _extract_text_pages(pdf, is_two_col: bool) -> list[str]:
