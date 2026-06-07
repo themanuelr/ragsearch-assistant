@@ -475,7 +475,11 @@ def extract_paper(pdf_path: str) -> dict:
         "projects": [project_name],
         "vault_note": None,
     })
-    _write_registry_entry(registry_path, key, registry_entry)
+    # Step 10: write registry entry with consistent error reporting
+    try:
+        _write_registry_entry(registry_path, key, registry_entry)
+    except Exception as e:
+        _fail(f"cannot write registry entry '{key}': {e}")
 
     # Return full PaperJSON (D-10 — 10-key schema returned to Claude)
     return paper_json
