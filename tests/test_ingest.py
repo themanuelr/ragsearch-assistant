@@ -172,7 +172,7 @@ def test_registry_write(sample_pdf_path):
         "registry entry title must match PaperJSON title"
 
 
-def test_registry_dedup(sample_pdf_path):
+def test_registry_dedup(sample_pdf_path, _tmp_config):
     """
     REG-02: Second ingest of the same paper returns the cached entry and skips extraction.
 
@@ -197,8 +197,10 @@ def test_registry_dedup(sample_pdf_path):
         "Second ingest must return the cached registry entry unchanged — REG-02"
     )
 
-    # Read the registry that extract_paper wrote to (via config)
-    config = _load_config(_find_config())
+    # Read the registry via the fixture config path (not unpatched _find_config) so we
+    # always inspect the temp registry created by the _tmp_config autouse fixture,
+    # not the real project registry.
+    config = _load_config(_tmp_config)
     with open(config["registry_path"], "r", encoding="utf-8") as f:
         registry = json.load(f)
     assert len(registry) == 1, (
