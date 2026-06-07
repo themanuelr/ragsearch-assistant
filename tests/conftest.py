@@ -34,6 +34,34 @@ def scanned_pdf_path():
 
 
 @pytest.fixture(autouse=True)
+def _mock_llm(monkeypatch):
+    """Stub _extract_with_llm so tests run without a live Ollama server.
+
+    Prevents each integration test from hanging for 300 s waiting for a
+    timeout when Ollama is not running on a CI runner (WR-03 fix).
+
+    Tests that specifically exercise the LLM network path
+    (test_extract_with_llm_*) call _extract_with_llm directly via their own
+    imported reference and additionally patch urlopen themselves, so this
+    autouse stub has no practical effect on them.
+    """
+    def _stub(pages_text):
+        return {
+            "title": "Sample Single Column Paper",
+            "authors": ["Alice Author", "Bob Collaborator"],
+            "abstract": "A test abstract.",
+            "sections": [
+                {"title": "Section A", "body": "Left column content."},
+                {"title": "Section B", "body": "Right column content."},
+            ],
+            "bibliography": None,
+            "figures": None,
+        }
+    monkeypatch.setattr("scripts.ingest._extract_with_llm", _stub)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _tmp_config(tmp_path):
     """Write a temp config.json so extract_paper does not require a real one.
 
