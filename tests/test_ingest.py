@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.error
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -20,6 +22,7 @@ import pdfplumber
 from scripts.ingest import (
     _compute_registry_key,
     _detect_layout,
+    _extract_with_llm,
     _find_config,
     _load_config,
     _read_registry,
@@ -272,3 +275,83 @@ def test_author_extraction_from_body(sample_pdf_path):
     assert result["authors"] != ["anonymous"], (
         f"authors must not be the sentinel value ['anonymous'], got: {result['authors']}"
     )
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_extract_with_llm_malformed_json(mock_urlopen):
+    """INGEST-01 LLM path: _extract_with_llm returns fallback defaults when Ollama returns
+    malformed JSON wrapped in markdown code fences — no exception raised (Ollama bug #15260
+    mitigation)."""
+    # Ollama /api/chat response envelope wraps content in {"message": {"content": "..."}}
+    # The content itself is malformed JSON wrapped in markdown fences (Ollama bug #15260)
+    ollama_response = json.dumps({"message": {"content": "```json\n{\"bad: json\"\n```"}}).encode()
+    mock_response = MagicMock()
+    mock_response.read.return_value = ollama_response
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    result = _extract_with_llm(["Sample paper text"])
+
+    assert isinstance(result, dict), "result must be a dict — no exception raised"
+    assert result["title"] == "", f"title must be empty string fallback, got: {result['title']}"
+    assert result["sections"] == [{"title": "Body", "body": ""}], (
+        f"sections must be D-02 fallback, got: {result['sections']}"
+    )
+    assert result["authors"] == ["Unknown"], (
+        f"authors must be D-02 fallback, got: {result['authors']}"
+    )
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_extract_with_llm_figures_and_bibliography(mock_urlopen):
+    """INGEST-01 LLM path: _extract_with_llm returns figures and bibliography lists when
+    Ollama returns valid JSON containing both fields."""
+    paper_content = (
+        '{"title": "Test Paper", "authors": ["A. Author"], "abstract": "An abstract.", '
+        '"sections": [{"title": "Introduction", "body": "Intro text."}], '
+        '"bibliography": ["Smith et al. (2020). A paper. Journal. https://doi.org/10.1/2"], '
+        '"figures": [{"label": "Figure 1", "caption": "A diagram showing the system."}]}'
+    )
+    # Ollama /api/chat response envelope wraps content in {"message": {"content": "..."}}
+    ollama_response = json.dumps({"message": {"content": paper_content}}).encode()
+    mock_response = MagicMock()
+    mock_response.read.return_value = ollama_response
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    result = _extract_with_llm(["Sample paper text"])
+
+    assert result["figures"] is not None and isinstance(result["figures"], list), (
+        f"figures must be a list, got: {result['figures']}"
+    )
+    assert len(result["figures"]) == 1, (
+        f"figures must have 1 entry, got: {len(result['figures'])}"
+    )
+    assert "label" in result["figures"][0] and "caption" in result["figures"][0], (
+        f"figure must have 'label' and 'caption' keys, got: {result['figures'][0]}"
+    )
+    assert result["bibliography"] is not None and isinstance(result["bibliography"], list), (
+        f"bibliography must be a list, got: {result['bibliography']}"
+    )
+    assert len(result["bibliography"]) == 1, (
+        f"bibliography must have 1 entry, got: {len(result['bibliography'])}"
+    )
+    assert result["title"] == "Test Paper", (
+        f"title must be 'Test Paper', got: {result['title']}"
+    )
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_extract_with_llm_timeout(mock_urlopen):
+    """INGEST-01 LLM path: _extract_with_llm returns fallback defaults when urlopen raises
+    urllib.error.URLError — no exception propagated to the caller."""
+    mock_urlopen.side_effect = urllib.error.URLError("connection timeout")
+
+    result = _extract_with_llm(["Sample paper text"])
+
+    assert isinstance(result, dict), "result must be a dict — no exception propagated"
+    assert result["sections"] == [{"title": "Body", "body": ""}], (
+        f"sections must be D-02 fallback, got: {result['sections']}"
+    )
+    assert result["authors"] == ["Unknown"], (
+        f"authors must be D-02 fallback, got: {result['authors']}"
+    )
+    assert result["title"] == "", f"title must be empty string fallback, got: {result['title']}"
