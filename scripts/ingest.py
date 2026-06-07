@@ -421,7 +421,18 @@ def extract_paper(pdf_path: str) -> dict:
     # Step 7: compute registry key from paper identity (D-12)
     # DOI is not extracted in Phase 1 (Phase 3 web path fills it); key falls to
     # arXiv ID (if present) or SHA-256 title hash.
-    minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": llm_result["title"] or "Unknown"}
+    # When LLM extraction fails (empty title), use a path-based hash to ensure
+    # per-document uniqueness — prevents all failed-LLM papers from colliding on
+    # the same sha256 key for normalized "unknown".
+    _llm_title = llm_result["title"] or ""
+    if not _llm_title:
+        # LLM extraction failed — use PDF path hash to ensure per-document uniqueness
+        _path_hash = hashlib.sha256(
+            os.path.abspath(pdf_path).encode()
+        ).hexdigest()[:DEFAULT_REGISTRY_KEY_PREFIX_LEN]
+        minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": f"__path:{_path_hash}"}
+    else:
+        minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": _llm_title}
     key = _compute_registry_key(minimal_paper)
 
     # Step 8: DEDUP CHECK (REG-02) — return cached entry if already ingested
