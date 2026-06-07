@@ -30,6 +30,7 @@ CONFIG_FILENAME = "config.json"
 SCANNED_CHAR_THRESHOLD = 100
 TWO_COL_RIGHT_RATIO = 0.30
 _TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
+REQUIRED_CONFIG_KEYS = ("registry_path", "vault_path")
 
 # ---------------------------------------------------------------------------
 # internal helpers
@@ -44,6 +45,7 @@ def _fail(msg: str) -> None:
 def _load_config(config_path: str) -> dict:
     """Load config.json from the given path.
 
+    Validates that required keys (registry_path, vault_path) are present.
     Expands ~ in registry_path and vault_path. Defaults project_name to the
     basename of the directory containing config.json (Open Question 3 resolution).
     """
@@ -52,6 +54,11 @@ def _load_config(config_path: str) -> dict:
             config = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         _fail(f"cannot read config.json: {e}")
+
+    # Validate required keys before use
+    for key in REQUIRED_CONFIG_KEYS:
+        if key not in config:
+            _fail(f"config.json is missing required key: '{key}'")
 
     # Expand ~ in path fields
     if "registry_path" in config:
