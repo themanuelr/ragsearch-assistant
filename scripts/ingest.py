@@ -364,10 +364,12 @@ def _find_sections_from_pdf(pdf_path: str) -> tuple[list[dict], float]:
 
 
 def _read_registry(registry_path: str) -> dict:
-    """Read the JSON registry file; return empty dict if missing or corrupted.
+    """Read the JSON registry file; return empty dict if missing or unreadable.
 
-    Treats a missing file and a corrupted (non-JSON) file identically — both
-    return {} so the caller can safely proceed without crashing (T-01-05 mitigation).
+    Treats any read failure (missing file, encoding error, corrupted JSON, OS error)
+    as empty — always returns {} rather than raising. This covers registry files
+    written by PowerShell (UTF-16 BOM), files with OS-level permission errors, and
+    files with corrupted JSON content (T-01-05, T-01-06 mitigations).
     No file lock needed for reads (RESEARCH.md Pattern 5 note).
     """
     if not os.path.exists(registry_path):
@@ -375,8 +377,8 @@ def _read_registry(registry_path: str) -> dict:
     try:
         with open(registry_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except json.JSONDecodeError:
-        return {}  # corrupted registry treated as empty — never crash on read
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {}  # any read failure treated as empty — never crash on read
 
 
 def _write_registry_entry(registry_path: str, key: str, entry: dict) -> None:
