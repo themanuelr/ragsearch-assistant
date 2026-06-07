@@ -30,6 +30,7 @@ CONFIG_FILENAME = "config.json"
 SCANNED_CHAR_THRESHOLD = 100
 TWO_COL_RIGHT_RATIO = 0.30
 _TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
+_AUTHOR_SENTINELS = frozenset({"unknown", "anonymous", "n/a", "none", ""})
 REQUIRED_CONFIG_KEYS = ("registry_path", "vault_path")
 
 # ---------------------------------------------------------------------------
@@ -187,38 +188,91 @@ def _extract_metadata(pdf_path: str) -> dict:
                 if candidate.lower() not in _TITLE_SENTINELS:
                     meta["title"] = candidate or None
             if raw.get("Author"):
-                meta["authors"] = [a.strip() for a in str(raw["Author"]).split(";") if a.strip()]
+                candidates = [a.strip() for a in str(raw["Author"]).split(";") if a.strip()]
+                # Filter out sentinel values (e.g., "anonymous", "unknown") — treat as absent
+                candidates = [a for a in candidates if a.lower() not in _AUTHOR_SENTINELS]
+                if candidates:
+                    meta["authors"] = candidates
 
             # Fallback (Pitfall 1): extract title from page-1 font heuristic
-            if not meta["title"] and pdf.pages:
+            if pdf.pages:
                 page0 = pdf.pages[0]
-                words = page0.extract_words(extra_attrs=["fontname", "size"])
-                if words:
-                    # Find modal body font size
-                    all_sizes = [w["size"] for w in words if w["size"] > 0]
-                    if all_sizes:
-                        body_size = Counter(round(s, 1) for s in all_sizes).most_common(1)[0][0]
+                page_text = page0.extract_text(x_tolerance=3) or ""
 
-                        # Group words into lines by approximate top position
-                        lines: dict[float, list] = {}
-                        for w in words:
-                            line_top = round(w["top"], 0)
-                            lines.setdefault(line_top, []).append(w)
+                if not meta["title"]:
+                    words = page0.extract_words(extra_attrs=["fontname", "size"])
+                    if words:
+                        # Find modal body font size
+                        all_sizes = [w["size"] for w in words if w["size"] > 0]
+                        if all_sizes:
+                            body_size = Counter(round(s, 1) for s in all_sizes).most_common(1)[0][0]
 
-                        # Find first line whose size exceeds body_size + 0.5
-                        for top, line_words in sorted(lines.items()):
-                            line_size = round(line_words[0]["size"], 1)
-                            if line_size > body_size + 0.5:
-                                meta["title"] = " ".join(w["text"] for w in line_words).strip()
+                            # Group words into lines by approximate top position
+                            lines: dict[float, list] = {}
+                            for w in words:
+                                line_top = round(w["top"], 0)
+                                lines.setdefault(line_top, []).append(w)
+
+                            # Find first line whose size exceeds body_size + 0.5
+                            for top, line_words in sorted(lines.items()):
+                                line_size = round(line_words[0]["size"], 1)
+                                if line_size > body_size + 0.5:
+                                    meta["title"] = " ".join(w["text"] for w in line_words).strip()
+                                    break
+
+                    # Last resort: first non-empty line of page 1 text
+                    if not meta["title"]:
+                        for line in page_text.splitlines():
+                            line = line.strip()
+                            if line:
+                                meta["title"] = line
                                 break
 
-                # Last resort: first non-empty line of page 1 text
-                if not meta["title"]:
-                    page_text = page0.extract_text(x_tolerance=3) or ""
-                    for line in page_text.splitlines():
-                        line = line.strip()
-                        if line:
-                            meta["title"] = line
+                # Body-text author heuristic: fires only when metadata gave no valid authors
+                # and a title was found to anchor the search window.
+                if not meta["authors"] and meta["title"]:
+                    _AUTHOR_KEYWORD_DENY = frozenset({
+                        "abstract", "introduction", "keywords",
+                        "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.",
+                        "doi", "arxiv", "received", "accepted", "published",
+                        "email", "department", "university", "institute",
+                        "laboratory", "school", "college",
+                    })
+                    text_lines = [l.strip() for l in page_text.splitlines() if l.strip()]
+                    # Find the title line index (case-insensitive)
+                    title_lower = meta["title"].lower()
+                    title_idx = None
+                    for idx, tl in enumerate(text_lines):
+                        if tl.lower() == title_lower:
+                            title_idx = idx
+                            break
+                    if title_idx is not None:
+                        import re as _re
+                        window = text_lines[title_idx + 1: title_idx + 11]
+                        for candidate in window:
+                            cl = candidate.lower()
+                            # Reject keyword lines
+                            if any(cl == kw or cl.startswith(kw + " ") for kw in _AUTHOR_KEYWORD_DENY):
+                                continue
+                            # Must contain comma, " and ", or " & " (multiple name indicator)
+                            has_separator = (
+                                "," in candidate
+                                or " and " in candidate
+                                or " & " in candidate
+                            )
+                            if not has_separator:
+                                continue
+                            # Must be between 5 and 200 chars
+                            if not (5 <= len(candidate) <= 200):
+                                continue
+                            # Must not look like a section number
+                            if _re.match(r"^\d+[\.\s]", candidate):
+                                continue
+                            # Accepted: split into author names
+                            parts = _re.split(r",| and | & ", candidate)
+                            names = [n.strip() for n in parts if n.strip()]
+                            if names:
+                                meta["authors"] = names
                             break
     except Exception as e:
         _fail(f"cannot open PDF: {e}")
