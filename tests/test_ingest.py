@@ -8,6 +8,7 @@ correct RED state. Waves 1-4 implement the bodies that turn these green.
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -19,6 +20,8 @@ import pdfplumber
 from scripts.ingest import (
     _compute_registry_key,
     _detect_layout,
+    _find_config,
+    _load_config,
     _write_registry_entry,
     extract_paper,
 )
@@ -125,7 +128,9 @@ def test_process_pdf_mcp_tool(sample_pdf_path):
     Calls ingest.py as a subprocess (mirroring how process_pdf in server.py works)
     and verifies the output is valid JSON with all required fields.
     """
-    ingest_script = "scripts/ingest.py"
+    ingest_script = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "scripts", "ingest.py")
+    )
     result = subprocess.run(
         [sys.executable, ingest_script, "--pdf", sample_pdf_path],
         capture_output=True,
@@ -143,7 +148,7 @@ def test_process_pdf_mcp_tool(sample_pdf_path):
         "CLI PaperJSON must have at least one section"
 
 
-def test_registry_write(tmp_registry_path, sample_pdf_path):
+def test_registry_write(sample_pdf_path):
     """
     REG-01: After a successful ingest, the registry file contains an entry with the
     correct key derived from the paper (DOI, arXiv ID, or SHA-256 title hash).
@@ -152,17 +157,17 @@ def test_registry_write(tmp_registry_path, sample_pdf_path):
     key = _compute_registry_key(result)
     assert isinstance(key, str) and key, "registry key must be a non-empty str"
 
-    _write_registry_entry(tmp_registry_path, key, result)
-
-    with open(tmp_registry_path, "r", encoding="utf-8") as f:
+    # Read the registry that extract_paper actually wrote to (via config)
+    config = _load_config(_find_config())
+    with open(config["registry_path"], "r", encoding="utf-8") as f:
         registry = json.load(f)
 
-    assert key in registry, f"registry must contain key '{key}' after write"
+    assert key in registry, f"extract_paper must have written key '{key}' to registry"
     assert registry[key]["title"] == result["title"], \
         "registry entry title must match PaperJSON title"
 
 
-def test_registry_dedup(tmp_registry_path, sample_pdf_path):
+def test_registry_dedup(sample_pdf_path):
     """
     REG-02: Second ingest of the same paper returns the cached entry and skips extraction.
 
@@ -173,9 +178,8 @@ def test_registry_dedup(tmp_registry_path, sample_pdf_path):
     # First ingest
     result1 = extract_paper(sample_pdf_path)
     key1 = _compute_registry_key(result1)
-    _write_registry_entry(tmp_registry_path, key1, result1)
 
-    # Second ingest of same file — must return cached (key must be identical)
+    # Second ingest of same file -- must return cached (key must be identical)
     result2 = extract_paper(sample_pdf_path)
     key2 = _compute_registry_key(result2)
 
@@ -184,8 +188,9 @@ def test_registry_dedup(tmp_registry_path, sample_pdf_path):
         f"got '{key1}' then '{key2}'"
     )
 
-    # Registry must still have exactly one entry for this paper
-    with open(tmp_registry_path, "r", encoding="utf-8") as f:
+    # Read the registry that extract_paper wrote to (via config)
+    config = _load_config(_find_config())
+    with open(config["registry_path"], "r", encoding="utf-8") as f:
         registry = json.load(f)
     assert len([k for k in registry if k == key1]) == 1, \
         "registry must not duplicate entries for the same paper"
