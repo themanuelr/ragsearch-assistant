@@ -15,8 +15,6 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from collections import Counter
-
 # ---------------------------------------------------------------------------
 # third-party
 # ---------------------------------------------------------------------------
