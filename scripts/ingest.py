@@ -240,21 +240,31 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     )
 
     # Step c: HTTP request following exact urllib pattern from mcp-ollama/server.py
+    payload = json.dumps({
+        "model": DEFAULT_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        OLLAMA_BASE + "/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        payload = json.dumps({
-            "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-        }).encode()
-        req = urllib.request.Request(
-            OLLAMA_BASE + "/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with urllib.request.urlopen(req, timeout=300) as resp:
-            raw = json.loads(resp.read())["message"]["content"]
-    except (urllib.error.URLError, Exception):
+            body = json.loads(resp.read())
+    except urllib.error.URLError as e:
+        print(f"[ingest warning: Ollama unreachable: {e}]", file=sys.stderr)
+        return _fallback()
+    except Exception as e:
+        print(f"[ingest warning: unexpected HTTP error: {e}]", file=sys.stderr)
+        return _fallback()
+
+    try:
+        raw = body["message"]["content"]
+    except (KeyError, TypeError):
+        print(f"[ingest warning: unexpected Ollama response: {body}]", file=sys.stderr)
         return _fallback()
 
     # Step d: strip+parse+pydantic fallback pattern (Ollama bugs #15260, #15416)
