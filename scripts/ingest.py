@@ -373,6 +373,10 @@ def _write_registry_entry(registry_path: str, key: str, entry: dict) -> None:
     # New FileLock instance per call — required for thread safety (RESEARCH.md critical note)
     lock = filelock.FileLock(lock_path, timeout=30)
 
+    # Ensure parent directory exists before acquiring the lock
+    dir_path = os.path.dirname(os.path.abspath(registry_path))
+    os.makedirs(dir_path, exist_ok=True)
+
     with lock:
         # Read current state under lock
         if os.path.exists(registry_path):
@@ -387,7 +391,6 @@ def _write_registry_entry(registry_path: str, key: str, entry: dict) -> None:
         registry[key] = entry
 
         # Atomic write: temp file in same dir ensures same-filesystem atomic replace (Pitfall 6)
-        dir_path = os.path.dirname(os.path.abspath(registry_path))
         fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -412,6 +415,10 @@ def extract_paper(pdf_path: str) -> dict:
     writes the registry entry (REG-01). On a cache hit, returns the cached entry
     directly without re-extracting.
 
+    The registry entry stores the full PaperJSON plus D-14 metadata fields
+    (summary, key_findings, projects, vault_note) so that a cache hit returns
+    the same PaperJSON schema as a fresh extraction.
+
     Args:
         pdf_path: Absolute path to the PDF file to ingest.
 
@@ -429,13 +436,13 @@ def extract_paper(pdf_path: str) -> dict:
     registry_path = config["registry_path"]
     project_name = config["project_name"]
 
-    # Step 3: extract metadata (title, authors, year)
+    # Step 3: extract metadata (title, authors, year) — lightweight; needed for key computation
     meta = _extract_metadata(pdf_path)
     title = meta["title"] or "Unknown"
     authors = meta["authors"] or ["Unknown"]
     year = meta["year"]
 
-    # Step 4: layout detection and text extraction
+    # Step 4: layout detection and text extraction (needed for arXiv ID)
     try:
         with pdfplumber.open(pdf_path) as pdf:
             page0 = pdf.pages[0] if pdf.pages else None
@@ -493,24 +500,21 @@ def extract_paper(pdf_path: str) -> dict:
         "source_path": os.path.abspath(pdf_path),
     }
 
-    # Step 12: build D-14 registry entry and write (REG-01)
-    # summary and key_findings are null in Phase 1 (Open Question 2 — Phase 2 fills these)
-    # projects = [project_name] (Open Question 3 resolution)
-    registry_entry = {
-        "title": title,
-        "authors": authors,
-        "year": year,
-        "doi": None,
-        "arxiv_id": arxiv_id,
+    # Step 12: build D-14 registry entry and write (REG-01).
+    # The registry entry stores the full PaperJSON plus D-14 metadata fields so that
+    # a future cache hit (REG-02) returns the same PaperJSON schema.
+    # summary and key_findings are null in Phase 1 (Open Question 2 — Phase 2 fills these).
+    # projects = [project_name] (Open Question 3 resolution).
+    registry_entry = dict(paper_json)  # start with full PaperJSON
+    registry_entry.update({
         "summary": None,
         "key_findings": None,
         "projects": [project_name],
         "vault_note": None,
-        "source_path": os.path.abspath(pdf_path),
-    }
+    })
     _write_registry_entry(registry_path, key, registry_entry)
 
-    # Return full PaperJSON (D-10 — richer than the registry entry)
+    # Return full PaperJSON (D-10 — 10-key schema returned to Claude)
     return paper_json
 
 
