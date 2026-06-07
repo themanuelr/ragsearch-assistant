@@ -385,3 +385,39 @@ def test_extract_with_llm_timeout(mock_urlopen):
         f"authors must be D-02 fallback, got: {result['authors']}"
     )
     assert result["title"] == "", f"title must be empty string fallback, got: {result['title']}"
+
+
+@patch("scripts.ingest._extract_with_llm")
+def test_author_heuristic_offline_fallback(mock_llm, sample_pdf_path):
+    """
+    INGEST-01 offline fallback: extract_paper recovers real author names from page 1 body
+    text when _extract_with_llm returns the fallback dict (Ollama offline simulation).
+
+    Uses @patch decorator (not monkeypatch) to create a second layer that overrides the
+    autouse _mock_llm fixture for this test only — simulating Ollama offline by returning
+    the exact _fallback() sentinel output: authors: ["Unknown"].
+
+    The body-text heuristic must find "Alice Author, Bob Collaborator" on page 1 and
+    return real names instead of the ["Unknown"] sentinel.
+    """
+    mock_llm.return_value = {
+        "title": "",
+        "authors": ["Unknown"],
+        "abstract": "",
+        "sections": [{"title": "Body", "body": ""}],
+        "bibliography": None,
+        "figures": None,
+    }
+
+    result = extract_paper(sample_pdf_path)
+
+    assert result["authors"] != ["Unknown"], (
+        f"authors must not be ['Unknown'] when body-text heuristic is available; "
+        f"got: {result['authors']}"
+    )
+    assert len(result["authors"]) >= 1, (
+        f"authors must have at least one element, got: {result['authors']}"
+    )
+    assert all(isinstance(a, str) and len(a) > 0 for a in result["authors"]), (
+        f"all authors must be non-empty strings, got: {result['authors']}"
+    )
