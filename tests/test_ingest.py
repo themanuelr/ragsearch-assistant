@@ -90,6 +90,12 @@ def test_two_column_layout(sample_twocol_pdf_path):
     assert idx_a != -1, "left column 'Section A' content not found in output"
     assert idx_b != -1, "right column 'Section B' content not found in output"
     assert idx_a < idx_b, "left column must appear before right column (reading order)"
+    # arXiv ID must be extracted from footer (INGEST-02 wiring check)
+    arxiv_id = result.get("arxiv_id")
+    assert arxiv_id is not None, "arxiv_id must be extracted from two-column fixture footer"
+    assert str(arxiv_id).startswith("2301.00001"), (
+        f"arxiv_id must start with '2301.00001', got: {arxiv_id}"
+    )
 
 
 def test_scanned_pdf_error(scanned_pdf_path):
