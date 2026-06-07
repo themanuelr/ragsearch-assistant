@@ -502,6 +502,9 @@ def extract_paper(pdf_path: str) -> dict:
             # Split on newline + leading number pattern
             raw_refs = re.split(r'\n\s*\[?\d+\]?\.?\s+', ref_text)
             references = [r.strip() for r in raw_refs if r.strip()]
+            # Strip leading [N] or N. marker from every entry for consistency
+            # (the first entry has no preceding newline so the split misses it)
+            references = [re.sub(r'^\[?\d+\]?\.?\s+', '', r) for r in references]
             break
 
     # Step 11: assemble PaperJSON (D-01, D-02, D-03, D-04)
