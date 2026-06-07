@@ -33,6 +33,11 @@ _TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
 _AUTHOR_SENTINELS = frozenset({"unknown", "anonymous", "n/a", "none", ""})
 REQUIRED_CONFIG_KEYS = ("registry_path", "vault_path")
 
+PAPER_JSON_KEYS = frozenset({
+    "title", "authors", "abstract", "sections", "doi",
+    "arxiv_id", "year", "journal", "references", "figures", "source_path",
+})
+
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 LLM_TEXT_TRUNCATE = 80_000  # max chars sent to Ollama — context overflow guard
@@ -446,7 +451,7 @@ def extract_paper(pdf_path: str) -> dict:
     # Step 8: DEDUP CHECK (REG-02) — return cached entry if already ingested
     registry = _read_registry(registry_path)
     if key in registry:
-        return registry[key]
+        return {k: registry[key][k] for k in PAPER_JSON_KEYS if k in registry[key]}
 
     # Step 9: assemble PaperJSON (D-01, D-02, D-03, D-04)
     paper_json = {
