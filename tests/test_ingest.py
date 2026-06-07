@@ -192,12 +192,18 @@ def test_registry_dedup(sample_pdf_path):
         f"got '{key1}' then '{key2}'"
     )
 
+    assert result1 == result2, (
+        "Second ingest must return the cached registry entry unchanged — REG-02"
+    )
+
     # Read the registry that extract_paper wrote to (via config)
     config = _load_config(_find_config())
     with open(config["registry_path"], "r", encoding="utf-8") as f:
         registry = json.load(f)
-    assert len([k for k in registry if k == key1]) == 1, \
-        "registry must not duplicate entries for the same paper"
+    assert len(registry) == 1, (
+        f"registry must contain exactly 1 entry after two ingests of the same paper; "
+        f"got {len(registry)}: {list(registry.keys())}"
+    )
 
 
 def test_concurrent_registry_writes(tmp_registry_path):
