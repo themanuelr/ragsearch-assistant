@@ -29,6 +29,7 @@ DEFAULT_REGISTRY_KEY_PREFIX_LEN = 16  # hex chars of SHA-256 title hash
 CONFIG_FILENAME = "config.json"
 SCANNED_CHAR_THRESHOLD = 100
 TWO_COL_RIGHT_RATIO = 0.30
+_TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
 
 # ---------------------------------------------------------------------------
 # internal helpers
@@ -175,7 +176,9 @@ def _extract_metadata(pdf_path: str) -> dict:
             # Primary: pdfplumber metadata dict
             raw = pdf.metadata or {}
             if raw.get("Title"):
-                meta["title"] = str(raw["Title"]).strip() or None
+                candidate = str(raw["Title"]).strip()
+                if candidate.lower() not in _TITLE_SENTINELS:
+                    meta["title"] = candidate or None
             if raw.get("Author"):
                 meta["authors"] = [a.strip() for a in str(raw["Author"]).split(";") if a.strip()]
 
