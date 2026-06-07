@@ -14,11 +14,32 @@ import threading
 
 import pytest
 
+import pdfplumber
+
 from scripts.ingest import (
     _compute_registry_key,
+    _detect_layout,
     _write_registry_entry,
     extract_paper,
 )
+
+
+def test_detect_layout(sample_pdf_path, sample_twocol_pdf_path):
+    """
+    INGEST-02 (unit): _detect_layout returns True for two-column PDFs, False for single-column.
+
+    The D-06 heuristic crops to the bottom 70% of page 1 (Pitfall 2 mitigation) and counts
+    words whose x0 exceeds the midpoint. A right-half ratio > TWO_COL_RIGHT_RATIO (0.30)
+    signals two-column layout.
+    """
+    with pdfplumber.open(sample_twocol_pdf_path) as pdf:
+        assert _detect_layout(pdf.pages[0]) is True, (
+            "_detect_layout must return True for two-column sample_twocol.pdf"
+        )
+    with pdfplumber.open(sample_pdf_path) as pdf:
+        assert _detect_layout(pdf.pages[0]) is False, (
+            "_detect_layout must return False for single-column sample_onecol.pdf"
+        )
 
 
 def test_paper_json_schema(sample_pdf_path):
