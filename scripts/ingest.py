@@ -238,14 +238,20 @@ def _extract_arxiv_id(page1_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+# Intentionally not implemented in Phase 1 — Phase 2 will wire this.
+# Use _find_sections_from_pdf directly until then.
 def _find_sections(pages_text: list[str], body_size: float) -> list[dict]:
     """Identify section headers via font heuristic and return list of {title, body} dicts.
 
     Note: This public function accepts pages_text strings (no font data).
     For full font-heuristic section detection, use _find_sections_from_pdf directly.
     This wrapper satisfies the Plan 01 contract signature.
+
+    TODO (Phase 2): implement body once pages_text carries font metadata.
     """
-    raise NotImplementedError
+    raise NotImplementedError(
+        "_find_sections is not implemented. Call _find_sections_from_pdf instead."
+    )
 
 
 def _find_sections_from_pdf(pdf_path: str) -> tuple[list[dict], float]:
