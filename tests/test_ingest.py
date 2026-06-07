@@ -22,6 +22,7 @@ from scripts.ingest import (
     _detect_layout,
     _find_config,
     _load_config,
+    _read_registry,
     _write_registry_entry,
     extract_paper,
 )
@@ -230,4 +231,21 @@ def test_concurrent_registry_writes(tmp_registry_path):
     assert len(data) == 2, (
         f"registry must contain exactly 2 entries after concurrent writes; "
         f"got {len(data)}: {list(data.keys())}"
+    )
+
+
+def test_registry_read_unicode_error(tmp_registry_path):
+    """
+    REG-01 regression: _read_registry returns {} when the registry file is UTF-16 encoded.
+
+    PowerShell may write JSON files with a UTF-16 LE BOM, which causes a UnicodeDecodeError
+    when opened with encoding='utf-8'. The function must catch this and return {} — never
+    raise an unhandled exception.
+    """
+    # Write a UTF-16 LE BOM followed by minimal content — simulates PowerShell output
+    with open(tmp_registry_path, "wb") as f:
+        f.write(b"\xff\xfe{}")
+    result = _read_registry(tmp_registry_path)
+    assert result == {}, (
+        f"_read_registry must return {{}} for UTF-16 encoded file, got: {result}"
     )
