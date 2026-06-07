@@ -1,0 +1,44 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Local config (per-clone, gitignored per CLAUDE.md)
+config.json
+
+# Vault (per-project, gitignored per CLAUDE.md)
+vault/
+
+# ChromaDB (per-project)
+chroma_db/
+
+# PDF files (user-supplied, never committed — except test fixtures)
+*.pdf
+!tests/fixtures/*.pdf
+
+# Registry (shared across clones, not in repo)
+papers_registry.json
+
+# IDE / OS artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# pytest cache
+.pytest_cache/
+
+# Coverage reports
+.coverage
+htmlcov/
