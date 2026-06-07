@@ -41,23 +41,70 @@ def _fail(msg: str) -> None:
 
 
 def _load_config(config_path: str) -> dict:
-    """Load config.json from the given path."""
-    raise NotImplementedError
+    """Load config.json from the given path.
+
+    Expands ~ in registry_path and vault_path. Defaults project_name to the
+    basename of the directory containing config.json (Open Question 3 resolution).
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        _fail(f"cannot read config.json: {e}")
+
+    # Expand ~ in path fields
+    if "registry_path" in config:
+        config["registry_path"] = os.path.expanduser(config["registry_path"])
+    if "vault_path" in config:
+        config["vault_path"] = os.path.expanduser(config["vault_path"])
+
+    # Default project_name to the config's parent-dir basename
+    if not config.get("project_name"):
+        config["project_name"] = os.path.basename(os.path.dirname(os.path.abspath(config_path)))
+
+    return config
 
 
 def _find_config() -> str:
-    """Walk up directory tree from this script to find config.json at repo root."""
-    raise NotImplementedError
+    """Walk up directory tree from this script to find config.json at repo root.
+
+    Starts at the directory containing this script and walks up parent directories
+    until CONFIG_FILENAME is found. Calls _fail if no config found by filesystem root.
+    """
+    current = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        candidate = os.path.join(current, CONFIG_FILENAME)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            # Reached filesystem root without finding config.json
+            _fail("config.json not found in repo tree")
+        current = parent
 
 
 def _normalize_title(title: str) -> str:
     """Lowercase, strip punctuation, collapse whitespace for registry key generation."""
-    raise NotImplementedError
+    title = title.lower()
+    title = re.sub(r"[^\w\s]", "", title)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip()
 
 
 def _compute_registry_key(paper: dict) -> str:
-    """Return DOI, arXiv ID, or SHA-256 title hash as the registry key (D-12)."""
-    raise NotImplementedError
+    """Return DOI, arXiv ID, or SHA-256 title hash as the registry key (D-12).
+
+    Priority: DOI -> arXiv ID -> SHA-256 of normalized title (first 16 hex chars).
+    """
+    if paper.get("doi"):
+        return paper["doi"]
+    if paper.get("arxiv_id"):
+        return f"arxiv:{paper['arxiv_id']}"
+    title = paper.get("title") or ""
+    hex_prefix = hashlib.sha256(
+        _normalize_title(title).encode()
+    ).hexdigest()[:DEFAULT_REGISTRY_KEY_PREFIX_LEN]
+    return f"sha256:{hex_prefix}"
 
 
 def _is_scanned(pdf_path: str, threshold: int = SCANNED_CHAR_THRESHOLD) -> bool:
@@ -299,13 +346,57 @@ def _find_sections_from_pdf(pdf_path: str) -> tuple[list[dict], float]:
 
 
 def _read_registry(registry_path: str) -> dict:
-    """Read the JSON registry file; return empty dict if missing or corrupted."""
-    raise NotImplementedError
+    """Read the JSON registry file; return empty dict if missing or corrupted.
+
+    Treats a missing file and a corrupted (non-JSON) file identically — both
+    return {} so the caller can safely proceed without crashing (T-01-05 mitigation).
+    No file lock needed for reads (RESEARCH.md Pattern 5 note).
+    """
+    if not os.path.exists(registry_path):
+        return {}
+    try:
+        with open(registry_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return {}  # corrupted registry treated as empty — never crash on read
 
 
 def _write_registry_entry(registry_path: str, key: str, entry: dict) -> None:
-    """Atomically add or update one entry in the registry JSON using filelock + os.replace."""
-    raise NotImplementedError
+    """Atomically add or update one entry in the registry JSON using filelock + os.replace.
+
+    Each call creates its own FileLock instance (thread_local=True default means
+    each thread must own its lock object — never share across threads). Uses
+    tempfile.mkstemp(dir=registry-dir) so the temp file is on the same filesystem
+    as the registry, making os.replace atomic (Pitfall 6 mitigation).
+    """
+    lock_path = registry_path + ".lock"
+    # New FileLock instance per call — required for thread safety (RESEARCH.md critical note)
+    lock = filelock.FileLock(lock_path, timeout=30)
+
+    with lock:
+        # Read current state under lock
+        if os.path.exists(registry_path):
+            try:
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    registry = json.load(f)
+            except json.JSONDecodeError:
+                registry = {}  # corrupted — start fresh
+        else:
+            registry = {}
+
+        registry[key] = entry
+
+        # Atomic write: temp file in same dir ensures same-filesystem atomic replace (Pitfall 6)
+        dir_path = os.path.dirname(os.path.abspath(registry_path))
+        fd, tmp_path = tempfile.mkstemp(dir=dir_path, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(registry, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, registry_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +406,11 @@ def _write_registry_entry(registry_path: str, key: str, entry: dict) -> None:
 def extract_paper(pdf_path: str) -> dict:
     """
     Extract structured PaperJSON from a PDF file and write to the global registry.
+
+    Checks the registry for a previously ingested entry (REG-02 dedup check) before
+    running the full extraction pipeline. On a cache miss, runs full extraction and
+    writes the registry entry (REG-01). On a cache hit, returns the cached entry
+    directly without re-extracting.
 
     Args:
         pdf_path: Absolute path to the PDF file to ingest.
@@ -327,13 +423,19 @@ def extract_paper(pdf_path: str) -> dict:
     if _is_scanned(pdf_path):
         _fail("scanned/image-only PDF — no extractable text (INGEST-03)")
 
-    # Step 2: extract metadata (title, authors, year)
+    # Step 2: load config for registry path and project name
+    config_path = _find_config()
+    config = _load_config(config_path)
+    registry_path = config["registry_path"]
+    project_name = config["project_name"]
+
+    # Step 3: extract metadata (title, authors, year)
     meta = _extract_metadata(pdf_path)
     title = meta["title"] or "Unknown"
     authors = meta["authors"] or ["Unknown"]
     year = meta["year"]
 
-    # Step 3: layout detection and text extraction
+    # Step 4: layout detection and text extraction
     try:
         with pdfplumber.open(pdf_path) as pdf:
             page0 = pdf.pages[0] if pdf.pages else None
@@ -342,21 +444,32 @@ def extract_paper(pdf_path: str) -> dict:
     except Exception as e:
         _fail(f"cannot open PDF: {e}")
 
-    # Step 4: extract arXiv ID from page 1 text
+    # Step 5: extract arXiv ID from page 1 text
     page1_text = pages_text[0] if pages_text else ""
     arxiv_id = _extract_arxiv_id(page1_text)
 
-    # Step 5: section detection via font heuristic
+    # Step 6: compute registry key from lightweight paper identity (D-12)
+    # DOI is not extracted in Phase 1 (Phase 3 web path fills it); key falls to
+    # arXiv ID (if present) or SHA-256 title hash.
+    minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": title}
+    key = _compute_registry_key(minimal_paper)
+
+    # Step 7: DEDUP CHECK (REG-02) — return cached entry if already ingested
+    registry = _read_registry(registry_path)
+    if key in registry:
+        return registry[key]
+
+    # Step 8: section detection via font heuristic (cache miss — full extraction)
     sections, body_size = _find_sections_from_pdf(pdf_path)
 
-    # Step 6: extract abstract from sections
+    # Step 9: extract abstract from sections
     abstract = ""
     for section in sections:
         if "abstract" in section["title"].lower():
             abstract = section["body"]
             break
 
-    # Step 7: extract references from sections
+    # Step 10: extract references from sections
     references = None
     for section in sections:
         if section["title"].lower() in ("references", "bibliography"):
@@ -366,8 +479,8 @@ def extract_paper(pdf_path: str) -> dict:
             references = [r.strip() for r in raw_refs if r.strip()]
             break
 
-    # Step 8: assemble PaperJSON (D-01, D-02, D-03, D-04)
-    return {
+    # Step 11: assemble PaperJSON (D-01, D-02, D-03, D-04)
+    paper_json = {
         "title": title,
         "authors": authors,
         "abstract": abstract,
@@ -379,6 +492,26 @@ def extract_paper(pdf_path: str) -> dict:
         "references": references,
         "source_path": os.path.abspath(pdf_path),
     }
+
+    # Step 12: build D-14 registry entry and write (REG-01)
+    # summary and key_findings are null in Phase 1 (Open Question 2 — Phase 2 fills these)
+    # projects = [project_name] (Open Question 3 resolution)
+    registry_entry = {
+        "title": title,
+        "authors": authors,
+        "year": year,
+        "doi": None,
+        "arxiv_id": arxiv_id,
+        "summary": None,
+        "key_findings": None,
+        "projects": [project_name],
+        "vault_note": None,
+        "source_path": os.path.abspath(pdf_path),
+    }
+    _write_registry_entry(registry_path, key, registry_entry)
+
+    # Return full PaperJSON (D-10 — richer than the registry entry)
+    return paper_json
 
 
 # ---------------------------------------------------------------------------
