@@ -313,7 +313,9 @@ def _find_sections_from_pdf(pdf_path: str) -> tuple[list[dict], float]:
             def _is_header(line: dict) -> bool:
                 is_larger = line["size"] > body_size + 0.5
                 is_bold = "bold" in line["fontname"].lower()
-                return is_larger or is_bold
+                # Guard: very long lines are body text, not section headers
+                is_short_enough = len(line["text"]) < 120
+                return (is_larger or is_bold) and is_short_enough
 
             current_header = None
             current_body_lines = []
