@@ -13,6 +13,8 @@ import os
 import re
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from collections import Counter
 
 # ---------------------------------------------------------------------------
@@ -32,6 +34,10 @@ TWO_COL_RIGHT_RATIO = 0.30
 _TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
 _AUTHOR_SENTINELS = frozenset({"unknown", "anonymous", "n/a", "none", ""})
 REQUIRED_CONFIG_KEYS = ("registry_path", "vault_path")
+
+OLLAMA_BASE = "http://localhost:11434"
+DEFAULT_MODEL = "gemma4:e4b"
+LLM_TEXT_TRUNCATE = 80_000  # max chars sent to Ollama — context overflow guard
 
 # ---------------------------------------------------------------------------
 # internal helpers
@@ -169,130 +175,6 @@ def _extract_text_pages(pdf, is_two_col: bool) -> list[str]:
     return texts
 
 
-def _extract_metadata(pdf_path: str) -> dict:
-    """Extract title, authors, year from PDF metadata dict and pypdf fallback.
-
-    Primary: pdfplumber pdf.metadata dict (Title, Author keys).
-    Secondary: pypdf for typed creation_date.year.
-    Fallback (Pitfall 1): page-1 font-size heuristic for title; ["Unknown"] for authors.
-    All font-size comparisons use round(size, 1) and > body_size + 0.5 threshold.
-    """
-    meta = {"title": None, "authors": None, "year": None}
-
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # Primary: pdfplumber metadata dict
-            raw = pdf.metadata or {}
-            if raw.get("Title"):
-                candidate = str(raw["Title"]).strip()
-                if candidate.lower() not in _TITLE_SENTINELS:
-                    meta["title"] = candidate or None
-            if raw.get("Author"):
-                candidates = [a.strip() for a in str(raw["Author"]).split(";") if a.strip()]
-                # Filter out sentinel values (e.g., "anonymous", "unknown") — treat as absent
-                candidates = [a for a in candidates if a.lower() not in _AUTHOR_SENTINELS]
-                if candidates:
-                    meta["authors"] = candidates
-
-            # Fallback (Pitfall 1): extract title from page-1 font heuristic
-            if pdf.pages:
-                page0 = pdf.pages[0]
-                page_text = page0.extract_text(x_tolerance=3) or ""
-
-                if not meta["title"]:
-                    words = page0.extract_words(extra_attrs=["fontname", "size"])
-                    if words:
-                        # Find modal body font size
-                        all_sizes = [w["size"] for w in words if w["size"] > 0]
-                        if all_sizes:
-                            body_size = Counter(round(s, 1) for s in all_sizes).most_common(1)[0][0]
-
-                            # Group words into lines by approximate top position
-                            lines: dict[float, list] = {}
-                            for w in words:
-                                line_top = round(w["top"], 0)
-                                lines.setdefault(line_top, []).append(w)
-
-                            # Find first line whose size exceeds body_size + 0.5
-                            for top, line_words in sorted(lines.items()):
-                                line_size = round(line_words[0]["size"], 1)
-                                if line_size > body_size + 0.5:
-                                    meta["title"] = " ".join(w["text"] for w in line_words).strip()
-                                    break
-
-                    # Last resort: first non-empty line of page 1 text
-                    if not meta["title"]:
-                        for line in page_text.splitlines():
-                            line = line.strip()
-                            if line:
-                                meta["title"] = line
-                                break
-
-                # Body-text author heuristic: fires only when metadata gave no valid authors
-                # and a title was found to anchor the search window.
-                if not meta["authors"] and meta["title"]:
-                    _AUTHOR_KEYWORD_DENY = frozenset({
-                        "abstract", "introduction", "keywords",
-                        "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.",
-                        "doi", "arxiv", "received", "accepted", "published",
-                        "email", "department", "university", "institute",
-                        "laboratory", "school", "college",
-                    })
-                    text_lines = [l.strip() for l in page_text.splitlines() if l.strip()]
-                    # Find the title line index (case-insensitive)
-                    title_lower = meta["title"].lower()
-                    title_idx = None
-                    for idx, tl in enumerate(text_lines):
-                        if tl.lower() == title_lower:
-                            title_idx = idx
-                            break
-                    if title_idx is not None:
-                        import re as _re
-                        window = text_lines[title_idx + 1: title_idx + 11]
-                        for candidate in window:
-                            cl = candidate.lower()
-                            # Reject keyword lines
-                            if any(cl == kw or cl.startswith(kw + " ") for kw in _AUTHOR_KEYWORD_DENY):
-                                continue
-                            # Must contain comma, " and ", or " & " (multiple name indicator)
-                            has_separator = (
-                                "," in candidate
-                                or " and " in candidate
-                                or " & " in candidate
-                            )
-                            if not has_separator:
-                                continue
-                            # Must be between 5 and 200 chars
-                            if not (5 <= len(candidate) <= 200):
-                                continue
-                            # Must not look like a section number
-                            if _re.match(r"^\d+[\.\s]", candidate):
-                                continue
-                            # Accepted: split into author names
-                            parts = _re.split(r",| and | & ", candidate)
-                            names = [n.strip() for n in parts if n.strip()]
-                            if names:
-                                meta["authors"] = names
-                            break
-    except Exception as e:
-        _fail(f"cannot open PDF: {e}")
-
-    # Secondary: pypdf for typed creation_date.year
-    if not meta["year"]:
-        try:
-            reader = PdfReader(pdf_path)
-            if reader.metadata and reader.metadata.creation_date:
-                meta["year"] = reader.metadata.creation_date.year
-        except Exception:
-            pass  # metadata missing or malformed — proceed without year
-
-    # D-02 fallback: authors must always be a list
-    if not meta["authors"]:
-        meta["authors"] = ["Unknown"]
-
-    return meta
-
-
 def _extract_arxiv_id(page1_text: str) -> str | None:
     """Extract arXiv ID from page 1 text using regex (e.g., arXiv:1706.03762v5).
 
@@ -302,119 +184,113 @@ def _extract_arxiv_id(page1_text: str) -> str | None:
     return match.group(1) if match else None
 
 
-# Intentionally not implemented in Phase 1 — Phase 2 will wire this.
-# Use _find_sections_from_pdf directly until then.
-def _find_sections(pages_text: list[str], body_size: float) -> list[dict]:
-    """Identify section headers via font heuristic and return list of {title, body} dicts.
+def _extract_with_llm(pages_text: list[str]) -> dict:
+    """Send paper text to Ollama gemma4:e4b and extract structured fields.
 
-    Note: This public function accepts pages_text strings (no font data).
-    For full font-heuristic section detection, use _find_sections_from_pdf directly.
-    This wrapper satisfies the Plan 01 contract signature.
+    Joins all page texts, truncates to LLM_TEXT_TRUNCATE chars, then posts to
+    Ollama /api/chat requesting JSON extraction of title, authors, abstract,
+    sections, bibliography, and figures.
 
-    TODO (Phase 2): implement body once pages_text carries font metadata.
+    Response parsing uses strip+parse+pydantic fallback pattern to handle
+    Ollama bugs #15260 (markdown fences in response) and #15416 (type coercion).
+
+    Returns a dict with keys: title, authors, abstract, sections, bibliography,
+    figures. Never raises — returns fallback defaults on any error.
     """
-    raise NotImplementedError(
-        "_find_sections is not implemented. Call _find_sections_from_pdf instead."
+    from pydantic import BaseModel, ValidationError
+
+    class _LLMPaperResult(BaseModel):
+        title: str = ""
+        authors: list[str] = []
+        abstract: str = ""
+        sections: list[dict] = []
+        bibliography: list[str] = []
+        figures: list[dict] = []
+
+    # Build fallback to return on any error
+    def _fallback() -> dict:
+        return {
+            "title": "",
+            "authors": ["Unknown"],
+            "abstract": "",
+            "sections": [{"title": "Body", "body": ""}],
+            "bibliography": None,
+            "figures": None,
+        }
+
+    # Step a: join and truncate
+    combined = "\n\n".join(pages_text)
+    truncated_text = combined[:LLM_TEXT_TRUNCATE]
+
+    # Step b: build prompt
+    prompt = (
+        "You are a scientific paper parser. Extract the following fields from the paper text "
+        "below and return ONLY valid JSON with no explanation, no markdown, and no code fences.\n\n"
+        "Required JSON schema:\n"
+        "{\"title\": \"string\", \"authors\": [\"string\"], \"abstract\": \"string\", "
+        "\"sections\": [{\"title\": \"string\", \"body\": \"string\"}], "
+        "\"bibliography\": [\"string\"], "
+        "\"figures\": [{\"label\": \"string\", \"caption\": \"string\"}]}\n\n"
+        "Rules:\n"
+        "- sections must include every section of the paper in reading order\n"
+        "- bibliography must include every reference as one complete string per entry\n"
+        "- figures must include every figure and table caption with its label "
+        "(e.g. 'Figure 1', 'Table 2')\n"
+        "- Return empty list [] for bibliography or figures if none found\n"
+        "- Return ONLY the JSON object, nothing else\n\n"
+        "Paper text:\n" + truncated_text
     )
 
-
-def _find_sections_from_pdf(pdf_path: str) -> tuple[list[dict], float]:
-    """Extract sections from a PDF using font heuristic. Returns (sections, body_size).
-
-    This is the internal implementation that accesses word-level font data by
-    reopening the PDF. The public _find_sections signature only accepts pages_text
-    strings (which have no font info), so extract_paper calls this directly.
-
-    Section headers are detected when:
-      - round(line_size, 1) > body_size + 0.5  (size-based — per Pitfall 3)
-      - OR "bold" in fontname.lower()           (bold-based — catches numbered headers)
-
-    Fallback: if no headers detected, returns a single {"title": "Body", "body": full_text}.
-    """
-    sections = []
-    body_size = 10.0  # default fallback
-
+    # Step c: HTTP request following exact urllib pattern from mcp-ollama/server.py
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            # Pass 1: collect all word sizes to find modal body font size
-            all_sizes = []
-            for page in pdf.pages:
-                words = page.extract_words(extra_attrs=["fontname", "size"])
-                all_sizes.extend(w["size"] for w in words if w["size"] > 0)
+        payload = json.dumps({
+            "model": DEFAULT_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }).encode()
+        req = urllib.request.Request(
+            OLLAMA_BASE + "/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            raw = json.loads(resp.read())["message"]["content"]
+    except (urllib.error.URLError, Exception):
+        return _fallback()
 
-            if not all_sizes:
-                # No text at all — return empty sections (caller will apply fallback)
-                return [], body_size
+    # Step d: strip+parse+pydantic fallback pattern (Ollama bugs #15260, #15416)
+    # Step d.1 — strip markdown fences
+    stripped = re.sub(r"^```(?:json)?\s*\n?|\n?```\s*$", "", raw.strip(), flags=re.MULTILINE)
 
-            body_size = Counter(round(s, 1) for s in all_sizes).most_common(1)[0][0]
+    # Step d.2 — parse JSON
+    parsed = None
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        pass
 
-            # Pass 2: collect all lines across pages with their font info
-            doc_lines = []  # list of {text, size, fontname, page_num, top}
-            for page_num, page in enumerate(pdf.pages, 1):
-                words = page.extract_words(extra_attrs=["fontname", "size"])
-                # Group words by approximate top position (same line = within 0.5 pt)
-                lines: dict[float, list] = {}
-                for w in words:
-                    line_top = round(w["top"], 0)
-                    lines.setdefault(line_top, []).append(w)
+    # Step d.3 — pydantic validation with typed defaults
+    if parsed is not None:
+        try:
+            model = _LLMPaperResult(**parsed)
+        except (ValidationError, TypeError):
+            model = _LLMPaperResult()
+    else:
+        model = _LLMPaperResult()
 
-                for top, line_words in sorted(lines.items()):
-                    line_text = " ".join(w["text"] for w in line_words)
-                    line_size = round(line_words[0]["size"], 1)
-                    line_font = line_words[0]["fontname"]
-                    doc_lines.append({
-                        "text": line_text,
-                        "size": line_size,
-                        "fontname": line_font,
-                        "page_num": page_num,
-                        "top": top,
-                    })
+    # Step d.4 — D-02 section fallback
+    sections = model.sections if model.sections else [{"title": "Body", "body": ""}]
 
-            # Pass 3: identify header lines and build sections
-            def _is_header(line: dict) -> bool:
-                is_larger = line["size"] > body_size + 0.5
-                is_bold = "bold" in line["fontname"].lower()
-                # Guard: very long lines are body text, not section headers
-                is_short_enough = len(line["text"]) < 120
-                return (is_larger or is_bold) and is_short_enough
-
-            current_header = None
-            current_body_lines = []
-
-            for line in doc_lines:
-                if _is_header(line):
-                    # Save previous section
-                    if current_header is not None:
-                        body_text = "\n".join(current_body_lines).strip()
-                        sections.append({"title": current_header, "body": body_text})
-                    elif current_body_lines:
-                        # Text before first header — treat as preamble
-                        body_text = "\n".join(current_body_lines).strip()
-                        if body_text:
-                            sections.append({"title": "Preamble", "body": body_text})
-                    current_header = line["text"]
-                    current_body_lines = []
-                else:
-                    current_body_lines.append(line["text"])
-
-            # Flush last section
-            if current_header is not None:
-                body_text = "\n".join(current_body_lines).strip()
-                sections.append({"title": current_header, "body": body_text})
-            elif current_body_lines:
-                # No headers at all — entire document is body
-                body_text = "\n".join(current_body_lines).strip()
-                if body_text:
-                    sections.append({"title": "Body", "body": body_text})
-
-    except Exception as e:
-        _fail(f"cannot open PDF: {e}")
-
-    # D-02 fallback: at least one section
-    if not sections:
-        sections = [{"title": "Body", "body": ""}]
-
-    return sections, body_size
+    # Step d.5 — return dict
+    return {
+        "title": model.title,
+        "authors": model.authors or ["Unknown"],
+        "abstract": model.abstract,
+        "sections": sections,
+        "bibliography": model.bibliography or None,
+        "figures": model.figures or None,
+    }
 
 
 def _read_registry(registry_path: str) -> dict:
@@ -498,7 +374,7 @@ def extract_paper(pdf_path: str) -> dict:
 
     Returns:
         PaperJSON dict with required fields: title, authors, abstract, sections,
-        source_path, doi, arxiv_id, year, journal, references.
+        source_path, doi, arxiv_id, year, journal, references, figures.
     """
     # Step 1: scanned PDF guard (INGEST-03, T-01-03)
     if _is_scanned(pdf_path):
@@ -510,13 +386,7 @@ def extract_paper(pdf_path: str) -> dict:
     registry_path = config["registry_path"]
     project_name = config["project_name"]
 
-    # Step 3: extract metadata (title, authors, year) — lightweight; needed for key computation
-    meta = _extract_metadata(pdf_path)
-    title = meta["title"] or "Unknown"
-    authors = meta["authors"] or ["Unknown"]
-    year = meta["year"]
-
-    # Step 4: layout detection and text extraction (needed for arXiv ID)
+    # Step 3: layout detection and text extraction
     try:
         with pdfplumber.open(pdf_path) as pdf:
             page0 = pdf.pages[0] if pdf.pages else None
@@ -525,45 +395,41 @@ def extract_paper(pdf_path: str) -> dict:
     except Exception as e:
         _fail(f"cannot open PDF: {e}")
 
-    # Step 5: extract arXiv ID from page 1 text
+    # Step 4: extract arXiv ID from page 1 text
     page1_text = pages_text[0] if pages_text else ""
     arxiv_id = _extract_arxiv_id(page1_text)
 
-    # Step 6: compute registry key from lightweight paper identity (D-12)
+    # Step 5: LLM-based extraction — replaces _extract_metadata + _find_sections_from_pdf
+    llm_result = _extract_with_llm(pages_text)
+
+    title = llm_result["title"] or "Unknown"
+    authors = llm_result["authors"] or ["Unknown"]
+    abstract = llm_result["abstract"]
+    sections = llm_result["sections"]
+    references = llm_result.get("bibliography") or None
+    figures = llm_result.get("figures")
+
+    # Step 6: inline pypdf year extraction (LLM does not return year)
+    year = None
+    try:
+        reader = PdfReader(pdf_path)
+        if reader.metadata and reader.metadata.creation_date:
+            year = reader.metadata.creation_date.year
+    except Exception:
+        pass  # metadata missing or malformed — proceed without year
+
+    # Step 7: compute registry key from paper identity (D-12)
     # DOI is not extracted in Phase 1 (Phase 3 web path fills it); key falls to
     # arXiv ID (if present) or SHA-256 title hash.
-    minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": title}
+    minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": llm_result["title"] or "Unknown"}
     key = _compute_registry_key(minimal_paper)
 
-    # Step 7: DEDUP CHECK (REG-02) — return cached entry if already ingested
+    # Step 8: DEDUP CHECK (REG-02) — return cached entry if already ingested
     registry = _read_registry(registry_path)
     if key in registry:
         return registry[key]
 
-    # Step 8: section detection via font heuristic (cache miss — full extraction)
-    sections, body_size = _find_sections_from_pdf(pdf_path)
-
-    # Step 9: extract abstract from sections
-    abstract = ""
-    for section in sections:
-        if "abstract" in section["title"].lower():
-            abstract = section["body"]
-            break
-
-    # Step 10: extract references from sections
-    references = None
-    for section in sections:
-        if section["title"].lower() in ("references", "bibliography"):
-            ref_text = section["body"]
-            # Split on newline + leading number pattern
-            raw_refs = re.split(r'\n\s*\[?\d+\]?\.?\s+', ref_text)
-            references = [r.strip() for r in raw_refs if r.strip()]
-            # Strip leading [N] or N. marker from every entry for consistency
-            # (the first entry has no preceding newline so the split misses it)
-            references = [re.sub(r'^\[?\d+\]?\.?\s+', '', r) for r in references]
-            break
-
-    # Step 11: assemble PaperJSON (D-01, D-02, D-03, D-04)
+    # Step 9: assemble PaperJSON (D-01, D-02, D-03, D-04)
     paper_json = {
         "title": title,
         "authors": authors,
@@ -574,10 +440,11 @@ def extract_paper(pdf_path: str) -> dict:
         "year": year,
         "journal": None,
         "references": references,
+        "figures": figures,
         "source_path": os.path.abspath(pdf_path),
     }
 
-    # Step 12: build D-14 registry entry and write (REG-01).
+    # Step 10: build D-14 registry entry and write (REG-01).
     # The registry entry stores the full PaperJSON plus D-14 metadata fields so that
     # a future cache hit (REG-02) returns the same PaperJSON schema.
     # summary and key_findings are null in Phase 1 (Open Question 2 — Phase 2 fills these).
