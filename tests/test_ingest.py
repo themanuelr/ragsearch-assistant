@@ -249,3 +249,26 @@ def test_registry_read_unicode_error(tmp_registry_path):
     assert result == {}, (
         f"_read_registry must return {{}} for UTF-16 encoded file, got: {result}"
     )
+
+
+def test_author_extraction_from_body(sample_pdf_path):
+    """
+    INGEST-01 regression: _extract_metadata extracts authors from body text when PDF metadata
+    author field is absent or contains only a sentinel value (e.g., 'anonymous').
+
+    sample_onecol.pdf has 'Alice Author, Bob Collaborator' as a visible author line on page 1
+    but its PDF info dict Author field is 'anonymous' — a sentinel that must be rejected.
+    After the fix, authors must come from body text.
+    """
+    result = extract_paper(sample_pdf_path)
+    assert result["authors"] != ["Unknown"], (
+        f"authors must not fall back to ['Unknown'] — expected body-text extraction, "
+        f"got: {result['authors']}"
+    )
+    assert len(result["authors"]) >= 1, (
+        f"authors must have at least one element, got: {result['authors']}"
+    )
+    # The fixture contains 'Alice Author, Bob Collaborator' — verify actual extraction
+    assert result["authors"] != ["anonymous"], (
+        f"authors must not be the sentinel value ['anonymous'], got: {result['authors']}"
+    )
