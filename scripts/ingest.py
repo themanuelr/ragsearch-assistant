@@ -187,6 +187,57 @@ def _extract_arxiv_id(page1_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _extract_authors_from_text(page1_text: str) -> list[str]:
+    """Scan page 1 text for author names when the LLM returns the 'Unknown' sentinel.
+
+    Heuristic: checks the first 15 lines for candidate author lines. A candidate line
+    must be non-empty, not a section-header keyword, 5-200 chars, and must split into
+    tokens that look like personal names (5-200 chars, at least one space, first char
+    uppercase, not all-uppercase). Splits on comma, ' and ', ' & '.
+
+    Returns a list of cleaned name strings, or [] if no candidates found.
+    No new imports — uses only re (already imported at module level).
+    """
+    _HEADER_KEYWORDS = frozenset({
+        "abstract", "introduction", "keywords", "doi", "arxiv", "copyright",
+        "received", "accepted", "published", "university", "department",
+        "institute", "school", "lab",
+    })
+
+    lines = page1_text.split("\n")[:15]
+    candidates = []
+    for line in lines:
+        line = line.strip()
+        # Skip empty, too short, too long
+        if not line or len(line) < 5 or len(line) > 200:
+            continue
+        # Skip lines containing section-header keywords
+        line_lower = line.lower()
+        if any(kw in line_lower for kw in _HEADER_KEYWORDS):
+            continue
+        # Split by comma, ' and ', ' & ' to get individual name tokens
+        tokens = re.split(r",\s*| and | & ", line)
+        names = []
+        for token in tokens:
+            token = token.strip()
+            if len(token) < 5 or len(token) > 200:
+                continue
+            # Must contain at least one space (first + last name minimum)
+            if " " not in token:
+                continue
+            # First char must be uppercase
+            if not token[0].isupper():
+                continue
+            # Must not be all-uppercase (avoids title-case section headers)
+            if token.isupper():
+                continue
+            names.append(token)
+        if names:
+            candidates.extend(names)
+
+    return candidates
+
+
 def _extract_with_llm(pages_text: list[str]) -> dict:
     """Send paper text to Ollama gemma4:e4b and extract structured fields.
 
@@ -421,6 +472,12 @@ def extract_paper(pdf_path: str) -> dict:
     sections = llm_result["sections"]
     references = llm_result.get("bibliography") or None
     figures = llm_result.get("figures")
+
+    # Offline fallback: recover authors from body text when LLM returns sentinel
+    if authors == ["Unknown"] and page1_text:
+        _heuristic = _extract_authors_from_text(page1_text)
+        if _heuristic:
+            authors = _heuristic
 
     # Step 6: inline pypdf year extraction (LLM does not return year)
     year = None
