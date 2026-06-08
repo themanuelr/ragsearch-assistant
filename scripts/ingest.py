@@ -167,7 +167,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
 
     Returns a dict with keys: title, authors, abstract, sections, bibliography, figures.
     """
-    from pydantic import BaseModel, ValidationError
+    from pydantic import BaseModel, ValidationError, field_validator
 
     class _LLMSectionList(BaseModel):
         sections: list[str] = []
@@ -177,6 +177,18 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         authors: list[str] = []
         abstract: str = ""
         year: int | None = None
+
+        @field_validator("year", mode="before")
+        @classmethod
+        def _coerce_year(cls, v: object) -> int | None:
+            """Tolerate non-numeric model years so a bad value cannot discard
+            valid title/authors/abstract (WR-01)."""
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str):
+                m = re.search(r"\b(\d{4})\b", v)
+                return int(m.group(1)) if m else None
+            return None
 
     class _LLMSection(BaseModel):
         title: str = ""
