@@ -313,6 +313,12 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
                     end = m_next.start()
             chunk = combined[start:end]
 
+        # Skip the network round-trip when there is no chunk to summarize —
+        # a paraphrased/unmatched title yields an empty chunk (WR-03).
+        if not chunk.strip():
+            sections.append({"title": sec_title, "body": ""})
+            continue
+
         body_text = ""
         try:
             raw_sec = _llm_post(
