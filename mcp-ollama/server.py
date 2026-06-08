@@ -42,9 +42,13 @@ def _ollama_chat(prompt: str, model: str, system: str | None = None) -> str:
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read())
-            return data["message"]["content"]
     except urllib.error.URLError as e:
         return f"[Ollama error: {e}]"
+
+    try:
+        return data["message"]["content"]
+    except (KeyError, TypeError):
+        return f"[Ollama error: unexpected response envelope: {data}]"
 
 
 def _ollama_chat_with_tools(messages: list, model: str, tools: list) -> dict:
