@@ -325,10 +325,9 @@ def test_author_extraction_from_body(sample_pdf_path):
 
 
 @patch("scripts.ingest.urllib.request.urlopen")
-def test_extract_with_llm_malformed_json(mock_urlopen):
-    """INGEST-01 LLM path: _extract_with_llm returns fallback defaults when Ollama returns
-    malformed JSON wrapped in markdown code fences — no exception raised (Ollama bug #15260
-    mitigation)."""
+def test_extract_with_llm_section_discovery_fallback(mock_urlopen):
+    """When section discovery returns malformed JSON, _extract_with_llm falls back to
+    a single Body section without raising."""
     # Ollama /api/chat response envelope wraps content in {"message": {"content": "..."}}
     # The content itself is malformed JSON wrapped in markdown fences (Ollama bug #15260)
     ollama_response = json.dumps({"message": {"content": "```json\n{\"bad: json\"\n```"}}).encode()
@@ -340,8 +339,10 @@ def test_extract_with_llm_malformed_json(mock_urlopen):
 
     assert isinstance(result, dict), "result must be a dict — no exception raised"
     assert result["title"] == "", f"title must be empty string fallback, got: {result['title']}"
-    assert result["sections"] == [{"title": "Body", "body": ""}], (
-        f"sections must be D-02 fallback, got: {result['sections']}"
+    assert len(result["sections"]) == 1
+    assert result["sections"][0]["title"] == "Body"
+    assert isinstance(result["sections"][0]["body"], str), (
+        f"sections[0]['body'] must be a str, got: {type(result['sections'][0]['body'])}"
     )
     assert result["authors"] == ["Unknown"], (
         f"authors must be D-02 fallback, got: {result['authors']}"
@@ -349,47 +350,50 @@ def test_extract_with_llm_malformed_json(mock_urlopen):
 
 
 @patch("scripts.ingest.urllib.request.urlopen")
-def test_extract_with_llm_figures_and_bibliography(mock_urlopen):
-    """INGEST-01 LLM path: _extract_with_llm returns figures and bibliography lists when
-    Ollama returns valid JSON containing both fields."""
-    paper_content = (
-        '{"title": "Test Paper", "authors": ["A. Author"], "abstract": "An abstract.", '
-        '"sections": [{"title": "Introduction", "body": "Intro text."}], '
-        '"bibliography": ["Smith et al. (2020). A paper. Journal. https://doi.org/10.1/2"], '
-        '"figures": [{"label": "Figure 1", "caption": "A diagram showing the system."}]}'
-    )
-    # Ollama /api/chat response envelope wraps content in {"message": {"content": "..."}}
-    ollama_response = json.dumps({"message": {"content": paper_content}}).encode()
-    mock_response = MagicMock()
-    mock_response.read.return_value = ollama_response
-    mock_urlopen.return_value.__enter__.return_value = mock_response
+def test_extract_with_llm_multi_call_returns_fields(mock_urlopen):
+    """Multi-call pipeline: section discovery + metadata + per-section calls return
+    structured fields. bibliography is detected from References section; figures is
+    None when no Figure/Table captions are present in the input text."""
+
+    def _make_mock_response(inner_payload):
+        response_bytes = json.dumps(
+            {"message": {"content": json.dumps(inner_payload)}}
+        ).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_bytes
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_resp
+        mock_ctx.__exit__.return_value = None
+        return mock_ctx
+
+    mock_urlopen.side_effect = [
+        _make_mock_response(["Introduction", "References"]),  # Call 1: section discovery
+        _make_mock_response({                                  # Call 2: metadata
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+        }),
+        _make_mock_response({"title": "Introduction", "body": "Intro text."}),   # Call 3
+        _make_mock_response({"title": "References", "body": "Smith et al. 2020."}),  # Call 4
+    ]
 
     result = _extract_with_llm(["Sample paper text"])
 
-    assert result["figures"] is not None and isinstance(result["figures"], list), (
-        f"figures must be a list, got: {result['figures']}"
+    assert result["title"] == "Test Paper", f"title must be 'Test Paper', got: {result['title']}"
+    assert result["authors"] == ["A. Author"], f"authors must be ['A. Author'], got: {result['authors']}"
+    assert result["abstract"] == "An abstract.", f"abstract mismatch: {result['abstract']}"
+    assert len(result["sections"]) == 2, f"sections must have 2 entries, got: {len(result['sections'])}"
+    assert result["sections"][0] == {"title": "Introduction", "body": "Intro text."}, (
+        f"sections[0] mismatch: {result['sections'][0]}"
     )
-    assert len(result["figures"]) == 1, (
-        f"figures must have 1 entry, got: {len(result['figures'])}"
-    )
-    assert "label" in result["figures"][0] and "caption" in result["figures"][0], (
-        f"figure must have 'label' and 'caption' keys, got: {result['figures'][0]}"
-    )
-    assert result["bibliography"] is not None and isinstance(result["bibliography"], list), (
-        f"bibliography must be a list, got: {result['bibliography']}"
-    )
-    assert len(result["bibliography"]) == 1, (
-        f"bibliography must have 1 entry, got: {len(result['bibliography'])}"
-    )
-    assert result["title"] == "Test Paper", (
-        f"title must be 'Test Paper', got: {result['title']}"
-    )
+    assert result["bibliography"] is not None, "bibliography must not be None (References section detected)"
+    assert result["figures"] is None, f"figures must be None (no Figure captions in input), got: {result['figures']}"
 
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_extract_with_llm_timeout(mock_urlopen):
     """INGEST-01 LLM path: _extract_with_llm re-raises urllib.error.URLError when Ollama
-    is unreachable — propagates to extract_paper() for fail-fast handling."""
+    is unreachable — fires on first call (section discovery) — fail-fast propagates immediately."""
     mock_urlopen.side_effect = urllib.error.URLError("connection timeout")
 
     with pytest.raises(urllib.error.URLError):

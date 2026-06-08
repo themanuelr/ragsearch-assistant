@@ -47,6 +47,7 @@ PAPER_JSON_KEYS = frozenset({
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 LLM_TEXT_TRUNCATE = 80_000  # max chars sent to Ollama — context overflow guard
+MAX_SECTIONS = 12  # max per-section LLM calls in the extraction pipeline
 
 # ---------------------------------------------------------------------------
 # internal helpers
@@ -241,30 +242,31 @@ def _extract_authors_from_text(page1_text: str) -> list[str]:
 
 
 def _extract_with_llm(pages_text: list[str]) -> dict:
-    """Send paper text to Ollama gemma4:e4b and extract structured fields.
+    """Multi-call pipeline: section discovery → metadata → per-section bodies.
 
-    Joins all page texts, truncates to LLM_TEXT_TRUNCATE chars, then posts to
-    Ollama /api/chat requesting JSON extraction of title, authors, abstract,
-    sections, bibliography, and figures.
+    Issues at least 2 separate HTTP calls to Ollama /api/chat for any non-empty
+    pages_text. Each call produces a small, bounded JSON response that cannot
+    overflow the Ollama JSON formatter (root cause fix for monolithic call failures).
 
-    Response parsing uses strip+parse+pydantic fallback pattern to handle
-    Ollama bugs #15260 (markdown fences in response) and #15416 (type coercion).
+    Raises urllib.error.URLError or TimeoutError when Ollama is unreachable.
+    Returns fallback defaults on non-network exceptions.
 
-    Returns a dict with keys: title, authors, abstract, sections, bibliography,
-    figures. Raises urllib.error.URLError when Ollama is unreachable — callers
-    must handle it. Returns fallback defaults on all other errors.
+    Returns a dict with keys: title, authors, abstract, sections, bibliography, figures.
     """
     from pydantic import BaseModel, ValidationError
 
-    class _LLMPaperResult(BaseModel):
+    class _LLMSectionList(BaseModel):
+        sections: list[str] = []
+
+    class _LLMMetadata(BaseModel):
         title: str = ""
         authors: list[str] = []
         abstract: str = ""
-        sections: list[dict] = []
-        bibliography: list[str] = []
-        figures: list[dict] = []
 
-    # Build fallback to return on any error
+    class _LLMSection(BaseModel):
+        title: str = ""
+        body: str = ""
+
     def _fallback() -> dict:
         return {
             "title": "",
@@ -275,88 +277,157 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             "figures": None,
         }
 
-    # Step a: join and truncate
     combined = "\n\n".join(pages_text)
-    truncated_text = combined[:LLM_TEXT_TRUNCATE]
 
-    # Step b: build prompt
-    prompt = (
-        "You are a scientific paper parser. Extract the following fields from the paper text "
-        "below and return ONLY valid JSON with no explanation, no markdown, and no code fences.\n\n"
-        "Required JSON schema:\n"
-        "{\"title\": \"string\", \"authors\": [\"string\"], \"abstract\": \"string\", "
-        "\"sections\": [{\"title\": \"string\", \"body\": \"string\"}], "
-        "\"bibliography\": [\"string\"], "
-        "\"figures\": [{\"label\": \"string\", \"caption\": \"string\"}]}\n\n"
-        "Rules:\n"
-        "- sections must include every section of the paper in reading order\n"
-        "- bibliography must include every reference as one complete string per entry\n"
-        "- figures must include every figure and table caption with its label "
-        "(e.g. 'Figure 1', 'Table 2')\n"
-        "- Return empty list [] for bibliography or figures if none found\n"
-        "- Return ONLY the JSON object, nothing else\n\n"
-        "Paper text:\n" + truncated_text
-    )
-
-    # Step c: HTTP request following exact urllib pattern from mcp-ollama/server.py
-    payload = json.dumps({
-        "model": DEFAULT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "format": "json",
-    }).encode()
-    req = urllib.request.Request(
-        OLLAMA_BASE + "/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+    def _llm_post(prompt: str, timeout: int = 120) -> str:
+        """POST prompt to Ollama /api/chat; return stripped content string."""
+        payload = json.dumps({
+            "model": DEFAULT_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "format": "json",
+        }).encode()
+        req = urllib.request.Request(
+            OLLAMA_BASE + "/api/chat",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError):
-        raise  # propagate to extract_paper() for fail-fast handling
-    except Exception as e:
-        print(f"[ingest warning: unexpected HTTP error: {e}]", file=sys.stderr)
-        return _fallback()
-
-    try:
         raw = body["message"]["content"]
-    except (KeyError, TypeError):
-        print(f"[ingest warning: unexpected Ollama response: {body}]", file=sys.stderr)
+        return re.sub(r"^```(?:json)?\s*\n?|\n?```\s*$", "", raw.strip(), flags=re.MULTILINE)
+
+    # Call 1: section discovery
+    section_titles: list[str] = []
+    try:
+        raw_discovery = _llm_post(
+            "You are a scientific paper parser. Read the paper text below and return ONLY "
+            "a JSON object with one key 'sections' whose value is an array of section title "
+            "strings in reading order. Example: {\"sections\": [\"Introduction\", \"Methods\", "
+            "\"Results\", \"Conclusion\"]}. Return ONLY the JSON object, nothing else.\n\n"
+            "Paper text:\n" + combined[:LLM_TEXT_TRUNCATE],
+            timeout=120,
+        )
+        try:
+            parsed = json.loads(raw_discovery)
+            if isinstance(parsed, list):
+                section_titles = [t for t in parsed if isinstance(t, str) and t.strip()]
+            else:
+                model = _LLMSectionList(**parsed)
+                section_titles = [t for t in model.sections if isinstance(t, str) and t.strip()]
+        except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
+            section_titles = []
+    except (urllib.error.URLError, TimeoutError):
+        raise
+    except Exception:
         return _fallback()
 
-    # Step d: strip+parse+pydantic fallback pattern (Ollama bugs #15260, #15416)
-    # Step d.1 — strip markdown fences
-    stripped = re.sub(r"^```(?:json)?\s*\n?|\n?```\s*$", "", raw.strip(), flags=re.MULTILINE)
-
-    # Step d.2 — parse JSON
-    parsed = None
+    # Call 2: metadata (always runs — even when section discovery returned empty)
+    page1_text = pages_text[0] if pages_text else ""
+    title = ""
+    authors: list[str] = ["Unknown"]
+    abstract = ""
     try:
-        parsed = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
+        raw_meta = _llm_post(
+            "You are a scientific paper parser. Read the paper text below and return ONLY "
+            "a JSON object with keys: 'title' (string), 'authors' (array of strings), "
+            "'abstract' (string). Return ONLY the JSON object, nothing else.\n\n"
+            "Paper text:\n" + page1_text[:8000],
+            timeout=120,
+        )
+        try:
+            parsed = json.loads(raw_meta)
+            meta = _LLMMetadata(**parsed)
+            title = meta.title
+            authors = meta.authors or ["Unknown"]
+            abstract = meta.abstract
+        except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
+            pass
+    except (urllib.error.URLError, TimeoutError):
+        raise
+    except Exception:
         pass
 
-    # Step d.3 — pydantic validation with typed defaults
-    if parsed is not None:
+    # Section discovery returned empty — use fallback sections, skip per-section calls
+    if not section_titles:
+        fig_matches = re.findall(
+            r'((?:Figure|Fig\.|Table)\s+\d+)',
+            combined[:LLM_TEXT_TRUNCATE],
+            flags=re.IGNORECASE,
+        )
+        return {
+            "title": title,
+            "authors": authors,
+            "abstract": abstract,
+            "sections": [{"title": "Body", "body": combined[:10000]}],
+            "bibliography": None,
+            "figures": [{"label": m, "caption": ""} for m in fig_matches[:20]] if fig_matches else None,
+        }
+
+    # Calls 3..N: per-section bodies (capped at MAX_SECTIONS)
+    sections: list[dict] = []
+    capped_titles = section_titles[:MAX_SECTIONS]
+    for i, sec_title in enumerate(capped_titles):
+        m = re.search(r'(?m)^\s*' + re.escape(sec_title), combined)
+        if not m:
+            chunk = ""
+        else:
+            start = m.start()
+            end = len(combined)
+            if i + 1 < len(capped_titles):
+                m_next = re.search(r'(?m)^\s*' + re.escape(capped_titles[i + 1]), combined)
+                if m_next and m_next.start() > start:
+                    end = m_next.start()
+            chunk = combined[start:end]
+
+        body_text = ""
         try:
-            model = _LLMPaperResult(**parsed)
-        except (ValidationError, TypeError):
-            model = _LLMPaperResult()
-    else:
-        model = _LLMPaperResult()
+            raw_sec = _llm_post(
+                "You are a scientific paper parser. Read the following section text and return "
+                "ONLY a JSON object with keys: 'title' (section title as string) and 'body' "
+                "(section content as string). Return ONLY the JSON object, nothing else.\n\n"
+                f"Section title: {sec_title}\n\nSection text:\n" + chunk,
+                timeout=120,
+            )
+            try:
+                parsed = json.loads(raw_sec)
+                sec_model = _LLMSection(**parsed)
+                body_text = sec_model.body
+            except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
+                body_text = ""
+        except (urllib.error.URLError, TimeoutError):
+            raise
+        except Exception:
+            body_text = ""
+        sections.append({"title": sec_title, "body": body_text})
 
-    # Step d.4 — D-02 section fallback
-    sections = model.sections if model.sections else [{"title": "Body", "body": ""}]
+    if not sections:
+        sections = [{"title": "Body", "body": combined[:10000]}]
 
-    # Step d.5 — return dict
+    # Bibliography: check last section title for reference/bibliography markers
+    bibliography = None
+    if sections:
+        last_title = sections[-1]["title"].lower()
+        if "reference" in last_title or "bibliograph" in last_title:
+            lines = [ln.strip() for ln in sections[-1]["body"].split("\n") if ln.strip()]
+            bibliography = lines if lines else None
+
+    # Figures: regex scan for Figure/Table labels — no extra LLM call
+    fig_matches = re.findall(
+        r'((?:Figure|Fig\.|Table)\s+\d+)',
+        combined[:LLM_TEXT_TRUNCATE],
+        flags=re.IGNORECASE,
+    )
+    figures = [{"label": m, "caption": ""} for m in fig_matches[:20]] if fig_matches else None
+
     return {
-        "title": model.title,
-        "authors": model.authors or ["Unknown"],
-        "abstract": model.abstract,
+        "title": title,
+        "authors": authors,
+        "abstract": abstract,
         "sections": sections,
-        "bibliography": model.bibliography or None,
-        "figures": model.figures or None,
+        "bibliography": bibliography,
+        "figures": figures,
     }
 
 
