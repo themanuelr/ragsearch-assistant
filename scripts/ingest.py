@@ -303,6 +303,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         "model": DEFAULT_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
+        "format": "json",
     }).encode()
     req = urllib.request.Request(
         OLLAMA_BASE + "/api/chat",
@@ -313,7 +314,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read())
-    except urllib.error.URLError:
+    except (urllib.error.URLError, TimeoutError):
         raise  # propagate to extract_paper() for fail-fast handling
     except Exception as e:
         print(f"[ingest warning: unexpected HTTP error: {e}]", file=sys.stderr)
