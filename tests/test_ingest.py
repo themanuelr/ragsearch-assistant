@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import urllib.error
+import urllib.request
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -126,6 +127,20 @@ def test_scanned_pdf_error(scanned_pdf_path):
         assert str(e), "exception message must not be empty"
 
 
+
+def _ollama_available() -> bool:
+    """Return True if Ollama is reachable at localhost:11434."""
+    try:
+        urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    not _ollama_available(),
+    reason="requires live Ollama server"
+)
 def test_process_pdf_mcp_tool(sample_pdf_path):
     """
     INGEST-04: process_pdf MCP tool returns the same PaperJSON as the CLI.
@@ -140,7 +155,7 @@ def test_process_pdf_mcp_tool(sample_pdf_path):
         [sys.executable, ingest_script, "--pdf", sample_pdf_path],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=360,
     )
     assert result.returncode == 0, (
         f"ingest.py CLI must exit 0 for a valid PDF; stderr: {result.stderr.strip()}"
