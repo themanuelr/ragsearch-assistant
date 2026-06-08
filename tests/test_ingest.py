@@ -409,3 +409,15 @@ def test_extract_paper_fails_on_ollama_unreachable(mock_llm, sample_pdf_path):
     with pytest.raises(SystemExit) as exc_info:
         extract_paper(sample_pdf_path)
     assert exc_info.value.code == 1
+
+
+@patch("scripts.ingest._extract_with_llm")
+def test_extract_paper_fails_on_timeout(mock_llm, sample_pdf_path):
+    """extract_paper must exit(1) when _extract_with_llm raises TimeoutError."""
+    mock_llm.side_effect = TimeoutError("timed out waiting for Ollama")
+
+    with pytest.raises(SystemExit) as exc_info:
+        extract_paper(sample_pdf_path)
+    assert exc_info.value.code == 1, (
+        f"extract_paper must exit with code 1 on TimeoutError, got: {exc_info.value.code}"
+    )

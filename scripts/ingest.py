@@ -540,7 +540,7 @@ def extract_paper(pdf_path: str) -> dict:
     # Step 5: LLM-based extraction (required — fails fast if Ollama unreachable)
     try:
         llm_result = _extract_with_llm(pages_text)
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, TimeoutError) as e:
         _fail(f"Ollama unreachable — LLM is required for extraction: {e}")
 
     title = llm_result["title"] or "Unknown"
