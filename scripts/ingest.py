@@ -15,6 +15,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from typing import NoReturn
 # ---------------------------------------------------------------------------
 # third-party
 # ---------------------------------------------------------------------------
@@ -51,7 +52,7 @@ LLM_TEXT_TRUNCATE = 80_000  # max chars sent to Ollama — context overflow guar
 # internal helpers
 # ---------------------------------------------------------------------------
 
-def _fail(msg: str) -> None:
+def _fail(msg: str) -> NoReturn:
     """Print error to stderr and exit non-zero."""
     print(f"[ingest error: {msg}]", file=sys.stderr)
     sys.exit(1)
