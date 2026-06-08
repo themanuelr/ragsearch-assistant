@@ -345,7 +345,12 @@ def test_extract_with_llm_multi_call_returns_fields(mock_urlopen):
         _make_mock_response({"title": "References", "body": "Smith et al. 2020."}),  # Call 4
     ]
 
-    result = _extract_with_llm(["Sample paper text"])
+    # Input text must contain the discovered section headings so the per-section
+    # chunk matcher finds non-empty bodies — otherwise the empty-chunk guard
+    # (WR-03) correctly skips the per-section LLM call.
+    result = _extract_with_llm([
+        "Introduction\nSome intro body.\n\nReferences\nSmith et al. 2020."
+    ])
 
     assert result["title"] == "Test Paper", f"title must be 'Test Paper', got: {result['title']}"
     assert result["authors"] == ["A. Author"], f"authors must be ['A. Author'], got: {result['authors']}"
