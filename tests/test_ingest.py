@@ -56,32 +56,23 @@ def test_paper_json_schema(sample_pdf_path):
     assert isinstance(result["source_path"], str), "source_path must be a str"
 
 
-def test_two_column_layout(sample_twocol_pdf_path):
+def test_two_column_arxiv_id_extraction(sample_twocol_pdf_path):
     """
-    INGEST-02: extract_paper processes two-column PDFs via simple per-page text extraction.
+    INGEST-02: extract_paper extracts the arXiv ID from a two-column PDF fixture.
 
-    Text extraction uses extract_text(x_tolerance=3) per page (no layout detection).
-    Sections are supplied by the LLM mock (autouse _mock_llm fixture returns Section A and
-    Section B). arXiv ID is extracted from the fixture footer via _extract_arxiv_id.
+    Text extraction uses extract_text(x_tolerance=3) per page (no layout detection —
+    the column-reordering logic was removed by gap-closure plan 01-10). Sections are
+    supplied by the autouse _mock_llm fixture, so this test only verifies real wiring
+    that is exercised by production code: per-page extraction produces sections, and
+    _extract_arxiv_id pulls the ID from the fixture footer.
 
-    The assertions verify that sections are present and arXiv ID is extracted — both rely on
-    the LLM mock and real _extract_arxiv_id, not on any deleted column-reordering logic.
+    Reading-order assertions were removed (WR-02): the previous idx_a < idx_b check only
+    verified the order of constants baked into the mock, not any code under test.
     """
     result = extract_paper(sample_twocol_pdf_path)
     assert isinstance(result, dict), "extract_paper must return a dict"
     assert isinstance(result["sections"], list) and len(result["sections"]) >= 1, \
         "two-column PDF must produce at least one section"
-    # Concatenate all section content for reading-order check
-    all_text = " ".join(
-        s.get("title", "") + " " + s.get("body", "")
-        for s in result["sections"]
-    ).lower()
-    # "section a" (left) must appear before "section b" (right) in the output
-    idx_a = all_text.find("section a")
-    idx_b = all_text.find("section b")
-    assert idx_a != -1, "left column 'Section A' content not found in output"
-    assert idx_b != -1, "right column 'Section B' content not found in output"
-    assert idx_a < idx_b, "left column must appear before right column (reading order)"
     # arXiv ID must be extracted from footer (INGEST-02 wiring check)
     arxiv_id = result.get("arxiv_id")
     assert arxiv_id is not None, "arxiv_id must be extracted from two-column fixture footer"
