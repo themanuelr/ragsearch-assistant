@@ -18,12 +18,9 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-import pdfplumber  # used directly only in test_detect_layout
-
 from scripts.ingest import (
     PAPER_JSON_KEYS,
     _compute_registry_key,
-    _detect_layout,
     _extract_with_llm,
     _find_config,
     _load_config,
@@ -31,24 +28,6 @@ from scripts.ingest import (
     _write_registry_entry,
     extract_paper,
 )
-
-
-def test_detect_layout(sample_pdf_path, sample_twocol_pdf_path):
-    """
-    INGEST-02 (unit): _detect_layout returns True for two-column PDFs, False for single-column.
-
-    The D-06 heuristic crops to the bottom 70% of page 1 (Pitfall 2 mitigation) and counts
-    words whose x0 exceeds the midpoint. A right-half ratio > TWO_COL_RIGHT_RATIO (0.30)
-    signals two-column layout.
-    """
-    with pdfplumber.open(sample_twocol_pdf_path) as pdf:
-        assert _detect_layout(pdf.pages[0]) is True, (
-            "_detect_layout must return True for two-column sample_twocol.pdf"
-        )
-    with pdfplumber.open(sample_pdf_path) as pdf:
-        assert _detect_layout(pdf.pages[0]) is False, (
-            "_detect_layout must return False for single-column sample_onecol.pdf"
-        )
 
 
 def test_paper_json_schema(sample_pdf_path):
@@ -79,10 +58,14 @@ def test_paper_json_schema(sample_pdf_path):
 
 def test_two_column_layout(sample_twocol_pdf_path):
     """
-    INGEST-02: extract_paper handles two-column PDFs with correct reading order.
+    INGEST-02: extract_paper processes two-column PDFs via simple per-page text extraction.
 
-    The sample_twocol.pdf has Section A in left column and Section B in right column.
-    Correct reading order: left column text appears before right column text in sections.
+    Text extraction uses extract_text(x_tolerance=3) per page (no layout detection).
+    Sections are supplied by the LLM mock (autouse _mock_llm fixture returns Section A and
+    Section B). arXiv ID is extracted from the fixture footer via _extract_arxiv_id.
+
+    The assertions verify that sections are present and arXiv ID is extracted — both rely on
+    the LLM mock and real _extract_arxiv_id, not on any deleted column-reordering logic.
     """
     result = extract_paper(sample_twocol_pdf_path)
     assert isinstance(result, dict), "extract_paper must return a dict"
@@ -296,12 +279,13 @@ def test_registry_read_unicode_error(tmp_registry_path):
 
 def test_author_extraction_from_body(sample_pdf_path):
     """
-    INGEST-01 regression: _extract_metadata extracts authors from body text when PDF metadata
-    author field is absent or contains only a sentinel value (e.g., 'anonymous').
+    INGEST-01 regression: extract_paper returns authors from the LLM result, not from a
+    deleted body-text heuristic.
 
-    sample_onecol.pdf has 'Alice Author, Bob Collaborator' as a visible author line on page 1
-    but its PDF info dict Author field is 'anonymous' — a sentinel that must be rejected.
-    After the fix, authors must come from body text.
+    Under the autouse _mock_llm fixture, _extract_with_llm returns
+    authors=["Alice Author", "Bob Collaborator"]. This test verifies that the
+    extract_paper contract holds: authors must not be ["Unknown"], ["anonymous"], or empty.
+    Authors flow exclusively from the LLM result (no offline heuristic path remains).
     """
     result = extract_paper(sample_pdf_path)
     assert result["authors"] != ["Unknown"], (
