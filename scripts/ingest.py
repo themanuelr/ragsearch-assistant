@@ -46,7 +46,9 @@ PAPER_JSON_KEYS = frozenset({
 
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
-LLM_TEXT_TRUNCATE = 80_000  # max chars sent to Ollama — context overflow guard
+LLM_TEXT_TRUNCATE = 80_000   # max chars sent to Ollama — context overflow guard
+LLM_PAGE1_TRUNCATE = 8_000   # chars for page-1 metadata call
+LLM_SECTION_TRUNCATE = 15_000  # chars per section body call
 MAX_SECTIONS = 12  # max per-section LLM calls in the extraction pipeline
 
 # ---------------------------------------------------------------------------
@@ -336,7 +338,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             "You are a scientific paper parser. Read the paper text below and return ONLY "
             "a JSON object with keys: 'title' (string), 'authors' (array of strings), "
             "'abstract' (string). Return ONLY the JSON object, nothing else.\n\n"
-            "Paper text:\n" + page1_text[:8000],
+            "Paper text:\n" + page1_text[:LLM_PAGE1_TRUNCATE],
             timeout=120,
         )
         try:
@@ -390,7 +392,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
                 "You are a scientific paper parser. Read the following section text and return "
                 "ONLY a JSON object with keys: 'title' (section title as string) and 'body' "
                 "(section content as string). Return ONLY the JSON object, nothing else.\n\n"
-                f"Section title: {sec_title}\n\nSection text:\n" + chunk,
+                f"Section title: {sec_title}\n\nSection text:\n" + chunk[:LLM_SECTION_TRUNCATE],
                 timeout=120,
             )
             try:
