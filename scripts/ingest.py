@@ -234,6 +234,9 @@ def _extract_authors_from_text(page1_text: str) -> list[str]:
             # Must not be all-uppercase (avoids title-case section headers)
             if token.isupper():
                 continue
+            # Reject tokens with more than 4 words — impractical as a personal name
+            if len(token.split()) > 4:
+                continue
             names.append(token)
         if names:
             candidates.extend(names)
