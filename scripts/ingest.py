@@ -31,6 +31,11 @@ SCANNED_CHAR_THRESHOLD = 100
 TWO_COL_RIGHT_RATIO = 0.30
 _TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
 _AUTHOR_SENTINELS = frozenset({"unknown", "anonymous", "n/a", "none", ""})
+_AUTHOR_HEADER_KEYWORDS = frozenset({
+    "abstract", "introduction", "keywords", "doi", "arxiv", "copyright",
+    "received", "accepted", "published", "university", "department",
+    "institute", "school", "lab",
+})
 REQUIRED_CONFIG_KEYS = ("registry_path", "vault_path")
 
 PAPER_JSON_KEYS = frozenset({
@@ -198,11 +203,6 @@ def _extract_authors_from_text(page1_text: str) -> list[str]:
     Returns a list of cleaned name strings, or [] if no candidates found.
     No new imports — uses only re (already imported at module level).
     """
-    _HEADER_KEYWORDS = frozenset({
-        "abstract", "introduction", "keywords", "doi", "arxiv", "copyright",
-        "received", "accepted", "published", "university", "department",
-        "institute", "school", "lab",
-    })
 
     lines = page1_text.split("\n")[:15]
     candidates = []
@@ -213,7 +213,7 @@ def _extract_authors_from_text(page1_text: str) -> list[str]:
             continue
         # Skip lines containing section-header keywords
         line_lower = line.lower()
-        if any(kw in line_lower for kw in _HEADER_KEYWORDS):
+        if any(kw in line_lower for kw in _AUTHOR_HEADER_KEYWORDS):
             continue
         # Split by comma, ' and ', ' & ' to get individual name tokens
         tokens = re.split(r",\s*| and | & ", line)
