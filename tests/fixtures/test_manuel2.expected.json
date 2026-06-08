@@ -1,0 +1,114 @@
+{
+  "_comment": "Hand-authored ground-truth PaperJSON for tests/fixtures/test_manuel2.pdf (Scientific Reports 2026). Built by reading the PDF directly. Use to score live ingest.py output. Section 'body' fields hold an anchor excerpt (first ~1 sentence) — exact body text is not expected to match verbatim (the LLM may paraphrase or trim), but the section MUST be present, non-empty, and contain the anchored content. Metadata, doi, year, journal, references, and figures ARE exact-match targets.",
+  "title": "The impact of community-acquired critical sepsis on long-term mortality and morbidity—a nationwide cohort study",
+  "authors": [
+    "Ann-Charlotte Lindström",
+    "Jesper Eriksson",
+    "Mikael Eriksson",
+    "Erik von Oelreich",
+    "Johan Mårtensson",
+    "Emma Larsson",
+    "Anders Oldner"
+  ],
+  "abstract": "The long-term consequences of sepsis, including mortality and morbidity among survivors, are insufficiently understood. This nationwide matched cohort study investigated the association between presumed community-acquired critical sepsis (PCACS) and long-term mortality, the morbidity burden before and after ICU admission, and causes of death. Patients admitted to Swedish ICUs for PCACS over a ten-year period (n = 10,072) were matched 1:5 with population controls (n = 50,180). Data on demographics, comorbidities, education, income, and causes of death were collected. Conditional Cox regression was used to assess long-term mortality. Patients with sepsis exhibited a progressive increase in morbidity during the five years preceding ICU admission, which further escalated in the year following discharge. Sepsis was associated with excess mortality up to three years post-admission. Among one-year survivors, sepsis remained independently associated with increased mortality between years one and three, even after adjusting for prior morbidity, indicating persistent long-term effects not fully explained by diagnosed conditions. Early deaths were primarily due to infections and cancer, while later deaths were dominated by cancer and circulatory diseases. These findings highlight the sustained impact of sepsis on survivors, underscoring the need for long-term follow-up and targeted interventions to mitigate post-septic morbidity and mortality.",
+  "year": 2026,
+  "doi": "10.1038/s41598-026-53619-9",
+  "arxiv_id": null,
+  "journal": "Scientific Reports",
+  "sections": [
+    {
+      "title": "Introduction",
+      "_note": "No literal 'Introduction' heading exists in this paper; the introduction is the body text immediately following the abstract (before the 'Materials and methods' heading). A correct extractor must still capture this content even though the heading is absent.",
+      "body": "Sepsis poses a significant global health challenge, with an estimated 50 million cases annually and accounting for almost 20% of all global deaths. ... The aim of this nationwide matched cohort study was to investigate the association between presumed community-acquired critical sepsis and long-term mortality."
+    },
+    {
+      "title": "Materials and methods",
+      "_subsections": ["Ethics approval", "Study population", "National register data", "Outcomes", "Statistical analysis"],
+      "body": "This nationwide matched cohort study was approved by the regional ethical review board in Stockholm, Sweden ... All statistical analyses were performed with Stata/MP 16.1 (StataCorp, College Station, TX)."
+    },
+    {
+      "title": "Results",
+      "_subsections": ["Demography", "Comorbidity trajectories", "Mortality", "Sepsis and risk of death among one-year survivors", "Causes of death"],
+      "body": "The study population included 10 072 patients with sepsis and 50 180 controls. ... Later causes of death were dominated by cancer and circulatory causes."
+    },
+    {
+      "title": "Discussion",
+      "_subsections": ["Key findings", "Relationship with previous studies", "Implication of study findings", "Strengths and limitations"],
+      "body": "In this nationwide matched cohort study of patients admitted to the ICU for PCACS, we found a sustained excess mortality up until three-years after admission, even after adjusting for relevant confounders."
+    },
+    {
+      "title": "Conclusions",
+      "body": "Among patients admitted to the ICU for PCACS, there was a notable increase in morbidity during the period preceding admission, followed by a distinct rise in the post-discharge phase. Exposure to sepsis was associated with excessive mortality up until three years after ICU admission."
+    }
+  ],
+  "references": [
+    "1. Reinhart, K. et al. Recognizing sepsis as a global health priority - A WHO resolution. N. Engl. J. Med. 377(5), 414–7 (2017).",
+    "2. Rudd, K. E. et al. Global, regional, and national sepsis incidence and mortality, 1990–2017: Analysis for the Global Burden of Disease Study. Lancet 395(10219), 200–11 (2020).",
+    "3. Kumar, G. et al. Nationwide trends of severe sepsis in the 21st century (2000–2007). Chest 140(5), 1223–1231 (2011).",
+    "4. Shankar-Hari, M., Harrison, D. A., Rubenfeld, G. D. & Rowan, K. Epidemiology of sepsis and septic shock in critical care units: Comparison between sepsis-2 and sepsis-3 populations using a national critical care database. Br. J. Anaesth. 119(4), 626–36 (2017).",
+    "5. Martin, G. S., Mannino, D. M., Eaton, S. & Moss, M. The epidemiology of sepsis in the United States from 1979 through 2000. N. Engl. J. Med. 348(16), 1546–54 (2003).",
+    "6. Valles, J. et al. Trends in the incidence and mortality of patients with community-acquired septic shock 2003–2016. J. Crit. Care 53, 46–52 (2019).",
+    "7. Rubens, M. et al. Increasing sepsis rates in the United States: Results from national inpatient sample, 2005 to 2014. J. Intensive Care Med. 35(9), 858–868 (2020).",
+    "8. Fleischmann, C. et al. Assessment of global incidence and mortality of hospital-treated sepsis. Current estimates and limitations. Am. J. Respir. Crit. Care Med. 193(3), 259–72 (2016).",
+    "9. Kaukonen, K. M., Bailey, M., Suzuki, S., Pilcher, D. & Bellomo, R. Mortality related to severe sepsis and septic shock among critically ill patients in Australia and New Zealand, 2000–2012. JAMA 311(13), 1308–1316 (2014).",
+    "10. Stevenson, E. K., Rubenstein, A. R., Radin, G. T., Wiener, R. S. & Walkey, A. J. Two decades of mortality trends among patients with severe sepsis: a comparative meta-analysis. Crit. Care Med. 42(3), 625–31 (2014).",
+    "11. Shankar-Hari, M. et al. Evidence for a causal link between sepsis and long-term mortality: a systematic review of epidemiologic studies. Crit. Care 20, 101 (2016).",
+    "12. Winters, B. D. et al. Long-term mortality and quality of life in sepsis: a systematic review. Crit. Care Med. 38(5), 1276–83 (2010).",
+    "13. Rahmel, T. et al. Long-term mortality and outcome in hospital survivors of septic shock, sepsis, and severe infections: The importance of aftercare. PLoS One. 15(2), e0228952 (2020).",
+    "14. von Elm, E. et al. The Strengthening the Reporting of Observational Studies in Epidemiology (STROBE) Statement: guidelines for reporting observational studies. Int. J. Surg. 12(12), 1495–1499 (2014).",
+    "15. SCB. Statistics Sweden https://www.scb.se/en/.",
+    "16. Svenska & Intensivvårdsregistret (SIR). https://www.icuregswe.org/.",
+    "17. Socialstyrelsen. Patientregistret, S. https://www.socialstyrelsen.se/statistik-och-data/register/alla-register/patientregistret/ (2018).",
+    "18. Quan, H. et al. Coding algorithms for defining comorbidities in ICD-9-CM and ICD-10 administrative data. Med. Care 43(11), 1130–9 (2005).",
+    "19. Socialstyrelsen TSbohaw & Dödsorsaksregistret Cause of death register: Socialstyrelsen, The Swedish board of health and welfare. https://www.socialstyrelsen.se/statistik-och-data/register/alla-register/dodsorsaksregistret/ (2018).",
+    "20. Ludvigsson, J. F., Svedberg, P., Olén, O., Bruze, G. & Neovius, M. The longitudinal integrated database for health insurance and labour market studies (LISA) and its use in medical research. Eur. J. Epidemiol. 34(4), 423–437 (2019).",
+    "21. Socialstyrelsen Swedish Prescribed Drug Register. https://www.socialstyrelsen.se/statistik-och-data/register/lakemedelsregistret/.",
+    "22. Schmidt, K. et al. Long-term survival following sepsis. Dtsch Arztebl Int 117(46), 775–82 (2020).",
+    "23. Vesteinsdottir, E., Sigurdsson, M. I., Gottfredsson, M., Blondal, A. & Karason, S. Temporal trends in the epidemiology, management, and outcome of sepsis-A nationwide observational study. Acta Anaesthesiol. Scand. 66(4), 497–506 (2022).",
+    "24. Pandolfi, F., Guillemot, D., Watier, L. & Brun-Buisson, C. Trends in bacterial sepsis incidence and mortality in France between 2015 and 2019 based on National Health Data System (Système National des données de Santé (SNDS)): A retrospective observational study. BMJ Open. 12(5), e058205 (2022).",
+    "25. Yende, S. et al. Risk of cardiovascular events in survivors of severe sepsis. Am. J. Respir. Crit. Care Med. 189(9), 1065–74 (2014).",
+    "26. Kosyakovsky, L. B. et al. Association between sepsis survivorship and long-term cardiovascular outcomes in adults: A systematic review and meta-analysis. Intensive Care Med. 47(9), 931–42 (2021).",
+    "27. Merdji, H., Schini-Kerth, V., Meziani, F. & Toti, F. Long-term cardiovascular complications following sepsis: Is senescence the missing link?. Ann. Intensive Care 11(1), 166 (2021).",
+    "28. Balintescu, A. et al. Prevalence and impact of chronic dysglycemia in intensive care unit patients-A retrospective cohort study. Acta Anaesthesiol. Scand. 65(1), 82–91 (2021).",
+    "29. Zhang, T. et al. Risk for newly diagnosed diabetes after COVID-19: A systematic review and meta-analysis. BMC Med. 20(1), 444 (2022).",
+    "30. Yende, S. & Angus, D. C. Long-term outcomes from sepsis. Curr. Infect. Dis. Rep. 9(5), 382–386 (2007).",
+    "31. Yende, S., Iwashyna, T. J. & Angus, D. C. Interplay between sepsis and chronic health. Trends Mol. Med. 20(4), 234–238 (2014).",
+    "32. Farrah, K. et al. Sepsis-associated mortality, resource use, and healthcare costs: A propensity-matched cohort study. Crit. Care Med. 49(2), 215–27 (2021).",
+    "33. Roh, J. et al. Factors predicting long-term survival of patients with sepsis on arrival at the emergency department: A single-center, observational study. Medicine (Baltimore) 98(33), e16871 (2019).",
+    "34. Abu-Kaf, H., Mizrakli, Y., Novack, V. & Dreiher, J. Long-term survival of young patients surviving ICU admission with severe sepsis. Crit. Care Med. 46(8), 1269–1275 (2018).",
+    "35. Kim, S. M. et al. Prognostic factors for late death in septic shock survivors: A multi-center, prospective, registry-based observational study. Intern. Emerg. Med. https://doi.org/10.1007/s11739-021-02847-0 (2021).",
+    "36. Prescott, H. C., Osterholzer, J. J., Langa, K. M., Angus, D. C. & Iwashyna, T. J. Late mortality after sepsis: Propensity matched cohort study. BMJ 353, i2375 (2016).",
+    "37. Garland, A., Olafson, K., Ramsey, C. D., Yogendran, M. & Fransoo, R. Distinct determinants of long-term and short-term survival in critical illness. Intensive Care Med. 40(8), 1097–1105 (2014).",
+    "38. Clermont, G. et al. Does acute organ dysfunction predict patient-centered outcomes? Chest 121(6), 1963–1971 (2002).",
+    "39. Quartin, A. A., Schein, R. M., Kett, D. H., Peduzzi, P. N., Department of Veterans Affairs Systemic Sepsis Cooperative Studies Group. Magnitude and duration of the effect of sepsis on survival. JAMA 277(13), 1058–63 (1997).",
+    "40. Arina, P. & Singer, M. Pathophysiology of sepsis. Curr. Opin. Anaesthesiol. 34(2), 77–84 (2021).",
+    "41. Wilhelms, S. B., Walther, S. M., Sjöberg, F. & De Geer, L. Causes of late mortality among ICU-treated patients with sepsis. Acta Anaesthesiol. Scand. 64(7), 961–6 (2020).",
+    "42. Ludvigsson, J. F. et al. External review and validation of the Swedish national inpatient register. BMC Public Health 11, 450 (2011).",
+    "43. Schafer, J. L. Multiple imputation: A primer. Stat. Methods Med. Res. 8(1), 3–15 (1999)."
+  ],
+  "figures": [
+    {"label": "Table 1", "caption": "Baseline characteristics and mortality of patients with sepsis and matched controls."},
+    {"label": "Table 2", "caption": "Baseline characteristics and mortality of patients with sepsis and matched controls with Charlson's Comorbidity Index zero at ICU admission."},
+    {"label": "Fig. 1", "caption": "Mean Charlson's Comorbidity Index (CCI) over time."},
+    {"label": "Fig. 2", "caption": "Trajectory of prevalence of the most common diagnoses included in Charlson's Comorbidity Index over time."},
+    {"label": "Fig. 3", "caption": "Kaplan-Meier survival plot."},
+    {"label": "Fig. 4", "caption": "Hazard ratios for mortality over time for patients with sepsis versus controls."},
+    {"label": "Fig. 5", "caption": "Proportions (%) of categories of causes of death for the patients with sepsis and controls."}
+  ],
+  "_scoring_targets": {
+    "exact_match": ["title", "authors", "year", "doi", "journal", "arxiv_id"],
+    "structural": {
+      "sections": "5 top-level sections; each non-empty; Introduction body MUST be captured despite missing heading",
+      "references": "43 entries, list of strings (raw reference list); count and content checkable",
+      "figures": "7 items (5 figures + 2 tables), no duplicate labels"
+    },
+    "known_live_failures_2026-06-08": {
+      "doi": "got null — DOI extraction not wired in",
+      "journal": "got null — not requested from LLM",
+      "references": "got null — bibliography extraction returned nothing",
+      "sections[Introduction].body": "got empty string — regex chunk-match failed on absent 'Introduction' heading (WR-03 path)",
+      "figures": "got 20 items with duplicate 'Table 1' entries and empty captions",
+      "cli": "python scripts/ingest.py --pdf ... exited 1 (UnicodeEncodeError on Windows cp1252 stdout) despite successful extraction + registry write"
+    }
+  }
+}
