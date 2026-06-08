@@ -483,8 +483,14 @@ def _write_registry_entry(registry_path: str, key: str, entry: dict) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(registry, f, indent=2, ensure_ascii=False)
+            fd = -1  # fdopen closed it; prevent double-close
             os.replace(tmp_path, registry_path)
-        except Exception:
+        except BaseException:
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             raise
