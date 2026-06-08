@@ -18,7 +18,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-import pdfplumber
+import pdfplumber  # used directly only in test_detect_layout
 
 from scripts.ingest import (
     PAPER_JSON_KEYS,
