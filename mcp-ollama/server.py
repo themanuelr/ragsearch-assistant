@@ -142,7 +142,7 @@ def ask_local_model(prompt: str, system: str = "") -> str:
 @mcp.tool()
 def research(query: str) -> str:
     """
-    Ask the local Gemma 4 12b model to research a topic autonomously using web search.
+    Ask the local Gemma 4 e4b model to research a topic autonomously using web search.
 
     IMPORTANT: Only call this tool when the user explicitly requests it,
     for example by saying "research X", "use the local model to research", or
