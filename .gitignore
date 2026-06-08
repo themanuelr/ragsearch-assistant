@@ -26,6 +26,7 @@ chroma_db/
 # PDF files (user-supplied, never committed — except test fixtures)
 *.pdf
 !tests/fixtures/*.pdf
+tests/fixtures/test_manuel1.pdf
 
 # Registry (shared across clones, not in repo)
 papers_registry.json
@@ -35,6 +36,10 @@ papers_registry.json
 Thumbs.db
 .idea/
 .vscode/
+.obsidian/
+
+# Claude Code local settings and memory
+.claude/
 
 # pytest cache
 .pytest_cache/
@@ -42,3 +47,7 @@ Thumbs.db
 # Coverage reports
 .coverage
 htmlcov/
+
+#user files
+NOTES.md
+STARTING_POINT.md
