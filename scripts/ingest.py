@@ -251,7 +251,8 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     Ollama bugs #15260 (markdown fences in response) and #15416 (type coercion).
 
     Returns a dict with keys: title, authors, abstract, sections, bibliography,
-    figures. Never raises — returns fallback defaults on any error.
+    figures. Raises urllib.error.URLError when Ollama is unreachable — callers
+    must handle it. Returns fallback defaults on all other errors.
     """
     from pydantic import BaseModel, ValidationError
 
@@ -312,9 +313,8 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read())
-    except urllib.error.URLError as e:
-        print(f"[ingest warning: Ollama unreachable: {e}]", file=sys.stderr)
-        return _fallback()
+    except urllib.error.URLError:
+        raise  # propagate to extract_paper() for fail-fast handling
     except Exception as e:
         print(f"[ingest warning: unexpected HTTP error: {e}]", file=sys.stderr)
         return _fallback()
@@ -465,8 +465,11 @@ def extract_paper(pdf_path: str) -> dict:
     page1_text = pages_text[0] if pages_text else ""
     arxiv_id = _extract_arxiv_id(page1_text)
 
-    # Step 5: LLM-based extraction — replaces _extract_metadata + _find_sections_from_pdf
-    llm_result = _extract_with_llm(pages_text)
+    # Step 5: LLM-based extraction (required — fails fast if Ollama unreachable)
+    try:
+        llm_result = _extract_with_llm(pages_text)
+    except urllib.error.URLError as e:
+        _fail(f"Ollama unreachable — LLM is required for extraction: {e}")
 
     title = llm_result["title"] or "Unknown"
     authors = llm_result["authors"] or ["Unknown"]

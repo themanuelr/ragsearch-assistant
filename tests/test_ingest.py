@@ -388,53 +388,20 @@ def test_extract_with_llm_figures_and_bibliography(mock_urlopen):
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_extract_with_llm_timeout(mock_urlopen):
-    """INGEST-01 LLM path: _extract_with_llm returns fallback defaults when urlopen raises
-    urllib.error.URLError — no exception propagated to the caller."""
+    """INGEST-01 LLM path: _extract_with_llm re-raises urllib.error.URLError when Ollama
+    is unreachable — propagates to extract_paper() for fail-fast handling."""
     mock_urlopen.side_effect = urllib.error.URLError("connection timeout")
 
-    result = _extract_with_llm(["Sample paper text"])
-
-    assert isinstance(result, dict), "result must be a dict — no exception propagated"
-    assert result["sections"] == [{"title": "Body", "body": ""}], (
-        f"sections must be D-02 fallback, got: {result['sections']}"
-    )
-    assert result["authors"] == ["Unknown"], (
-        f"authors must be D-02 fallback, got: {result['authors']}"
-    )
-    assert result["title"] == "", f"title must be empty string fallback, got: {result['title']}"
+    with pytest.raises(urllib.error.URLError):
+        _extract_with_llm(["Sample paper text"])
 
 
 @patch("scripts.ingest._extract_with_llm")
-def test_author_heuristic_offline_fallback(mock_llm, sample_pdf_path):
-    """
-    INGEST-01 offline fallback: extract_paper recovers real author names from page 1 body
-    text when _extract_with_llm returns the fallback dict (Ollama offline simulation).
+def test_extract_paper_fails_on_ollama_unreachable(mock_llm, sample_pdf_path):
+    """extract_paper must exit(1) when Ollama is unreachable — LLM is required."""
+    import urllib.error
+    mock_llm.side_effect = urllib.error.URLError("connection refused")
 
-    Uses @patch decorator (not monkeypatch) to create a second layer that overrides the
-    autouse _mock_llm fixture for this test only — simulating Ollama offline by returning
-    the exact _fallback() sentinel output: authors: ["Unknown"].
-
-    The body-text heuristic must find "Alice Author, Bob Collaborator" on page 1 and
-    return real names instead of the ["Unknown"] sentinel.
-    """
-    mock_llm.return_value = {
-        "title": "",
-        "authors": ["Unknown"],
-        "abstract": "",
-        "sections": [{"title": "Body", "body": ""}],
-        "bibliography": None,
-        "figures": None,
-    }
-
-    result = extract_paper(sample_pdf_path)
-
-    assert result["authors"] != ["Unknown"], (
-        f"authors must not be ['Unknown'] when body-text heuristic is available; "
-        f"got: {result['authors']}"
-    )
-    assert len(result["authors"]) >= 1, (
-        f"authors must have at least one element, got: {result['authors']}"
-    )
-    assert all(isinstance(a, str) and len(a) > 0 for a in result["authors"]), (
-        f"all authors must be non-empty strings, got: {result['authors']}"
-    )
+    with pytest.raises(SystemExit) as exc_info:
+        extract_paper(sample_pdf_path)
+    assert exc_info.value.code == 1
