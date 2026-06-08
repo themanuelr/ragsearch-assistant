@@ -248,13 +248,13 @@ def process_pdf(path: str) -> str:
             [sys.executable, ingest_script, "--pdf", path],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=360,  # must exceed _extract_with_llm's 300s Ollama timeout
         )
         if result.returncode != 0:
             return f"[process_pdf error: ingest.py failed: {result.stderr.strip()}]"
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        return "[process_pdf error: ingest.py timed out after 120s]"
+        return "[process_pdf error: ingest.py timed out after 360s]"
     except Exception as e:
         return f"[process_pdf error: {e}]"
 
