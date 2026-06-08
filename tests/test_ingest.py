@@ -153,7 +153,7 @@ def test_process_pdf_mcp_tool(sample_pdf_path):
         "CLI PaperJSON must have at least one section"
 
 
-def test_registry_write(sample_pdf_path):
+def test_registry_write(sample_pdf_path, _tmp_config):
     """
     REG-01: After a successful ingest, the registry file contains an entry with the
     correct key derived from the paper (DOI, arXiv ID, or SHA-256 title hash).
@@ -162,15 +162,15 @@ def test_registry_write(sample_pdf_path):
     key = _compute_registry_key(result)
     assert isinstance(key, str) and key, "registry key must be a non-empty str"
 
-    # Read the registry that extract_paper actually wrote to (via config)
-    config = _load_config(_find_config())
+    # Use the temp config injected by _tmp_config fixture (bypasses monkeypatch binding issue)
+    from scripts.ingest import _load_config as _lc
+    config = _lc(_tmp_config)
     with open(config["registry_path"], "r", encoding="utf-8") as f:
         registry = json.load(f)
 
     assert key in registry, f"extract_paper must have written key '{key}' to registry"
     assert registry[key]["title"] == result["title"], \
         "registry entry title must match PaperJSON title"
-
 
 def test_registry_dedup(sample_pdf_path, _tmp_config):
     """
