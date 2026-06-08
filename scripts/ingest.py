@@ -21,7 +21,6 @@ from typing import NoReturn
 # ---------------------------------------------------------------------------
 import filelock
 import pdfplumber
-from pypdf import PdfReader
 
 # ---------------------------------------------------------------------------
 # constants
@@ -29,14 +28,8 @@ from pypdf import PdfReader
 DEFAULT_REGISTRY_KEY_PREFIX_LEN = 16  # hex chars of SHA-256 title hash
 CONFIG_FILENAME = "config.json"
 SCANNED_CHAR_THRESHOLD = 100
-TWO_COL_RIGHT_RATIO = 0.30
 _TITLE_SENTINELS = frozenset({"untitled", "unknown", "no title", ""})
 _AUTHOR_SENTINELS = frozenset({"unknown", "anonymous", "n/a", "none", ""})
-_AUTHOR_HEADER_KEYWORDS = frozenset({
-    "abstract", "introduction", "keywords", "doi", "arxiv", "copyright",
-    "received", "accepted", "published", "university", "department",
-    "institute", "school", "lab",
-})
 REQUIRED_CONFIG_KEYS = ("registry_path", "vault_path")
 
 PAPER_JSON_KEYS = frozenset({
@@ -153,41 +146,6 @@ def _is_scanned(pdf_path: str, threshold: int = SCANNED_CHAR_THRESHOLD) -> bool:
     return True  # less than threshold chars across entire document
 
 
-def _detect_layout(page) -> bool:
-    """Return True if page appears to be two-column (D-06 heuristic).
-
-    Crops to the bottom 70% of the page (Pitfall 2 mitigation: the single-column
-    title block at the top of two-column papers would otherwise suppress detection).
-    Counts words whose x0 exceeds the page midpoint. Returns True when the right-half
-    word ratio exceeds TWO_COL_RIGHT_RATIO (0.30).
-    """
-    region = page.crop((0, page.height * 0.3, page.width, page.height))
-    words = region.extract_words()
-    if not words:
-        return False
-    mid = page.width / 2
-    right_count = sum(1 for w in words if w["x0"] > mid)
-    return (right_count / len(words)) > TWO_COL_RIGHT_RATIO
-
-
-def _extract_text_pages(pdf, is_two_col: bool) -> list[str]:
-    """Extract text from all pages in reading order; crop columns if two-column."""
-    texts = []
-    for page in pdf.pages:
-        if is_two_col:
-            # Two-column: crop at midpoint and concatenate left then right
-            left = page.crop((0, 0, page.width / 2, page.height))
-            right = page.crop((page.width / 2, 0, page.width, page.height))
-            texts.append(
-                (left.extract_text(x_tolerance=3) or "") +
-                "\n" +
-                (right.extract_text(x_tolerance=3) or "")
-            )
-        else:
-            texts.append(page.extract_text(x_tolerance=3) or "")
-    return texts
-
-
 def _extract_arxiv_id(page1_text: str) -> str | None:
     """Extract arXiv ID from page 1 text using regex (e.g., arXiv:1706.03762v5).
 
@@ -195,55 +153,6 @@ def _extract_arxiv_id(page1_text: str) -> str | None:
     """
     match = re.search(r'arXiv:(\d{4}\.\d{4,5}(?:v\d+)?)', page1_text)
     return match.group(1) if match else None
-
-
-def _extract_authors_from_text(page1_text: str) -> list[str]:
-    """Scan page 1 text for author names when the LLM returns the 'Unknown' sentinel.
-
-    Heuristic: checks the first 15 lines for candidate author lines. A candidate line
-    must be non-empty, not a section-header keyword, 5-200 chars, and must split into
-    tokens that look like personal names (5-200 chars, at least one space, first char
-    uppercase, not all-uppercase). Splits on comma, ' and ', ' & '.
-
-    Returns a list of cleaned name strings, or [] if no candidates found.
-    No new imports — uses only re (already imported at module level).
-    """
-
-    lines = page1_text.split("\n")[:15]
-    candidates = []
-    for line in lines:
-        line = line.strip()
-        # Skip empty, too short, too long
-        if not line or len(line) < 5 or len(line) > 200:
-            continue
-        # Skip lines containing section-header keywords
-        line_lower = line.lower()
-        if any(kw in line_lower for kw in _AUTHOR_HEADER_KEYWORDS):
-            continue
-        # Split by comma, ' and ', ' & ' to get individual name tokens
-        tokens = re.split(r",\s*| and | & ", line)
-        names = []
-        for token in tokens:
-            token = token.strip()
-            if len(token) < 5 or len(token) > 200:
-                continue
-            # Must contain at least one space (first + last name minimum)
-            if " " not in token:
-                continue
-            # First char must be uppercase
-            if not token[0].isupper():
-                continue
-            # Must not be all-uppercase (avoids title-case section headers)
-            if token.isupper():
-                continue
-            # Reject tokens with more than 4 words — impractical as a personal name
-            if len(token.split()) > 4:
-                continue
-            names.append(token)
-        if names:
-            candidates.extend(names)
-
-    return candidates
 
 
 def _extract_with_llm(pages_text: list[str]) -> dict:
@@ -267,6 +176,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         title: str = ""
         authors: list[str] = []
         abstract: str = ""
+        year: int | None = None
 
     class _LLMSection(BaseModel):
         title: str = ""
@@ -280,6 +190,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             "sections": [{"title": "Body", "body": ""}],
             "bibliography": None,
             "figures": None,
+            "year": None,
         }
 
     combined = "\n\n".join(pages_text)
@@ -333,11 +244,13 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     title = ""
     authors: list[str] = ["Unknown"]
     abstract = ""
+    year: int | None = None
     try:
         raw_meta = _llm_post(
             "You are a scientific paper parser. Read the paper text below and return ONLY "
             "a JSON object with keys: 'title' (string), 'authors' (array of strings), "
-            "'abstract' (string). Return ONLY the JSON object, nothing else.\n\n"
+            "'abstract' (string), 'year' (integer or null). Return the integer publication "
+            "year in 'year', or null if not found. Return ONLY the JSON object, nothing else.\n\n"
             "Paper text:\n" + page1_text[:LLM_PAGE1_TRUNCATE],
             timeout=120,
         )
@@ -347,6 +260,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             title = meta.title
             authors = meta.authors or ["Unknown"]
             abstract = meta.abstract
+            year = meta.year
         except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
             pass
     except (urllib.error.URLError, TimeoutError):
@@ -368,6 +282,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             "sections": [{"title": "Body", "body": combined[:10000]}],
             "bibliography": None,
             "figures": [{"label": m, "caption": ""} for m in fig_matches[:20]] if fig_matches else None,
+            "year": year,
         }
 
     # Calls 3..N: per-section bodies (capped at MAX_SECTIONS)
@@ -433,6 +348,7 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         "sections": sections,
         "bibliography": bibliography,
         "figures": figures,
+        "year": year,
     }
 
 
@@ -535,12 +451,10 @@ def extract_paper(pdf_path: str) -> dict:
     registry_path = config["registry_path"]
     project_name = config["project_name"]
 
-    # Step 3: layout detection and text extraction
+    # Step 3: simple per-page text extraction — one string per page, fed directly to LLM
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            page0 = pdf.pages[0] if pdf.pages else None
-            is_two_col = _detect_layout(page0) if page0 else False
-            pages_text = _extract_text_pages(pdf, is_two_col)
+            pages_text = [p.extract_text(x_tolerance=3) or "" for p in pdf.pages]
     except Exception as e:
         _fail(f"cannot open PDF: {e}")
 
@@ -560,23 +474,9 @@ def extract_paper(pdf_path: str) -> dict:
     sections = llm_result["sections"]
     references = llm_result.get("bibliography") or None
     figures = llm_result.get("figures")
+    year = llm_result.get("year")
 
-    # Offline fallback: recover authors from body text when LLM returns sentinel
-    if authors == ["Unknown"] and page1_text:
-        _heuristic = _extract_authors_from_text(page1_text)
-        if _heuristic:
-            authors = _heuristic
-
-    # Step 6: inline pypdf year extraction (LLM does not return year)
-    year = None
-    try:
-        reader = PdfReader(pdf_path)
-        if reader.metadata and reader.metadata.creation_date:
-            year = reader.metadata.creation_date.year
-    except Exception:
-        pass  # metadata missing or malformed — proceed without year
-
-    # Step 7: compute registry key from paper identity (D-12)
+    # Step 6: compute registry key from paper identity (D-12)
     # DOI is not extracted in Phase 1 (Phase 3 web path fills it); key falls to
     # arXiv ID (if present) or SHA-256 title hash.
     # When LLM extraction fails (empty title), use a path-based hash to ensure
@@ -593,12 +493,12 @@ def extract_paper(pdf_path: str) -> dict:
         minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": _llm_title}
     key = _compute_registry_key(minimal_paper)
 
-    # Step 8: DEDUP CHECK (REG-02) — return cached entry if already ingested
+    # Step 7: DEDUP CHECK (REG-02) — return cached entry if already ingested
     registry = _read_registry(registry_path)
     if key in registry:
         return {k: registry[key][k] for k in PAPER_JSON_KEYS if k in registry[key]}
 
-    # Step 9: assemble PaperJSON (D-01, D-02, D-03, D-04)
+    # Step 8: assemble PaperJSON (D-01, D-02, D-03, D-04)
     paper_json = {
         "title": title,
         "authors": authors,
@@ -613,7 +513,7 @@ def extract_paper(pdf_path: str) -> dict:
         "source_path": os.path.abspath(pdf_path),
     }
 
-    # Step 10: build D-14 registry entry and write (REG-01).
+    # Step 9: build D-14 registry entry and write (REG-01).
     # The registry entry stores the full PaperJSON plus D-14 metadata fields so that
     # a future cache hit (REG-02) returns the same PaperJSON schema.
     # summary and key_findings are null in Phase 1 (Open Question 2 — Phase 2 fills these).
@@ -625,7 +525,7 @@ def extract_paper(pdf_path: str) -> dict:
         "projects": [project_name],
         "vault_note": None,
     })
-    # Step 10: write registry entry with consistent error reporting
+    # Step 9: write registry entry with consistent error reporting
     try:
         _write_registry_entry(registry_path, key, registry_entry)
     except Exception as e:
