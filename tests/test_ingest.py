@@ -414,3 +414,40 @@ def test_extract_paper_fails_on_timeout(mock_llm, sample_pdf_path):
     assert exc_info.value.code == 1, (
         f"extract_paper must exit with code 1 on TimeoutError, got: {exc_info.value.code}"
     )
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_extract_with_llm_section_discovery_object_form(mock_urlopen):
+    """Section discovery: when Ollama returns {"sections": [...]} (object form),
+    _LLMSectionList Pydantic validation branch is exercised correctly."""
+
+    def _make_mock_response(inner_payload):
+        response_bytes = json.dumps(
+            {"message": {"content": json.dumps(inner_payload)}}
+        ).encode()
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = response_bytes
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__.return_value = mock_resp
+        mock_ctx.__exit__.return_value = None
+        return mock_ctx
+
+    mock_urlopen.side_effect = [
+        _make_mock_response({"sections": ["Introduction", "Conclusion"]}),  # Call 1: object form
+        _make_mock_response({                                                    # Call 2: metadata
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+        }),
+        _make_mock_response({"title": "Introduction", "body": "Intro text."}),   # Call 3
+        _make_mock_response({"title": "Conclusion", "body": "Conclusion text."}),  # Call 4
+    ]
+
+    result = _extract_with_llm(["Sample paper text"])
+
+    assert result["title"] == "Test Paper", f"title mismatch: {result['title']}"
+    assert len(result["sections"]) == 2, (
+        f"sections must have 2 entries when discovery returns object form; got: {len(result['sections'])}"
+    )
+    assert result["sections"][0]["title"] == "Introduction", (
+        f"sections[0] title mismatch: {result['sections'][0]['title']}"
+    )
