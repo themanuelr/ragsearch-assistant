@@ -11,8 +11,15 @@ import pytest
 
 @pytest.fixture
 def tmp_registry_path(tmp_path):
-    """Temporary registry JSON path — cleaned up after each test."""
-    return str(tmp_path / "papers_registry.json")
+    """Temporary registry JSON path — cleaned up after each test, including .lock sibling."""
+    path = str(tmp_path / "papers_registry.json")
+    yield path
+    lock_path = path + ".lock"
+    if os.path.exists(lock_path):
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
 
 
 @pytest.fixture
