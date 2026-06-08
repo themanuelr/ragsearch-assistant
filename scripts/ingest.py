@@ -140,7 +140,8 @@ def _is_scanned(pdf_path: str, threshold: int = SCANNED_CHAR_THRESHOLD) -> bool:
         with pdfplumber.open(pdf_path) as pdf:
             total_chars = 0
             for page in pdf.pages:
-                total_chars += len(page.chars)
+                text = page.extract_text() or ""
+                total_chars += len(text)
                 if total_chars >= threshold:
                     return False  # early exit: enough text found
     except Exception as e:
