@@ -59,6 +59,14 @@ META_SCHEMA = {
     "required": ["title", "authors", "abstract"],
 }
 
+# JSON Schema for the section-discovery call: returns only an ordered list of
+# section titles so the output is grammar-safe (bounded array of strings).
+DISCOVERY_SCHEMA = {
+    "type": "object",
+    "properties": {"sections": {"type": "array", "items": {"type": "string"}}},
+    "required": ["sections"],
+}
+
 # JSON Schema for the dedicated references call (array of strings — schema-safe).
 REFS_SCHEMA = {
     "type": "object",
@@ -213,14 +221,21 @@ def _extract_arxiv_id(page1_text: str) -> str | None:
 
 
 def _extract_with_llm(pages_text: list[str]) -> dict:
-    """Multi-call pipeline: section discovery → metadata → per-section bodies.
+    """Multi-call pipeline: metadata → section discovery → per-section bodies → refs → figures.
 
-    Issues at least 2 separate HTTP calls to Ollama /api/chat for any non-empty
-    pages_text. Each call produces a small, bounded JSON response that cannot
-    overflow the Ollama JSON formatter (root cause fix for monolithic call failures).
+    Call 1 (metadata): schema-constrained — title, authors, abstract, year, doi, journal.
+    Call 2 (discovery): returns ordered list of section titles only (DISCOVERY_SCHEMA).
+    Calls 2a+ (per-section bodies): one call per discovered title, loose fmt="json".
+    Call 3 (references): REFS_SCHEMA — array of strings.
+    Call 4 (figures): FIGS_SCHEMA — array of {label, caption} objects.
 
-    Raises urllib.error.URLError or TimeoutError when Ollama is unreachable.
-    Returns fallback defaults on non-network exceptions.
+    Every call produces a small, bounded JSON response that cannot overflow the Ollama
+    JSON formatter (root cause fix for monolithic call failures).
+
+    Raises urllib.error.URLError or TimeoutError when Ollama is unreachable (fail-fast).
+    Raises RuntimeError("section discovery returned no sections") when discovery
+    succeeds but returns an empty titles list — propagates as exit(1) via extract_paper.
+    Returns fallback defaults on non-network/non-RuntimeError exceptions.
 
     Returns a dict with keys: title, authors, abstract, sections, references,
     figures, year, doi, journal.
@@ -256,10 +271,6 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
                 return None
             s = str(v).strip()
             return s or None
-
-    class _LLMSection(BaseModel):
-        title: str = ""
-        body: str = ""
 
     combined = "\n\n".join(pages_text)
 
@@ -341,48 +352,89 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     elif regex_doi and not doi:
         doi = regex_doi
 
-    # Call 2: sections — ONE whole-document call returning {title, body} for every
-    # section in reading order. Loose fmt="json" (NOT a schema) avoids the gemma4
-    # repetition loop on long free-text bodies (RESEARCH Pitfall 2). Replaces the
-    # former section-discovery + regex chunk-slicing + per-section loop (the root
-    # cause of the empty heading-less Introduction body — RESEARCH Pattern 4).
+    # Call 2: section discovery — bounded call returning ONLY an ordered list of
+    # section titles (DISCOVERY_SCHEMA: array of strings). Grammar-safe; avoids the
+    # gemma4 repetition loop that plagued the former single unbounded sections call.
+    # Per-section bodies are fetched individually in the loop below (Call 2a+).
+    # The discovery instruction explicitly names the heading-less Introduction so the
+    # loop can fetch its body even when no "Introduction" heading appears in the text
+    # (the historical empty-Introduction root cause — RESEARCH Pattern 4).
     sections: list[dict] = []
     try:
-        raw_sections = _llm_post(
+        raw_discovery = _llm_post(
             document=combined[:LLM_TEXT_TRUNCATE],
             instruction=(
                 "You are a scientific paper parser. Return ONLY a JSON object "
-                "{\"sections\": [{\"title\": str, \"body\": str}]} covering every section "
-                "in reading order, each with its full body text. The text between the abstract "
-                "and the first explicit section heading is the Introduction; include it as a "
-                "section titled 'Introduction' with its full body, even though no 'Introduction' "
-                "heading appears in the text. Return ONLY the JSON object, nothing else."
+                "{\"sections\": [\"<title1>\", \"<title2>\", ...]} listing every section "
+                "title in reading order. IMPORTANT: the text between the abstract and the "
+                "first explicit section heading is the Introduction — you MUST include it as "
+                "a title \"Introduction\" even though no 'Introduction' heading appears in "
+                "the text. Return ONLY the JSON object with the sections array, nothing else."
             ),
-            fmt="json",
-            timeout=300,
+            fmt=DISCOVERY_SCHEMA,
+            timeout=180,
         )
+        titles: list[str] = []
         try:
-            parsed = json.loads(raw_sections)
+            parsed = json.loads(raw_discovery)
             raw_list = parsed.get("sections", []) if isinstance(parsed, dict) else parsed
             if isinstance(raw_list, list):
+                seen: set[str] = set()
                 for item in raw_list:
-                    try:
-                        sec = _LLMSection(**item)
-                    except (ValidationError, TypeError):
+                    if not isinstance(item, str):
                         continue
-                    if sec.body.strip():
-                        sections.append({"title": sec.title, "body": sec.body})
-        except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
-            sections = []
+                    t = item.strip()
+                    if t and t not in seen:
+                        titles.append(t)
+                        seen.add(t)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            titles = []
     except (urllib.error.URLError, TimeoutError):
-        raise
+        raise  # fail-fast: discovery network failure propagates immediately
     except Exception:
-        sections = []
+        titles = []
 
-    # Parse failure / empty list — single Body fallback (same shape the deleted
-    # empty-discovery early-return used to provide).
-    if not sections:
-        sections = [{"title": "Body", "body": combined[:10000]}]
+    # No sections discovered — fail-fast: raise RuntimeError so extract_paper's
+    # widened except clause (urllib.error.URLError, TimeoutError, RuntimeError)
+    # surfaces this as exit(1), matching the Ollama-unreachable behavior.
+    # Decision: no single-{title:'Body'} fallback for the discovery-failure case.
+    if not titles:
+        raise RuntimeError("section discovery returned no sections")
+
+    # Calls 2a+: per-section body loop — one bounded _llm_post per discovered title.
+    # fmt="json" (loose, NOT a schema) because the body is long free-text and a typed
+    # schema triggers the gemma4 repetition loop (RESEARCH Pitfall 2).
+    # Each call receives the FULL document and a single named target title so the LLM
+    # can read across the whole paper, avoiding the former chunk-slicing root cause.
+    # Keep-empty-body decision: a blank body KEEPS the title with body="" (NOT dropped).
+    # URLError / TimeoutError from any per-section call re-raises (fail-fast):
+    # a mid-loop network drop must not silently truncate the result.
+    for title_str in titles:
+        try:
+            raw_body = _llm_post(
+                document=combined[:LLM_TEXT_TRUNCATE],
+                instruction=(
+                    f"You are a scientific paper parser. Return ONLY a JSON object "
+                    f"{{\"body\": \"<full verbatim body text of the section titled "
+                    f"'{title_str}'>\"}}, containing the complete body of the section "
+                    f"titled '{title_str}' from this paper. If that section is not present, "
+                    f"return {{\"body\": \"\"}}. Return ONLY the JSON object, nothing else."
+                ),
+                fmt="json",
+                timeout=300,
+            )
+            body_str = ""
+            try:
+                parsed_body = json.loads(raw_body)
+                if isinstance(parsed_body, dict):
+                    body_str = str(parsed_body.get("body", ""))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                body_str = ""
+        except (urllib.error.URLError, TimeoutError):
+            raise  # fail-fast: mid-loop network drop propagates immediately
+        except Exception:
+            body_str = ""
+        sections.append({"title": title_str, "body": body_str})
 
     # Call 3: references — dedicated whole-document call, independent of section
     # discovery (no "References" heading required). REFS_SCHEMA (array of strings)
@@ -584,11 +636,15 @@ def extract_paper(pdf_path: str) -> dict:
     page1_text = pages_text[0] if pages_text else ""
     arxiv_id = _extract_arxiv_id(page1_text)
 
-    # Step 5: LLM-based extraction (required — fails fast if Ollama unreachable)
+    # Step 5: LLM-based extraction (required — fails fast if Ollama unreachable or
+    # section discovery returns no sections; RuntimeError covers the no-sections
+    # fail-fast path — see discovery block in _extract_with_llm).
     try:
         llm_result = _extract_with_llm(pages_text)
     except (urllib.error.URLError, TimeoutError) as e:
         _fail(f"Ollama unreachable — LLM is required for extraction: {e}")
+    except RuntimeError as e:
+        _fail(f"LLM extraction failed — {e}")
 
     title = llm_result["title"] or "Unknown"
     authors = llm_result["authors"] or ["Unknown"]
