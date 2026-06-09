@@ -365,6 +365,12 @@ def test_extract_with_llm_multi_call_returns_fields(mock_urlopen):
                 {"title": "References", "body": "Smith et al. 2020."},
             ]
         }),
+        _make_mock_response({                                  # Call 3: references
+            "references": ["1. Smith et al. 2020.", "2. Doe et al. 2021."]
+        }),
+        _make_mock_response({                                  # Call 4: figures
+            "figures": [{"label": "Fig. 1", "caption": "A figure."}]
+        }),
     ]
 
     result = _extract_with_llm([
@@ -378,9 +384,14 @@ def test_extract_with_llm_multi_call_returns_fields(mock_urlopen):
     assert result["sections"][0] == {"title": "Introduction", "body": "Intro text."}, (
         f"sections[0] mismatch: {result['sections'][0]}"
     )
-    # bibliography/figures are placeholder None keys at end of plan 02 (plan 03 fills them)
-    assert "bibliography" in result, "result must still expose a bibliography key (placeholder)"
-    assert result["figures"] is None, f"figures must be None placeholder at plan 02, got: {result['figures']}"
+    # references/figures now come from dedicated calls (plan 03); bibliography key is gone
+    assert "bibliography" not in result, "bibliography key must be removed (renamed to references)"
+    assert result["references"] == ["1. Smith et al. 2020.", "2. Doe et al. 2021."], (
+        f"references must come from the dedicated call, got: {result.get('references')}"
+    )
+    assert result["figures"] == [{"label": "Fig. 1", "caption": "A figure."}], (
+        f"figures must come from the dedicated call, got: {result.get('figures')}"
+    )
 
 
 @patch("scripts.ingest.urllib.request.urlopen")
@@ -493,6 +504,91 @@ def test_sections_all_bodies_non_empty(mock_urlopen):
     assert all(s["body"].strip() for s in result["sections"]), (
         f"every section body must be non-empty, got: {result['sections']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.1-03: dedicated references + deduplicated figures calls
+# ---------------------------------------------------------------------------
+
+def _meta_and_sections_responses():
+    """Return the first two canned responses (metadata, sections) shared by the
+    references/figures tests. Call sequence is metadata, sections, references, figures."""
+    return [
+        _make_mock_response({                       # Call 1: metadata
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+        }),
+        _make_mock_response({"sections": [          # Call 2: sections (NO References title)
+            {"title": "Introduction", "body": "Intro."},
+            {"title": "Results", "body": "Results."},
+        ]}),
+    ]
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_references_extracted_independent_of_sections(mock_urlopen):
+    """The dedicated references call populates references even when section
+    discovery returns NO 'References' title (decoupled from discovery)."""
+    mock_urlopen.side_effect = _meta_and_sections_responses() + [
+        _make_mock_response({"references": ["1. Reinhart, K. et al. 2017.", "2. Rudd, K. E. 2020."]}),  # Call 3
+        _make_mock_response({"figures": []}),                                                          # Call 4
+    ]
+    result = _extract_with_llm(["paper text with no References heading in sections"])
+    assert result["references"], "references must be populated independent of section discovery"
+    assert result["references"][0].startswith("1."), (
+        f"references[0] must start with '1.', got: {result['references'][0]}"
+    )
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_references_threshold_and_shape(mock_urlopen):
+    """A references call returning 43 strings yields a list of >=40 non-empty
+    strings whose first entry starts with '1.'."""
+    refs = [f"{i}. Author {i} et al. (20{i:02d})." for i in range(1, 44)]
+    mock_urlopen.side_effect = _meta_and_sections_responses() + [
+        _make_mock_response({"references": refs}),   # Call 3
+        _make_mock_response({"figures": []}),         # Call 4
+    ]
+    result = _extract_with_llm(["paper text"])
+    assert len(result["references"]) >= 40, f"expected >=40 refs, got: {len(result['references'])}"
+    assert all(isinstance(r, str) and r.strip() for r in result["references"]), "all refs non-empty str"
+    assert result["references"][0].startswith("1."), "references[0] must start with '1.'"
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_figures_dedup_no_duplicate_labels(mock_urlopen):
+    """A figures call returning duplicate labels is deduplicated by label."""
+    mock_urlopen.side_effect = _meta_and_sections_responses() + [
+        _make_mock_response({"references": ["1. Ref."]}),                       # Call 3
+        _make_mock_response({"figures": [                                       # Call 4: dup labels
+            {"label": "Table 1", "caption": "short"},
+            {"label": "Table 1", "caption": "a longer caption that wins"},
+            {"label": "Fig. 1", "caption": "fig caption"},
+        ]}),
+    ]
+    result = _extract_with_llm(["paper text"])
+    labels = [f["label"] for f in result["figures"]]
+    assert len(labels) == len(set(labels)), f"figure labels must be unique, got: {labels}"
+    assert "Table 1" in labels and "Fig. 1" in labels
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_figures_captions_non_empty(mock_urlopen):
+    """All figures in a populated result have non-empty captions (empty ones dropped)."""
+    mock_urlopen.side_effect = _meta_and_sections_responses() + [
+        _make_mock_response({"references": ["1. Ref."]}),                       # Call 3
+        _make_mock_response({"figures": [                                       # Call 4
+            {"label": "Fig. 1", "caption": "real caption"},
+            {"label": "", "caption": "no label — dropped"},
+        ]}),
+    ]
+    result = _extract_with_llm(["paper text"])
+    assert result["figures"], "figures must be populated"
+    assert all(f["caption"].strip() for f in result["figures"]), (
+        f"all figure captions must be non-empty, got: {result['figures']}"
+    )
+    assert all(f["label"].strip() for f in result["figures"]), "empty-label entries must be dropped"
 
 
 # ---------------------------------------------------------------------------
