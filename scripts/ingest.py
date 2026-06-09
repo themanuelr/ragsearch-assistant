@@ -60,11 +60,31 @@ META_SCHEMA = {
 }
 
 # JSON Schema for the dedicated references call (array of strings — schema-safe).
-# Added now for reuse by plan 03 (references slice).
 REFS_SCHEMA = {
     "type": "object",
     "properties": {"references": {"type": "array", "items": {"type": "string"}}},
     "required": ["references"],
+}
+
+# JSON Schema for the dedicated figures call (array of small {label, caption}
+# objects — schema-safe; the LLM dedups + pairs captions, replacing the legacy
+# regex scan that produced 20 dupes with empty captions).
+FIGS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "figures": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "caption": {"type": "string"},
+                },
+                "required": ["label", "caption"],
+            },
+        }
+    },
+    "required": ["figures"],
 }
 
 
@@ -202,7 +222,8 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     Raises urllib.error.URLError or TimeoutError when Ollama is unreachable.
     Returns fallback defaults on non-network exceptions.
 
-    Returns a dict with keys: title, authors, abstract, sections, bibliography, figures.
+    Returns a dict with keys: title, authors, abstract, sections, references,
+    figures, year, doi, journal.
     """
     from pydantic import BaseModel, ValidationError, field_validator
 
@@ -239,19 +260,6 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     class _LLMSection(BaseModel):
         title: str = ""
         body: str = ""
-
-    def _fallback() -> dict:
-        return {
-            "title": "",
-            "authors": ["Unknown"],
-            "abstract": "",
-            "sections": [{"title": "Body", "body": ""}],
-            "bibliography": None,
-            "figures": None,
-            "year": None,
-            "doi": None,
-            "journal": None,
-        }
 
     combined = "\n\n".join(pages_text)
 
@@ -376,15 +384,85 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     if not sections:
         sections = [{"title": "Body", "body": combined[:10000]}]
 
-    # bibliography/figures remain placeholder None keys at the end of plan 02;
-    # plan 03 replaces them with dedicated references/figures calls.
+    # Call 3: references — dedicated whole-document call, independent of section
+    # discovery (no "References" heading required). REFS_SCHEMA (array of strings)
+    # is grammar-safe. Threshold-scored downstream (>=40); parse-failure -> None.
+    references: list[str] | None = None
+    try:
+        raw_refs = _llm_post(
+            document=combined[:LLM_TEXT_TRUNCATE],
+            instruction=(
+                "Return every entry in the paper's reference/bibliography list as a JSON "
+                "array under 'references', one raw string per reference, in order. "
+                "Do not summarize. Return ONLY the JSON object, nothing else."
+            ),
+            fmt=REFS_SCHEMA,
+            timeout=300,
+        )
+        try:
+            parsed = json.loads(raw_refs)
+            raw_list = parsed.get("references", []) if isinstance(parsed, dict) else parsed
+            if isinstance(raw_list, list):
+                cleaned = [r.strip() for r in raw_list if isinstance(r, str) and r.strip()]
+                references = cleaned or None
+        except (json.JSONDecodeError, ValueError, TypeError):
+            references = None
+    except (urllib.error.URLError, TimeoutError):
+        raise
+    except Exception:
+        references = None
+
+    # Call 4: figures — dedicated whole-document call. FIGS_SCHEMA (array of
+    # {label, caption}) lets the model dedup + pair captions, replacing the legacy
+    # regex scan (20 dupes, empty captions). Drop empty-label entries and dedup by
+    # label as a server-side safety net (keep the longest caption per label).
+    figures: list[dict] | None = None
+    try:
+        raw_figs = _llm_post(
+            document=combined[:LLM_TEXT_TRUNCATE],
+            instruction=(
+                "List every figure and table in the paper as a JSON array under 'figures', "
+                "each an object {label, caption}. Use the figure/table label (e.g. 'Fig. 1', "
+                "'Table 1') and its full caption. Return each label only once — do not repeat "
+                "labels. Return ONLY the JSON object, nothing else."
+            ),
+            fmt=FIGS_SCHEMA,
+            timeout=300,
+        )
+        try:
+            parsed = json.loads(raw_figs)
+            raw_list = parsed.get("figures", []) if isinstance(parsed, dict) else parsed
+            if isinstance(raw_list, list):
+                by_label: dict[str, str] = {}
+                order: list[str] = []
+                for item in raw_list:
+                    if not isinstance(item, dict):
+                        continue
+                    label = str(item.get("label", "")).strip()
+                    caption = str(item.get("caption", "")).strip()
+                    if not label or not caption:
+                        continue
+                    if label not in by_label:
+                        order.append(label)
+                        by_label[label] = caption
+                    elif len(caption) > len(by_label[label]):
+                        by_label[label] = caption  # keep the longest caption per label
+                deduped = [{"label": lbl, "caption": by_label[lbl]} for lbl in order]
+                figures = deduped or None
+        except (json.JSONDecodeError, ValueError, TypeError):
+            figures = None
+    except (urllib.error.URLError, TimeoutError):
+        raise
+    except Exception:
+        figures = None
+
     return {
         "title": title,
         "authors": authors,
         "abstract": abstract,
         "sections": sections,
-        "bibliography": None,
-        "figures": None,
+        "references": references,
+        "figures": figures,
         "year": year,
         "doi": doi,
         "journal": journal,
@@ -511,7 +589,7 @@ def extract_paper(pdf_path: str) -> dict:
     authors = llm_result["authors"] or ["Unknown"]
     abstract = llm_result["abstract"]
     sections = llm_result["sections"]
-    references = llm_result.get("bibliography") or None
+    references = llm_result.get("references") or None
     figures = llm_result.get("figures")
     year = llm_result.get("year")
     journal = llm_result.get("journal")

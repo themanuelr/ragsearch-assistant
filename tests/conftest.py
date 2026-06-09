@@ -164,7 +164,7 @@ def _mock_llm(monkeypatch):
                 {"title": "Section A", "body": "Left column content."},
                 {"title": "Section B", "body": "Right column content."},
             ],
-            "bibliography": None,
+            "references": None,
             "figures": None,
             "year": None,
             "doi": None,
