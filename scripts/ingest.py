@@ -43,6 +43,46 @@ LLM_TEXT_TRUNCATE = 80_000   # max chars sent to Ollama — context overflow gua
 LLM_PAGE1_TRUNCATE = 8_000   # chars for page-1 metadata call
 LLM_SECTION_TRUNCATE = 15_000  # chars per section body call
 MAX_SECTIONS = 12  # max per-section LLM calls in the extraction pipeline
+LLM_NUM_CTX = 32_768  # explicit Ollama context window — whole paper fits (RESEARCH A2)
+
+# DOI extraction: doi.org-anchored regex cross-check (RESEARCH Pattern 3, Pitfall 4)
+DOI_RE = re.compile(r'10\.\d{4,9}/[-._;()/:A-Za-z0-9]+', re.IGNORECASE)
+
+# JSON Schema for the whole-document metadata call (short/typed fields — schema-safe)
+META_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "authors": {"type": "array", "items": {"type": "string"}},
+        "abstract": {"type": "string"},
+        "year": {"type": ["integer", "null"]},
+        "doi": {"type": ["string", "null"]},
+        "journal": {"type": ["string", "null"]},
+    },
+    "required": ["title", "authors", "abstract"],
+}
+
+# JSON Schema for the dedicated references call (array of strings — schema-safe).
+# Added now for reuse by plan 03 (references slice).
+REFS_SCHEMA = {
+    "type": "object",
+    "properties": {"references": {"type": "array", "items": {"type": "string"}}},
+    "required": ["references"],
+}
+
+
+def _doi_from_text(text: str) -> str | None:
+    """Extract the paper's DOI from full text, doi.org-anchored (RESEARCH Pattern 3).
+
+    Prefers a DOI adjacent to a doi.org URL (the paper's own DOI appears near its
+    front-matter doi.org link) so a reference's DOI cannot win (Pitfall 4). Falls
+    back to the first bare DOI match. Returns None if no DOI is present.
+    """
+    m = re.search(r'doi\.org/(' + DOI_RE.pattern + r')', text, re.IGNORECASE)
+    if m:
+        return m.group(1).rstrip('.')
+    m = DOI_RE.search(text)
+    return m.group(0).rstrip('.') if m else None
 
 # ---------------------------------------------------------------------------
 # internal helpers
@@ -177,6 +217,8 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         authors: list[str] = []
         abstract: str = ""
         year: int | None = None
+        doi: str | None = None
+        journal: str | None = None
 
         @field_validator("year", mode="before")
         @classmethod
@@ -189,6 +231,16 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
                 m = re.search(r"\b(\d{4})\b", v)
                 return int(m.group(1)) if m else None
             return None
+
+        @field_validator("doi", "journal", mode="before")
+        @classmethod
+        def _coerce_optional_str(cls, v: object) -> str | None:
+            """Tolerate non-string model values for doi/journal so a bad value
+            cannot discard valid title/authors/abstract (WR-01)."""
+            if v is None:
+                return None
+            s = str(v).strip()
+            return s or None
 
     class _LLMSection(BaseModel):
         title: str = ""
@@ -203,17 +255,30 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             "bibliography": None,
             "figures": None,
             "year": None,
+            "doi": None,
+            "journal": None,
         }
 
     combined = "\n\n".join(pages_text)
 
-    def _llm_post(prompt: str, timeout: int = 120) -> str:
-        """POST prompt to Ollama /api/chat; return stripped content string."""
+    def _llm_post(document: str, instruction: str, fmt, timeout: int = 180) -> str:
+        """POST a document-first prompt to Ollama /api/chat; return stripped content.
+
+        The paper text goes FIRST and the task instruction LAST so Ollama reuses
+        its KV-cache prefix across calls that share the same document (RESEARCH
+        Pattern 1). `fmt` is either a JSON Schema object (short/typed fields) or
+        the string "json" (loose json for free-text bodies). `options.num_ctx` is
+        set explicitly so the whole-paper premise cannot silently truncate
+        (RESEARCH A2 / Open Question 1). Does NOT set `think` (RESEARCH Pitfall 3).
+        """
         payload = json.dumps({
             "model": DEFAULT_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "user", "content": f"PAPER TEXT:\n{document}\n\nTASK:\n{instruction}"}
+            ],
             "stream": False,
-            "format": "json",
+            "format": fmt,
+            "options": {"temperature": 0, "num_ctx": LLM_NUM_CTX},
         }).encode()
         req = urllib.request.Request(
             OLLAMA_BASE + "/api/chat",
@@ -230,12 +295,15 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     section_titles: list[str] = []
     try:
         raw_discovery = _llm_post(
-            "You are a scientific paper parser. Read the paper text below and return ONLY "
-            "a JSON object with one key 'sections' whose value is an array of section title "
-            "strings in reading order. Example: {\"sections\": [\"Introduction\", \"Methods\", "
-            "\"Results\", \"Conclusion\"]}. Return ONLY the JSON object, nothing else.\n\n"
-            "Paper text:\n" + combined[:LLM_TEXT_TRUNCATE],
-            timeout=120,
+            document=combined[:LLM_TEXT_TRUNCATE],
+            instruction=(
+                "You are a scientific paper parser. Return ONLY a JSON object with one key "
+                "'sections' whose value is an array of section title strings in reading order. "
+                "Example: {\"sections\": [\"Introduction\", \"Methods\", \"Results\", "
+                "\"Conclusion\"]}. Return ONLY the JSON object, nothing else."
+            ),
+            fmt="json",
+            timeout=180,
         )
         try:
             parsed = json.loads(raw_discovery)
@@ -251,20 +319,27 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     except Exception:
         return _fallback()
 
-    # Call 2: metadata (always runs — even when section discovery returned empty)
-    page1_text = pages_text[0] if pages_text else ""
+    # Call 2: metadata (always runs — even when section discovery returned empty).
+    # Whole-document, schema-constrained: title/authors/abstract/year/doi/journal.
     title = ""
     authors: list[str] = ["Unknown"]
     abstract = ""
     year: int | None = None
+    doi: str | None = None
+    journal: str | None = None
     try:
         raw_meta = _llm_post(
-            "You are a scientific paper parser. Read the paper text below and return ONLY "
-            "a JSON object with keys: 'title' (string), 'authors' (array of strings), "
-            "'abstract' (string), 'year' (integer or null). Return the integer publication "
-            "year in 'year', or null if not found. Return ONLY the JSON object, nothing else.\n\n"
-            "Paper text:\n" + page1_text[:LLM_PAGE1_TRUNCATE],
-            timeout=120,
+            document=combined[:LLM_TEXT_TRUNCATE],
+            instruction=(
+                "You are a scientific paper parser. Return ONLY a JSON object with keys: "
+                "'title' (string), 'authors' (array of strings), 'abstract' (string), "
+                "'year' (integer publication year or null), 'doi' (the paper's own DOI as a "
+                "string such as '10.1038/s41598-...' or null — NOT a DOI from the reference "
+                "list), and 'journal' (the publishing journal name as a string or null). "
+                "Return ONLY the JSON object, nothing else."
+            ),
+            fmt=META_SCHEMA,
+            timeout=180,
         )
         try:
             parsed = json.loads(raw_meta)
@@ -273,12 +348,23 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             authors = meta.authors or ["Unknown"]
             abstract = meta.abstract
             year = meta.year
+            doi = meta.doi
+            journal = meta.journal
         except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
             pass
     except (urllib.error.URLError, TimeoutError):
         raise
     except Exception:
         pass
+
+    # DOI cross-check: reconcile the LLM doi against a doi.org-anchored regex
+    # over the full text. Prefer the anchored regex match when they disagree so a
+    # reference's DOI cannot become the paper key (Pitfall 4).
+    regex_doi = _doi_from_text(combined)
+    if regex_doi and doi and regex_doi != doi:
+        doi = regex_doi
+    elif regex_doi and not doi:
+        doi = regex_doi
 
     # Section discovery returned empty — use fallback sections, skip per-section calls
     if not section_titles:
@@ -295,6 +381,8 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
             "bibliography": None,
             "figures": [{"label": m, "caption": ""} for m in fig_matches[:20]] if fig_matches else None,
             "year": year,
+            "doi": doi,
+            "journal": journal,
         }
 
     # Calls 3..N: per-section bodies (capped at MAX_SECTIONS)
@@ -322,11 +410,14 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         body_text = ""
         try:
             raw_sec = _llm_post(
-                "You are a scientific paper parser. Read the following section text and return "
-                "ONLY a JSON object with keys: 'title' (section title as string) and 'body' "
-                "(section content as string). Return ONLY the JSON object, nothing else.\n\n"
-                f"Section title: {sec_title}\n\nSection text:\n" + chunk[:LLM_SECTION_TRUNCATE],
-                timeout=120,
+                document=chunk[:LLM_SECTION_TRUNCATE],
+                instruction=(
+                    "You are a scientific paper parser. Return ONLY a JSON object with keys: "
+                    "'title' (section title as string) and 'body' (section content as string). "
+                    f"The section title is: {sec_title}. Return ONLY the JSON object, nothing else."
+                ),
+                fmt="json",
+                timeout=180,
             )
             try:
                 parsed = json.loads(raw_sec)
@@ -367,6 +458,8 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         "bibliography": bibliography,
         "figures": figures,
         "year": year,
+        "doi": doi,
+        "journal": journal,
     }
 
 
@@ -493,6 +586,21 @@ def extract_paper(pdf_path: str) -> dict:
     references = llm_result.get("bibliography") or None
     figures = llm_result.get("figures")
     year = llm_result.get("year")
+    journal = llm_result.get("journal")
+
+    # DOI reconciliation (Pitfall 4): cross-check the LLM doi against a
+    # doi.org-anchored regex over the full document text. Prefer the anchored
+    # regex match when the two disagree so a reference's DOI cannot become the
+    # registry key. Falls back to whichever single value is present.
+    combined = "\n\n".join(pages_text)
+    regex_doi = _doi_from_text(combined)
+    llm_doi = llm_result.get("doi")
+    if regex_doi and llm_doi and regex_doi != llm_doi:
+        doi = regex_doi
+    elif regex_doi:
+        doi = regex_doi
+    else:
+        doi = llm_doi
 
     # Step 6: compute registry key from paper identity (D-12)
     # DOI is not extracted in Phase 1 (Phase 3 web path fills it); key falls to
@@ -506,9 +614,9 @@ def extract_paper(pdf_path: str) -> dict:
         _path_hash = hashlib.sha256(
             os.path.abspath(pdf_path).encode()
         ).hexdigest()[:DEFAULT_REGISTRY_KEY_PREFIX_LEN]
-        minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": f"__path:{_path_hash}"}
+        minimal_paper = {"doi": doi, "arxiv_id": arxiv_id, "title": f"__path:{_path_hash}"}
     else:
-        minimal_paper = {"doi": None, "arxiv_id": arxiv_id, "title": _llm_title}
+        minimal_paper = {"doi": doi, "arxiv_id": arxiv_id, "title": _llm_title}
     key = _compute_registry_key(minimal_paper)
 
     # Step 7: DEDUP CHECK (REG-02) — return cached entry if already ingested
@@ -522,10 +630,10 @@ def extract_paper(pdf_path: str) -> dict:
         "authors": authors,
         "abstract": abstract,
         "sections": sections if sections else [{"title": "Body", "body": ""}],
-        "doi": None,  # Phase 3 web path fills DOI
+        "doi": doi,  # reconciled LLM doi + doi.org-anchored regex
         "arxiv_id": arxiv_id,
         "year": year,
-        "journal": None,
+        "journal": journal,
         "references": references,
         "figures": figures,
         "source_path": os.path.abspath(pdf_path),
