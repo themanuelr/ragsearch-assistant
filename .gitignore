@@ -27,6 +27,7 @@ chroma_db/
 *.pdf
 !tests/fixtures/*.pdf
 tests/fixtures/test_manuel1.pdf
+tests/fixtures/test_manuel2.pdf
 
 # Registry (shared across clones, not in repo)
 papers_registry.json
