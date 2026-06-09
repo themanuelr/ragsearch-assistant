@@ -75,6 +75,19 @@ def _norm_str(s: object) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
+def _strip_inline_citations(s: str) -> str:
+    """Remove citation superscripts fused to a word — for anchor matching ONLY.
+
+    Live PDF text carries inline citation markers attached to the preceding word
+    (e.g. 'challenge1', 'deaths2', 'rise3-7', 'increase9,10'); the hand-authored
+    anchor does not. Strip a digit-run (optionally a range/list such as '3-7' or
+    '9,10') that immediately follows a letter so the anchor containment check
+    compares prose, not citation numbering. Comparison-only — this never mutates
+    the extracted/stored section body, only the strings being matched here.
+    """
+    return re.sub(r"(?<=[A-Za-z])\d+(?:[–\-,]\d+)*", "", str(s))
+
+
 def score_against_expected(actual: dict, expected: dict) -> dict:
     """Score an extraction output against the ground-truth fixture.
 
@@ -118,15 +131,16 @@ def score_against_expected(actual: dict, expected: dict) -> dict:
     intro_anchor = ""
     for s in exp_sections:
         if _norm_str(s.get("title", "")).lower() == "introduction":
-            # anchor = opening substring before the first ellipsis marker
+            # anchor = opening substring before the first ellipsis marker, with
+            # inline citation superscripts stripped so the prose matches live text
             body = s.get("body", "")
-            intro_anchor = _norm_str(body.split("...")[0]) if body else ""
+            intro_anchor = _norm_str(_strip_inline_citations(body.split("...")[0])) if body else ""
             break
     if intro_anchor:
         intro_match = any(
             _norm_str(s.get("title", "")).lower() == "introduction"
             and _norm_str(s.get("body", "")) != ""
-            and intro_anchor.lower() in _norm_str(s.get("body", "")).lower()
+            and intro_anchor.lower() in _norm_str(_strip_inline_citations(s.get("body", ""))).lower()
             for s in act_sections
         )
         sections_ok = sections_ok and intro_match
@@ -159,7 +173,7 @@ def score_against_expected(actual: dict, expected: dict) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _mock_llm(monkeypatch):
+def _mock_llm(request, monkeypatch):
     """Stub _extract_with_llm so tests run without a live Ollama server.
 
     Prevents each integration test from hanging for 300 s waiting for a
@@ -169,7 +183,15 @@ def _mock_llm(monkeypatch):
     (test_extract_with_llm_*) call _extract_with_llm directly via their own
     imported reference and additionally patch urlopen themselves, so this
     autouse stub has no practical effect on them.
+
+    Tests marked @pytest.mark.live MUST hit the real local Ollama pipeline
+    through extract_paper(), so they opt out of this stub entirely — otherwise
+    the stub silently clobbers the live call and the test scores mock data.
     """
+    if request.node.get_closest_marker("live"):
+        yield
+        return
+
     def _stub(pages_text):
         return {
             "title": "Sample Single Column Paper",

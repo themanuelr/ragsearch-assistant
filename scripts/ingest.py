@@ -392,9 +392,14 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         raw_refs = _llm_post(
             document=combined[:LLM_TEXT_TRUNCATE],
             instruction=(
-                "Return every entry in the paper's reference/bibliography list as a JSON "
-                "array under 'references', one raw string per reference, in order. "
-                "Do not summarize. Return ONLY the JSON object, nothing else."
+                "Return the paper's reference/bibliography list as a JSON array under "
+                "'references', one raw string per reference, in their printed order. Begin "
+                "each string with that reference's own number exactly as printed in the list "
+                "(e.g. '1. ', '2. ', '3. '). Include ONLY entries from the numbered "
+                "reference/bibliography list itself — do NOT include author-contribution "
+                "statements, acknowledgements, funding or data-availability notes, or any "
+                "text that appears after the reference list ends. Do not summarize or merge "
+                "entries. Return ONLY the JSON object, nothing else."
             ),
             fmt=REFS_SCHEMA,
             timeout=300,

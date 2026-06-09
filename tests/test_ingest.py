@@ -761,6 +761,7 @@ def test_recorded_output_scores_against_fixture(recorded_llm_output, expected_fi
         )
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not _ollama_available(), reason="requires live Ollama")
 def test_cli_windows_unicode_round_trips(test_manuel2_pdf_path):
     """Criterion 6 / Pitfall 5: the CLI subprocess exits 0 and its stdout round-trips
@@ -785,6 +786,7 @@ def test_cli_windows_unicode_round_trips(test_manuel2_pdf_path):
     )
 
 
+@pytest.mark.live
 @pytest.mark.skipif(not _ollama_available(), reason="requires live Ollama")
 def test_live_end_to_end_scores_against_fixture(test_manuel2_pdf_path, expected_fixture, _tmp_config):
     """Phase acceptance gate (opt-in): real extract_paper scored against the
