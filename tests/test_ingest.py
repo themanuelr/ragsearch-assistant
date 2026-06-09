@@ -21,6 +21,7 @@ import pytest
 from scripts.ingest import (
     PAPER_JSON_KEYS,
     _compute_registry_key,
+    _doi_from_text,
     _extract_with_llm,
     _find_config,
     _load_config,
@@ -28,6 +29,24 @@ from scripts.ingest import (
     _write_registry_entry,
     extract_paper,
 )
+
+
+def _make_mock_response(inner_payload):
+    """Build a mocked Ollama /api/chat response context manager.
+
+    Wraps inner_payload (the model's content) in the Ollama envelope
+    {"message": {"content": "<json string>"}} and returns a context-manager
+    MagicMock suitable for mock_urlopen.side_effect entries.
+    """
+    response_bytes = json.dumps(
+        {"message": {"content": json.dumps(inner_payload)}}
+    ).encode()
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = response_bytes
+    mock_ctx = MagicMock()
+    mock_ctx.__enter__.return_value = mock_resp
+    mock_ctx.__exit__.return_value = None
+    return mock_ctx
 
 
 def test_paper_json_schema(sample_pdf_path):
@@ -430,4 +449,110 @@ def test_extract_with_llm_section_discovery_object_form(mock_urlopen):
     )
     assert result["sections"][0]["title"] == "Introduction", (
         f"sections[0] title mismatch: {result['sections'][0]['title']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.1-01 Task 2: doi + journal extraction (metadata schema call)
+# ---------------------------------------------------------------------------
+
+def test_doi_from_text_anchors_on_doi_org():
+    """_doi_from_text prefers the doi.org-anchored front-matter DOI over a bare
+    reference DOI elsewhere in the text (Pitfall 4)."""
+    text = (
+        "Scientific Reports | https://doi.org/10.1038/s41598-026-53619-9\n"
+        "...\n"
+        "35. Kim, S. M. et al. ... https://doi.org/10.1007/s11739-021-02847-0 (2021)."
+    )
+    assert _doi_from_text(text) == "10.1038/s41598-026-53619-9"
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_doi_extracted_from_metadata_call(mock_urlopen):
+    """The metadata LLM call returns a doi which flows into _extract_with_llm result."""
+    mock_urlopen.side_effect = [
+        _make_mock_response({                       # metadata
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+            "year": 2026,
+            "doi": "10.1038/s41598-026-53619-9",
+            "journal": "Scientific Reports",
+        }),
+        _make_mock_response({"sections": []}),       # sections (interim json)
+    ]
+    result = _extract_with_llm(["Some paper text https://doi.org/10.1038/s41598-026-53619-9"])
+    assert result["doi"] == "10.1038/s41598-026-53619-9", (
+        f"doi must flow from metadata call, got: {result.get('doi')}"
+    )
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_journal_extracted_from_metadata_call(mock_urlopen):
+    """The metadata LLM call returns a journal which flows into the result."""
+    mock_urlopen.side_effect = [
+        _make_mock_response({                       # metadata
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+            "year": 2026,
+            "doi": "10.1038/s41598-026-53619-9",
+            "journal": "Scientific Reports",
+        }),
+        _make_mock_response({"sections": []}),       # sections
+    ]
+    result = _extract_with_llm(["Some paper text"])
+    assert result["journal"] == "Scientific Reports", (
+        f"journal must flow from metadata call, got: {result.get('journal')}"
+    )
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_doi_reconcile_prefers_anchored(mock_urlopen, test_manuel2_pdf_path, monkeypatch):
+    """When the LLM doi disagrees with the doi.org-anchored regex match,
+    extract_paper prefers the anchored regex DOI (Pitfall 4 reconciliation)."""
+    # Patch _extract_with_llm to return a WRONG doi (a reference DOI), and feed a
+    # combined text whose front matter anchors the real one. extract_paper must
+    # reconcile to the anchored DOI from the document text.
+    def _stub_llm(pages_text):
+        return {
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+            "sections": [{"title": "Introduction", "body": "Intro."}],
+            "bibliography": None,
+            "figures": None,
+            "year": 2026,
+            "doi": "10.1007/s11739-021-02847-0",   # a reference DOI — wrong paper DOI
+            "journal": "Scientific Reports",
+        }
+
+    monkeypatch.setattr("scripts.ingest._extract_with_llm", _stub_llm)
+    # Force the PDF text path to carry the anchored front-matter DOI.
+    monkeypatch.setattr(
+        "scripts.ingest._is_scanned", lambda *a, **k: False
+    )
+
+    class _Page:
+        def extract_text(self, **kw):
+            return (
+                "Scientific Reports https://doi.org/10.1038/s41598-026-53619-9\n"
+                "Body text.\n"
+                "35. ref ... https://doi.org/10.1007/s11739-021-02847-0 (2021)."
+            )
+
+    class _PDF:
+        pages = [_Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("scripts.ingest.pdfplumber.open", lambda *a, **k: _PDF())
+
+    result = extract_paper(test_manuel2_pdf_path)
+    assert result["doi"] == "10.1038/s41598-026-53619-9", (
+        f"reconciliation must prefer the doi.org-anchored DOI, got: {result['doi']}"
     )
