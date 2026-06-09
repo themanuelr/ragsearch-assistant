@@ -514,13 +514,10 @@ def test_doi_from_text_anchors_on_doi_org():
 def test_doi_extracted_from_metadata_call(mock_urlopen):
     """The metadata LLM call returns a doi which flows into _extract_with_llm result.
 
-    Call order in this interim pipeline (pre plan-02) is: section discovery,
-    then metadata. The empty-discovery branch short-circuits before any
-    per-section calls, so only two responses are consumed.
+    Call order (plan 02): metadata first, then ONE whole-document sections call.
     """
     mock_urlopen.side_effect = [
-        _make_mock_response({"sections": []}),       # Call 1: section discovery (empty)
-        _make_mock_response({                        # Call 2: metadata
+        _make_mock_response({                        # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
@@ -528,6 +525,7 @@ def test_doi_extracted_from_metadata_call(mock_urlopen):
             "doi": "10.1038/s41598-026-53619-9",
             "journal": "Scientific Reports",
         }),
+        _make_mock_response({"sections": []}),       # Call 2: sections (empty -> Body fallback)
     ]
     result = _extract_with_llm(["Some paper text https://doi.org/10.1038/s41598-026-53619-9"])
     assert result["doi"] == "10.1038/s41598-026-53619-9", (
@@ -539,8 +537,7 @@ def test_doi_extracted_from_metadata_call(mock_urlopen):
 def test_journal_extracted_from_metadata_call(mock_urlopen):
     """The metadata LLM call returns a journal which flows into the result."""
     mock_urlopen.side_effect = [
-        _make_mock_response({"sections": []}),       # Call 1: section discovery (empty)
-        _make_mock_response({                        # Call 2: metadata
+        _make_mock_response({                        # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
@@ -548,6 +545,7 @@ def test_journal_extracted_from_metadata_call(mock_urlopen):
             "doi": "10.1038/s41598-026-53619-9",
             "journal": "Scientific Reports",
         }),
+        _make_mock_response({"sections": []}),       # Call 2: sections (empty -> Body fallback)
     ]
     result = _extract_with_llm(["Some paper text"])
     assert result["journal"] == "Scientific Reports", (

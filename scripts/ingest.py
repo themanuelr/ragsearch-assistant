@@ -40,9 +40,6 @@ PAPER_JSON_KEYS = frozenset({
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 LLM_TEXT_TRUNCATE = 80_000   # max chars sent to Ollama — context overflow guard
-LLM_PAGE1_TRUNCATE = 8_000   # chars for page-1 metadata call
-LLM_SECTION_TRUNCATE = 15_000  # chars per section body call
-MAX_SECTIONS = 12  # max per-section LLM calls in the extraction pipeline
 LLM_NUM_CTX = 32_768  # explicit Ollama context window — whole paper fits (RESEARCH A2)
 
 # DOI extraction: doi.org-anchored regex cross-check (RESEARCH Pattern 3, Pitfall 4)
@@ -209,9 +206,6 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     """
     from pydantic import BaseModel, ValidationError, field_validator
 
-    class _LLMSectionList(BaseModel):
-        sections: list[str] = []
-
     class _LLMMetadata(BaseModel):
         title: str = ""
         authors: list[str] = []
@@ -291,36 +285,9 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
         raw = body["message"]["content"]
         return re.sub(r"^```(?:json)?\s*\n?|\n?```\s*$", "", raw.strip(), flags=re.MULTILINE)
 
-    # Call 1: section discovery
-    section_titles: list[str] = []
-    try:
-        raw_discovery = _llm_post(
-            document=combined[:LLM_TEXT_TRUNCATE],
-            instruction=(
-                "You are a scientific paper parser. Return ONLY a JSON object with one key "
-                "'sections' whose value is an array of section title strings in reading order. "
-                "Example: {\"sections\": [\"Introduction\", \"Methods\", \"Results\", "
-                "\"Conclusion\"]}. Return ONLY the JSON object, nothing else."
-            ),
-            fmt="json",
-            timeout=180,
-        )
-        try:
-            parsed = json.loads(raw_discovery)
-            if isinstance(parsed, list):
-                section_titles = [t for t in parsed if isinstance(t, str) and t.strip()]
-            else:
-                model = _LLMSectionList(**parsed)
-                section_titles = [t for t in model.sections if isinstance(t, str) and t.strip()]
-        except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
-            section_titles = []
-    except (urllib.error.URLError, TimeoutError):
-        raise
-    except Exception:
-        return _fallback()
-
-    # Call 2: metadata (always runs — even when section discovery returned empty).
-    # Whole-document, schema-constrained: title/authors/abstract/year/doi/journal.
+    # Call 1: metadata — whole-document, schema-constrained.
+    # title/authors/abstract/year/doi/journal. Ordered FIRST so the sections call
+    # below reuses the shared document KV-cache prefix.
     title = ""
     authors: list[str] = ["Unknown"]
     abstract = ""
@@ -366,97 +333,58 @@ def _extract_with_llm(pages_text: list[str]) -> dict:
     elif regex_doi and not doi:
         doi = regex_doi
 
-    # Section discovery returned empty — use fallback sections, skip per-section calls
-    if not section_titles:
-        fig_matches = re.findall(
-            r'((?:Figure|Fig\.|Table)\s+\d+)',
-            combined[:LLM_TEXT_TRUNCATE],
-            flags=re.IGNORECASE,
-        )
-        return {
-            "title": title,
-            "authors": authors,
-            "abstract": abstract,
-            "sections": [{"title": "Body", "body": combined[:10000]}],
-            "bibliography": None,
-            "figures": [{"label": m, "caption": ""} for m in fig_matches[:20]] if fig_matches else None,
-            "year": year,
-            "doi": doi,
-            "journal": journal,
-        }
-
-    # Calls 3..N: per-section bodies (capped at MAX_SECTIONS)
+    # Call 2: sections — ONE whole-document call returning {title, body} for every
+    # section in reading order. Loose fmt="json" (NOT a schema) avoids the gemma4
+    # repetition loop on long free-text bodies (RESEARCH Pitfall 2). Replaces the
+    # former section-discovery + regex chunk-slicing + per-section loop (the root
+    # cause of the empty heading-less Introduction body — RESEARCH Pattern 4).
     sections: list[dict] = []
-    capped_titles = section_titles[:MAX_SECTIONS]
-    for i, sec_title in enumerate(capped_titles):
-        m = re.search(r'(?m)^\s*' + re.escape(sec_title), combined)
-        if not m:
-            chunk = ""
-        else:
-            start = m.start()
-            end = len(combined)
-            if i + 1 < len(capped_titles):
-                m_next = re.search(r'(?m)^\s*' + re.escape(capped_titles[i + 1]), combined)
-                if m_next and m_next.start() > start:
-                    end = m_next.start()
-            chunk = combined[start:end]
-
-        # Skip the network round-trip when there is no chunk to summarize —
-        # a paraphrased/unmatched title yields an empty chunk (WR-03).
-        if not chunk.strip():
-            sections.append({"title": sec_title, "body": ""})
-            continue
-
-        body_text = ""
+    try:
+        raw_sections = _llm_post(
+            document=combined[:LLM_TEXT_TRUNCATE],
+            instruction=(
+                "You are a scientific paper parser. Return ONLY a JSON object "
+                "{\"sections\": [{\"title\": str, \"body\": str}]} covering every section "
+                "in reading order, each with its full body text. The text between the abstract "
+                "and the first explicit section heading is the Introduction; include it as a "
+                "section titled 'Introduction' with its full body, even though no 'Introduction' "
+                "heading appears in the text. Return ONLY the JSON object, nothing else."
+            ),
+            fmt="json",
+            timeout=300,
+        )
         try:
-            raw_sec = _llm_post(
-                document=chunk[:LLM_SECTION_TRUNCATE],
-                instruction=(
-                    "You are a scientific paper parser. Return ONLY a JSON object with keys: "
-                    "'title' (section title as string) and 'body' (section content as string). "
-                    f"The section title is: {sec_title}. Return ONLY the JSON object, nothing else."
-                ),
-                fmt="json",
-                timeout=180,
-            )
-            try:
-                parsed = json.loads(raw_sec)
-                sec_model = _LLMSection(**parsed)
-                body_text = sec_model.body
-            except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
-                body_text = ""
-        except (urllib.error.URLError, TimeoutError):
-            raise
-        except Exception:
-            body_text = ""
-        sections.append({"title": sec_title, "body": body_text})
+            parsed = json.loads(raw_sections)
+            raw_list = parsed.get("sections", []) if isinstance(parsed, dict) else parsed
+            if isinstance(raw_list, list):
+                for item in raw_list:
+                    try:
+                        sec = _LLMSection(**item)
+                    except (ValidationError, TypeError):
+                        continue
+                    if sec.body.strip():
+                        sections.append({"title": sec.title, "body": sec.body})
+        except (json.JSONDecodeError, ValueError, ValidationError, TypeError):
+            sections = []
+    except (urllib.error.URLError, TimeoutError):
+        raise
+    except Exception:
+        sections = []
 
+    # Parse failure / empty list — single Body fallback (same shape the deleted
+    # empty-discovery early-return used to provide).
     if not sections:
         sections = [{"title": "Body", "body": combined[:10000]}]
 
-    # Bibliography: check last section title for reference/bibliography markers
-    bibliography = None
-    if sections:
-        last_title = sections[-1]["title"].lower()
-        if "reference" in last_title or "bibliograph" in last_title:
-            lines = [ln.strip() for ln in sections[-1]["body"].split("\n") if ln.strip()]
-            bibliography = lines if lines else None
-
-    # Figures: regex scan for Figure/Table labels — no extra LLM call
-    fig_matches = re.findall(
-        r'((?:Figure|Fig\.|Table)\s+\d+)',
-        combined[:LLM_TEXT_TRUNCATE],
-        flags=re.IGNORECASE,
-    )
-    figures = [{"label": m, "caption": ""} for m in fig_matches[:20]] if fig_matches else None
-
+    # bibliography/figures remain placeholder None keys at the end of plan 02;
+    # plan 03 replaces them with dedicated references/figures calls.
     return {
         "title": title,
         "authors": authors,
         "abstract": abstract,
         "sections": sections,
-        "bibliography": bibliography,
-        "figures": figures,
+        "bibliography": None,
+        "figures": None,
         "year": year,
         "doi": doi,
         "journal": journal,
