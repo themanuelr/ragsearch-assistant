@@ -672,6 +672,13 @@ def extract_paper(pdf_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Windows defaults stdout to cp1252, which cannot encode U+2212 (minus sign)
+    # or some accented author names — the extraction succeeds but the print would
+    # crash with UnicodeEncodeError. Reconfigure to UTF-8 before any output.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass  # non-reconfigurable stream; ensure_ascii guard below still helps
     parser = argparse.ArgumentParser(
         description="Ingest a PDF into PaperJSON + registry"
     )

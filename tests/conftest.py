@@ -55,6 +55,21 @@ def expected_fixture():
         return json.load(f)
 
 
+@pytest.fixture
+def recorded_llm_output():
+    """Load one captured real _extract_with_llm output for deterministic replay.
+
+    Returns None when the recorded fixture has not been captured yet (it is
+    generated once from a live run at the plan-04 checkpoint) so dependent tests
+    can skip gracefully instead of erroring.
+    """
+    path = os.path.join(os.path.dirname(__file__), "fixtures", "test_manuel2.recorded.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _norm_str(s: object) -> str:
     """Whitespace-normalize a string for exact-match comparison."""
     return re.sub(r"\s+", " ", str(s)).strip()

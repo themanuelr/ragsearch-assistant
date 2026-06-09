@@ -698,3 +698,100 @@ def test_doi_reconcile_prefers_anchored(mock_urlopen, test_manuel2_pdf_path, mon
     assert result["doi"] == "10.1038/s41598-026-53619-9", (
         f"reconciliation must prefer the doi.org-anchored DOI, got: {result['doi']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.1-04: CLI unicode fix + DOI registry key + recorded/live scoring
+# ---------------------------------------------------------------------------
+
+def test_registry_doi_key(sample_pdf_path, _tmp_config, monkeypatch):
+    """REG-01 key derivation: a paper whose extraction yields a DOI is written
+    under that DOI key in an ISOLATED empty tmp registry.
+
+    Scope note (Warning 3): this runs against the _tmp_config empty registry, so
+    it proves DOI-key DERIVATION only — NOT real-registry sha256->DOI re-key,
+    which is the 04-T2 human gate.
+    """
+    def _stub_llm(pages_text):
+        return {
+            "title": "A DOI Bearing Paper",
+            "authors": ["A. Author"],
+            "abstract": "ab",
+            "sections": [{"title": "Introduction", "body": "Intro."}],
+            "references": None,
+            "figures": None,
+            "year": 2026,
+            "doi": "10.1038/s41598-026-53619-9",
+            "journal": "Scientific Reports",
+        }
+    monkeypatch.setattr("scripts.ingest._extract_with_llm", _stub_llm)
+
+    extract_paper(sample_pdf_path)
+
+    config = _load_config(_tmp_config)
+    with open(config["registry_path"], "r", encoding="utf-8") as f:
+        registry = json.load(f)
+    assert len(registry) == 1, f"expected exactly one entry, got: {list(registry.keys())}"
+    key = next(iter(registry))
+    assert key == "10.1038/s41598-026-53619-9", (
+        f"DOI-bearing paper must be keyed by its DOI, got key: {key}"
+    )
+
+
+def test_recorded_output_scores_against_fixture(recorded_llm_output, expected_fixture,
+                                                sample_pdf_path, _tmp_config, monkeypatch):
+    """Deterministic recorded-replay: replay one captured real _extract_with_llm
+    output through extract_paper and score the structural/threshold fields against
+    the ground-truth fixture — no live Ollama needed.
+
+    Skips until the recorded fixture is captured at the plan-04 checkpoint.
+    """
+    if recorded_llm_output is None:
+        pytest.skip("recorded fixture not yet captured (plan 04 checkpoint)")
+
+    from tests.conftest import score_against_expected
+    monkeypatch.setattr("scripts.ingest._extract_with_llm", lambda pages_text: recorded_llm_output)
+
+    result = extract_paper(sample_pdf_path)
+    scores = score_against_expected(result, expected_fixture)
+    # Structural/threshold fields must pass on the recorded output.
+    for field in ("sections", "references", "figures"):
+        assert scores.get(field) is True, (
+            f"recorded-replay structural field '{field}' failed scoring: {scores}"
+        )
+
+
+@pytest.mark.skipif(not _ollama_available(), reason="requires live Ollama")
+def test_cli_windows_unicode_round_trips(test_manuel2_pdf_path):
+    """Criterion 6 / Pitfall 5: the CLI subprocess exits 0 and its stdout round-trips
+    through json.loads even with non-cp1252 content (accented author 'Mårtensson')."""
+    ingest_script = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "scripts", "ingest.py")
+    )
+    result = subprocess.run(
+        [sys.executable, ingest_script, "--pdf", test_manuel2_pdf_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=600,
+    )
+    assert result.returncode == 0, (
+        f"CLI must exit 0 on a cp1252 console; stderr: {result.stderr.strip()}"
+    )
+    paper = json.loads(result.stdout.strip())
+    assert isinstance(paper, dict) and paper.get("title"), "CLI output must be valid PaperJSON"
+    assert any("Mårtensson" in a for a in paper.get("authors", [])), (
+        f"accented author must round-trip, got authors: {paper.get('authors')}"
+    )
+
+
+@pytest.mark.skipif(not _ollama_available(), reason="requires live Ollama")
+def test_live_end_to_end_scores_against_fixture(test_manuel2_pdf_path, expected_fixture, _tmp_config):
+    """Phase acceptance gate (opt-in): real extract_paper scored against the
+    ground-truth fixture — exact-match metadata (incl. doi/journal) + structural
+    sections/references/figures."""
+    from tests.conftest import score_against_expected
+    result = extract_paper(test_manuel2_pdf_path)
+    scores = score_against_expected(result, expected_fixture)
+    failed = [k for k, v in scores.items() if v is not True]
+    assert not failed, f"live extraction failed scoring on fields: {failed} (full: {scores})"
