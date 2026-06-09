@@ -52,3 +52,6 @@ htmlcov/
 #user files
 NOTES.md
 STARTING_POINT.md
+
+# Local scratch — registry copies, capture scripts, ad-hoc test text (never committed)
+.local/
