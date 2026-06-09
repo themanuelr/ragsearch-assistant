@@ -312,59 +312,55 @@ def test_author_extraction_from_body(sample_pdf_path):
 
 
 @patch("scripts.ingest.urllib.request.urlopen")
-def test_extract_with_llm_section_discovery_fallback(mock_urlopen):
-    """When section discovery returns malformed JSON, _extract_with_llm falls back to
-    a single Body section without raising."""
-    # Ollama /api/chat response envelope wraps content in {"message": {"content": "..."}}
-    # The content itself is malformed JSON wrapped in markdown fences (Ollama bug #15260)
-    ollama_response = json.dumps({"message": {"content": "```json\n{\"bad: json\"\n```"}}).encode()
-    mock_response = MagicMock()
-    mock_response.read.return_value = ollama_response
-    mock_urlopen.return_value.__enter__.return_value = mock_response
+def test_extract_with_llm_no_sections_fails_fast(mock_urlopen):
+    """When section discovery returns an empty list (or malformed JSON), _extract_with_llm
+    raises RuntimeError — no Body fallback, no swallow.
 
-    result = _extract_with_llm(["Sample paper text"])
+    The old single-{title:'Body'} fallback is removed; an empty discovery is now fail-fast.
+    """
+    mock_urlopen.side_effect = [
+        _make_mock_response({                               # Call 1: metadata (succeeds)
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+        }),
+        _make_mock_response({"sections": []}),              # Call 2: discovery returns empty list
+    ]
 
-    assert isinstance(result, dict), "result must be a dict — no exception raised"
-    assert result["title"] == "", f"title must be empty string fallback, got: {result['title']}"
-    assert len(result["sections"]) == 1
-    assert result["sections"][0]["title"] == "Body"
-    assert isinstance(result["sections"][0]["body"], str), (
-        f"sections[0]['body'] must be a str, got: {type(result['sections'][0]['body'])}"
-    )
-    assert result["authors"] == ["Unknown"], (
-        f"authors must be D-02 fallback, got: {result['authors']}"
+    with pytest.raises(RuntimeError, match="section discovery returned no sections"):
+        _extract_with_llm(["Sample paper text"])
+
+
+@patch("scripts.ingest._extract_with_llm")
+def test_extract_paper_fails_on_no_sections(mock_llm, sample_pdf_path):
+    """extract_paper must exit(1) when _extract_with_llm raises RuntimeError
+    (no-sections fail-fast path from section discovery)."""
+    mock_llm.side_effect = RuntimeError("section discovery returned no sections")
+
+    with pytest.raises(SystemExit) as exc_info:
+        extract_paper(sample_pdf_path)
+    assert exc_info.value.code == 1, (
+        f"extract_paper must exit with code 1 on no-sections RuntimeError, "
+        f"got: {exc_info.value.code}"
     )
 
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_extract_with_llm_multi_call_returns_fields(mock_urlopen):
-    """Multi-call pipeline: section discovery + metadata + per-section calls return
-    structured fields. bibliography is detected from References section; figures is
-    None when no Figure/Table captions are present in the input text."""
+    """Multi-call pipeline: metadata → discovery → per-section bodies → refs → figs.
 
-    def _make_mock_response(inner_payload):
-        response_bytes = json.dumps(
-            {"message": {"content": json.dumps(inner_payload)}}
-        ).encode()
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = response_bytes
-        mock_ctx = MagicMock()
-        mock_ctx.__enter__.return_value = mock_resp
-        mock_ctx.__exit__.return_value = None
-        return mock_ctx
-
+    New call sequence: metadata (Call 1), discovery (Call 2), one body call per
+    discovered title (Calls 2a+), references (Call 3), figures (Call 4).
+    """
     mock_urlopen.side_effect = [
         _make_mock_response({                                  # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
         }),
-        _make_mock_response({                                  # Call 2: whole-document sections
-            "sections": [
-                {"title": "Introduction", "body": "Intro text."},
-                {"title": "References", "body": "Smith et al. 2020."},
-            ]
-        }),
+        _make_mock_response({"sections": ["Introduction", "References"]}),  # Call 2: discovery
+        _make_mock_response({"body": "Intro text."}),          # Call 2a: body[Introduction]
+        _make_mock_response({"body": "Smith et al. 2020."}),   # Call 2b: body[References]
         _make_mock_response({                                  # Call 3: references
             "references": ["1. Smith et al. 2020.", "2. Doe et al. 2021."]
         }),
@@ -397,8 +393,26 @@ def test_extract_with_llm_multi_call_returns_fields(mock_urlopen):
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_extract_with_llm_timeout(mock_urlopen):
     """INGEST-01 LLM path: _extract_with_llm re-raises urllib.error.URLError when Ollama
-    is unreachable — fires on first call (section discovery) — fail-fast propagates immediately."""
+    is unreachable — fires on the first HTTP call (metadata, Call 1) — fail-fast propagates
+    immediately."""
     mock_urlopen.side_effect = urllib.error.URLError("connection timeout")
+
+    with pytest.raises(urllib.error.URLError):
+        _extract_with_llm(["Sample paper text"])
+
+
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_extract_with_llm_discovery_urlopen_fails_fast(mock_urlopen):
+    """_extract_with_llm re-raises URLError when the DISCOVERY call (Call 2) fails,
+    even after metadata (Call 1) succeeds. Locks discovery-call fail-fast semantics."""
+    mock_urlopen.side_effect = [
+        _make_mock_response({                               # Call 1: metadata (succeeds)
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+        }),
+        urllib.error.URLError("connection refused"),        # Call 2: discovery raises URLError
+    ]
 
     with pytest.raises(urllib.error.URLError):
         _extract_with_llm(["Sample paper text"])
@@ -428,29 +442,39 @@ def test_extract_paper_fails_on_timeout(mock_llm, sample_pdf_path):
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_extract_with_llm_section_discovery_object_form(mock_urlopen):
-    """Whole-document sections call: when Ollama returns {"sections": [{title, body}]}
-    (object form), the _LLMSection validation branch is exercised correctly."""
+    """Discovery call: when Ollama returns {"sections": ["Introduction", "Conclusion"]}
+    (string-array form), the per-section loop issues one body call per title."""
 
     mock_urlopen.side_effect = [
-        _make_mock_response({                                                    # Call 1: metadata
+        _make_mock_response({                                          # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
         }),
-        _make_mock_response({"sections": [                                        # Call 2: sections
-            {"title": "Introduction", "body": "Intro text."},
-            {"title": "Conclusion", "body": "Conclusion text."},
-        ]}),
+        _make_mock_response({"sections": ["Introduction", "Conclusion"]}),  # Call 2: discovery
+        _make_mock_response({"body": "Intro text."}),                  # Call 2a: body[Introduction]
+        _make_mock_response({"body": "Conclusion text."}),             # Call 2b: body[Conclusion]
+        _make_mock_response({"references": []}),                       # Call 3: references
+        _make_mock_response({"figures": []}),                          # Call 4: figures
     ]
 
     result = _extract_with_llm(["Sample paper text"])
 
     assert result["title"] == "Test Paper", f"title mismatch: {result['title']}"
     assert len(result["sections"]) == 2, (
-        f"sections must have 2 entries when sections call returns object form; got: {len(result['sections'])}"
+        f"sections must have 2 entries; got: {len(result['sections'])}"
     )
     assert result["sections"][0]["title"] == "Introduction", (
         f"sections[0] title mismatch: {result['sections'][0]['title']}"
+    )
+    assert result["sections"][0]["body"] == "Intro text.", (
+        f"sections[0] body mismatch: {result['sections'][0]['body']}"
+    )
+    assert result["sections"][1]["title"] == "Conclusion", (
+        f"sections[1] title mismatch: {result['sections'][1]['title']}"
+    )
+    assert result["sections"][1]["body"] == "Conclusion text.", (
+        f"sections[1] body mismatch: {result['sections'][1]['body']}"
     )
 
 
@@ -460,18 +484,22 @@ def test_extract_with_llm_section_discovery_object_form(mock_urlopen):
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_sections_introduction_captured_without_heading(mock_urlopen):
-    """The whole-document sections call captures the Introduction with a non-empty
-    body even when the input text has NO literal 'Introduction' heading."""
+    """Discovery call explicitly requests Introduction; the per-section body call
+    returns non-empty body even when input text has NO literal 'Introduction' heading.
+    Locks the RESEARCH Pattern 4 fix: heading-less Introduction captured via discovery."""
     mock_urlopen.side_effect = [
-        _make_mock_response({                                   # Call 1: metadata
+        _make_mock_response({                                      # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
         }),
-        _make_mock_response({"sections": [                       # Call 2: sections
-            {"title": "Introduction", "body": "Sepsis poses a significant global health challenge."},
-            {"title": "Materials and methods", "body": "Approved by the review board."},
+        _make_mock_response({"sections": [                         # Call 2: discovery
+            "Introduction", "Materials and methods"
         ]}),
+        _make_mock_response({"body": "Sepsis poses a significant global health challenge."}),  # Call 2a: body[Introduction]
+        _make_mock_response({"body": "Approved by the review board."}),  # Call 2b: body[Materials and methods]
+        _make_mock_response({"references": []}),                   # Call 3: references
+        _make_mock_response({"figures": []}),                      # Call 4: figures
     ]
     # Input text deliberately has NO "Introduction" heading — just abstract then body.
     result = _extract_with_llm([
@@ -486,18 +514,22 @@ def test_sections_introduction_captured_without_heading(mock_urlopen):
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_sections_all_bodies_non_empty(mock_urlopen):
-    """Every section returned by extraction has a non-empty body (no WR-03 empty-body path)."""
+    """Every section returned by extraction has a non-empty body; discovery-then-loop
+    preserves all discovered titles with their bodies."""
     mock_urlopen.side_effect = [
-        _make_mock_response({                                   # Call 1: metadata
+        _make_mock_response({                                      # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
         }),
-        _make_mock_response({"sections": [                       # Call 2: sections
-            {"title": "Introduction", "body": "Intro body."},
-            {"title": "Results", "body": "Results body."},
-            {"title": "Conclusions", "body": "Conclusion body."},
+        _make_mock_response({"sections": [                         # Call 2: discovery
+            "Introduction", "Results", "Conclusions"
         ]}),
+        _make_mock_response({"body": "Intro body."}),              # Call 2a: body[Introduction]
+        _make_mock_response({"body": "Results body."}),            # Call 2b: body[Results]
+        _make_mock_response({"body": "Conclusion body."}),         # Call 2c: body[Conclusions]
+        _make_mock_response({"references": []}),                   # Call 3: references
+        _make_mock_response({"figures": []}),                      # Call 4: figures
     ]
     result = _extract_with_llm(["Some paper text"])
     assert len(result["sections"]) == 3
@@ -506,23 +538,61 @@ def test_sections_all_bodies_non_empty(mock_urlopen):
     )
 
 
+@patch("scripts.ingest.urllib.request.urlopen")
+def test_section_empty_body_keeps_title(mock_urlopen):
+    """Keep-empty-body decision: a per-section body call that returns empty string
+    KEEPS the title with body="" (the title is NOT dropped from sections)."""
+    mock_urlopen.side_effect = [
+        _make_mock_response({                                      # Call 1: metadata
+            "title": "Test Paper",
+            "authors": ["A. Author"],
+            "abstract": "An abstract.",
+        }),
+        _make_mock_response({"sections": ["Introduction", "Methods"]}),  # Call 2: discovery
+        _make_mock_response({"body": "Intro."}),                   # Call 2a: body[Introduction]
+        _make_mock_response({"body": ""}),                         # Call 2b: body[Methods] — empty
+        _make_mock_response({"references": []}),                   # Call 3: references
+        _make_mock_response({"figures": []}),                      # Call 4: figures
+    ]
+    result = _extract_with_llm(["Some paper text"])
+    titles_in_result = [s["title"] for s in result["sections"]]
+    assert len(result["sections"]) == 2, (
+        f"both titles must be present even with an empty body; got sections: {result['sections']}"
+    )
+    assert "Introduction" in titles_in_result, "Introduction must be in sections"
+    assert "Methods" in titles_in_result, "Methods must be in sections even with empty body"
+    methods_entry = next(s for s in result["sections"] if s["title"] == "Methods")
+    assert methods_entry["body"] == "", (
+        f"Methods body must be empty string (not dropped); got: {methods_entry['body']!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plan 01.1-03: dedicated references + deduplicated figures calls
 # ---------------------------------------------------------------------------
 
 def _meta_and_sections_responses():
-    """Return the first two canned responses (metadata, sections) shared by the
-    references/figures tests. Call sequence is metadata, sections, references, figures."""
+    """Return leading canned responses (metadata, discovery, per-section bodies) shared
+    by the references/figures tests.
+
+    Call sequence: metadata (Call 1), discovery (Call 2), body[Introduction] (Call 2a),
+    body[Results] (Call 2b), then callers append references (Call 3) and figures (Call 4).
+
+    The final result["sections"] equals [{"title":"Introduction","body":"Intro."},
+    {"title":"Results","body":"Results."}] — identical to the old single-call shape
+    so downstream assertions in references/figures tests are unchanged.
+    """
     return [
-        _make_mock_response({                       # Call 1: metadata
+        _make_mock_response({                              # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
         }),
-        _make_mock_response({"sections": [          # Call 2: sections (NO References title)
-            {"title": "Introduction", "body": "Intro."},
-            {"title": "Results", "body": "Results."},
+        _make_mock_response({"sections": [                 # Call 2: discovery (NO References title)
+            "Introduction", "Results"
         ]}),
+        _make_mock_response({"body": "Intro."}),           # Call 2a: body[Introduction]
+        _make_mock_response({"body": "Results."}),         # Call 2b: body[Results]
     ]
 
 
@@ -610,10 +680,11 @@ def test_doi_from_text_anchors_on_doi_org():
 def test_doi_extracted_from_metadata_call(mock_urlopen):
     """The metadata LLM call returns a doi which flows into _extract_with_llm result.
 
-    Call order (plan 02): metadata first, then ONE whole-document sections call.
+    Call order (discovery-then-loop): metadata (Call 1), discovery (Call 2),
+    body[Introduction] (Call 2a), references (Call 3), figures (Call 4).
     """
     mock_urlopen.side_effect = [
-        _make_mock_response({                        # Call 1: metadata
+        _make_mock_response({                              # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
@@ -621,7 +692,10 @@ def test_doi_extracted_from_metadata_call(mock_urlopen):
             "doi": "10.1038/s41598-026-53619-9",
             "journal": "Scientific Reports",
         }),
-        _make_mock_response({"sections": []}),       # Call 2: sections (empty -> Body fallback)
+        _make_mock_response({"sections": ["Introduction"]}),   # Call 2: discovery (non-empty)
+        _make_mock_response({"body": "Intro."}),               # Call 2a: body[Introduction]
+        _make_mock_response({"references": []}),               # Call 3: references
+        _make_mock_response({"figures": []}),                  # Call 4: figures
     ]
     result = _extract_with_llm(["Some paper text https://doi.org/10.1038/s41598-026-53619-9"])
     assert result["doi"] == "10.1038/s41598-026-53619-9", (
@@ -631,9 +705,13 @@ def test_doi_extracted_from_metadata_call(mock_urlopen):
 
 @patch("scripts.ingest.urllib.request.urlopen")
 def test_journal_extracted_from_metadata_call(mock_urlopen):
-    """The metadata LLM call returns a journal which flows into the result."""
+    """The metadata LLM call returns a journal which flows into the result.
+
+    Call order (discovery-then-loop): metadata (Call 1), discovery (Call 2),
+    body[Introduction] (Call 2a), references (Call 3), figures (Call 4).
+    """
     mock_urlopen.side_effect = [
-        _make_mock_response({                        # Call 1: metadata
+        _make_mock_response({                              # Call 1: metadata
             "title": "Test Paper",
             "authors": ["A. Author"],
             "abstract": "An abstract.",
@@ -641,7 +719,10 @@ def test_journal_extracted_from_metadata_call(mock_urlopen):
             "doi": "10.1038/s41598-026-53619-9",
             "journal": "Scientific Reports",
         }),
-        _make_mock_response({"sections": []}),       # Call 2: sections (empty -> Body fallback)
+        _make_mock_response({"sections": ["Introduction"]}),   # Call 2: discovery (non-empty)
+        _make_mock_response({"body": "Intro."}),               # Call 2a: body[Introduction]
+        _make_mock_response({"references": []}),               # Call 3: references
+        _make_mock_response({"figures": []}),                  # Call 4: figures
     ]
     result = _extract_with_llm(["Some paper text"])
     assert result["journal"] == "Scientific Reports", (
