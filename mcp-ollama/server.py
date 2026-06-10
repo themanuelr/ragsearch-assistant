@@ -4,9 +4,6 @@ Includes an autonomous research tool with DuckDuckGo web search via tool-calling
 """
 
 import json
-import os
-import subprocess
-import sys
 import urllib.request
 import urllib.error
 from mcp.server.fastmcp import FastMCP
@@ -226,41 +223,6 @@ def research(query: str) -> str:
             messages.append({"role": "tool", "content": result})
 
     return "[Research stopped: reached maximum search iterations without a final answer]"
-
-
-@mcp.tool()
-def process_pdf(path: str) -> str:
-    """
-    Extract structured PaperJSON from a PDF file.
-
-    Calls scripts/ingest.py as a subprocess and returns the full PaperJSON string.
-    Use this to ingest a research paper PDF before generating an Obsidian note.
-
-    Args:
-        path: Absolute path to the PDF file to ingest.
-    """
-    if not os.path.exists(path):
-        return f"[process_pdf error: file not found: {path}]"
-
-    server_dir = os.path.dirname(os.path.abspath(__file__))
-    ingest_script = os.path.normpath(
-        os.path.join(server_dir, "..", "scripts", "ingest.py")
-    )
-
-    try:
-        result = subprocess.run(
-            [sys.executable, ingest_script, "--pdf", path],
-            capture_output=True,
-            text=True,
-            timeout=360,  # must exceed _extract_with_llm's 300s Ollama timeout
-        )
-        if result.returncode != 0:
-            return f"[process_pdf error: ingest.py failed: {result.stderr.strip()}]"
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return "[process_pdf error: ingest.py timed out after 360s]"
-    except Exception as e:
-        return f"[process_pdf error: {e}]"
 
 
 @mcp.tool()

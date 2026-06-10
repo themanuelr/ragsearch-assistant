@@ -26,8 +26,7 @@ chroma_db/
 # PDF files (user-supplied, never committed — except test fixtures)
 *.pdf
 !tests/fixtures/*.pdf
-tests/fixtures/test_manuel1.pdf
-tests/fixtures/test_manuel2.pdf
+tests/fixtures/test_manuel*.pdf
 
 # Registry (shared across clones, not in repo)
 papers_registry.json
