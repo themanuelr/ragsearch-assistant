@@ -54,3 +54,6 @@ STARTING_POINT.md
 
 # Local scratch — registry copies, capture scripts, ad-hoc test text (never committed)
 .local/
+
+# MinerU output artifacts (persistent, git-ignored per D-16)
+.mineru_output/

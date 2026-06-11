@@ -1,0 +1,159 @@
+[
+  {
+    "type": "text",
+    "text": "Structural Basis of Cl<sup>2</sup> Transport by the NKCC1 Cotransporter",
+    "text_level": 1,
+    "bbox": [72, 60, 540, 80],
+    "page_idx": 0
+  },
+  {
+    "type": "text",
+    "text": "Jane Smith,<sup>a</sup> John Doe,<sup>b</sup> and Alice Johnson<sup>a,b</sup>",
+    "text_level": null,
+    "bbox": [72, 90, 540, 105],
+    "page_idx": 0
+  },
+  {
+    "type": "text",
+    "text": "<sup>a</sup>Department of Biochemistry, University of Science, City, Country. <sup>b</sup>Institute of Structural Biology, Research Center.",
+    "text_level": null,
+    "bbox": [72, 110, 540, 130],
+    "page_idx": 0
+  },
+  {
+    "type": "header",
+    "text": "JACS 2024 | Research Article",
+    "bbox": [72, 40, 540, 55],
+    "page_idx": 0
+  },
+  {
+    "type": "text",
+    "text": "Abstract",
+    "text_level": 2,
+    "bbox": [72, 145, 200, 158],
+    "page_idx": 0
+  },
+  {
+    "type": "text",
+    "text": "The SLC12A2 cotransporter (NKCC1) is a signi<sup>fi</sup>cant drug target for diuretics and neurological disorders. Here we present a 3.2 Å cryo-EM structure re<sup>fl</sup>ecting the outward-facing conformation under physiological conditions. The structure reveals the binding site for bumetanide and explains ion selectivity for Na<sup>+</sup>, K<sup>+</sup>, and Cl<sup>2</sup> efflux. These <sup>fi</sup>ndings have broad implications for developing loop diuretics with reduced side effects. The protein was puri<sup>fi</sup>ed using a� two-step approach and reconstituted into nanodiscs.",
+    "text_level": null,
+    "bbox": [72, 160, 540, 230],
+    "page_idx": 0
+  },
+  {
+    "type": "text",
+    "text": "Introduction",
+    "text_level": 2,
+    "bbox": [72, 250, 540, 265],
+    "page_idx": 1
+  },
+  {
+    "type": "text",
+    "text": "The cation-chloride cotransporter family (SLC12) comprises nine members that mediate electroneutral coupled transport of Na<sup>+</sup>, K<sup>+</sup>, and Cl<sup>2</sup> across plasma membranes. These transporters are de<sup>fi</sup>ned by their sensitivity to loop diuretics such as bumetanide and furosemide. Signi<sup>fi</sup>cant progress has been made in understanding the structural basis of transport, but the mechanism of ion selectivity remains incompletely understood.",
+    "text_level": null,
+    "bbox": [72, 270, 540, 340],
+    "page_idx": 1
+  },
+  {
+    "type": "text",
+    "text": "Results",
+    "text_level": 2,
+    "bbox": [72, 360, 540, 375],
+    "page_idx": 2
+  },
+  {
+    "type": "text",
+    "text": "Overall structure. The NKCC1 cotransporter adopts a homodimeric architecture with each monomer containing 12 transmembrane helices. The ion binding site is located at the center of the transmembrane domain, coordinated by residues from TM2, TM4, TM7, and TM9.",
+    "text_level": null,
+    "bbox": [72, 380, 540, 430],
+    "page_idx": 2
+  },
+  {
+    "type": "image",
+    "img_path": "images/fig1_structure_overview.jpg",
+    "image_caption": ["Fig. 1. Overall architecture of the NKCC1 cotransporter. (A) Cryo-EM density map at 3.2 Å resolution. (B) Cartoon representation of the NKCC1 dimer. Subunits are colored blue and orange. Scale bar, 50 Å."],
+    "image_footnote": [],
+    "content": "Molecular interaction diagram showing: Monomer 1 [blue] --> TM helices bundle --> ion binding site; Monomer 2 [orange] --> TM helices bundle --> ion binding site; dimerization interface shown by dashed lines",
+    "sub_type": "natural_image",
+    "bbox": [72, 440, 540, 600],
+    "page_idx": 2
+  },
+  {
+    "type": "text",
+    "text": "Ion binding site. The chloride binding site is formed by backbone amide nitrogens from Gly428 and Val429 and the hydroxyl group of Thr431. Sodium is coordinated by Asn316, Asp317, and three water molecules. The potassium site overlaps partially with the sodium site but is distinguished by coordination geometry.",
+    "text_level": null,
+    "bbox": [72, 610, 540, 660],
+    "page_idx": 3
+  },
+  {
+    "type": "table",
+    "text": "| Parameter | Value | Unit |\n|-----------|-------|------|\n| Resolution (overall) | 3.2 | Å |\n| Resolution (core) | 2.9 | Å |\n| Particles used | 142,830 | - |\n| Map sharpening B-factor | -85 | Å<sup>2</sup> |\n| Model CC (mask) | 0.78 | - |\n| R.m.s.d. bonds | 0.003 | Å |\n| R.m.s.d. angles | 0.62 | ° |",
+    "bbox": [72, 670, 540, 790],
+    "page_idx": 3
+  },
+  {
+    "type": "equation",
+    "text": "$$\\Delta G_{transport} = \\Delta G_{ion} + \\Delta G_{lipid} + \\Delta G_{protein}$$",
+    "bbox": [200, 800, 400, 820],
+    "page_idx": 3
+  },
+  {
+    "type": "aside_text",
+    "text": "Downloaded from https://pubs.acs.org by 192.168.1.1 on June 01, 2024",
+    "bbox": [72, 825, 540, 840],
+    "page_idx": 3
+  },
+  {
+    "type": "text",
+    "text": "Discussion",
+    "text_level": 2,
+    "bbox": [72, 50, 540, 65],
+    "page_idx": 4
+  },
+  {
+    "type": "text",
+    "text": "Our structure reveals that NKCC1 uses a conserved elevator-type mechanism for ion transport. The outward-facing conformation captured here represents the ion-loading state, where the cotransporter binds all three ions simultaneously before transitioning to the inward-facing state for release. The structural data are consistent with electrophysiological measurements showing obligatory coupling of Na<sup>+</sup>, K<sup>+</sup>, and 2 Cl<sup>2</sup> ions per transport cycle.",
+    "text_level": null,
+    "bbox": [72, 70, 540, 140],
+    "page_idx": 4
+  },
+  {
+    "type": "footer",
+    "text": "J. Am. Chem. Soc. 2024, 146, 12345–12358. DOI: 10.1021/jacs.3c10258",
+    "bbox": [72, 780, 540, 795],
+    "page_idx": 4
+  },
+  {
+    "type": "page_number",
+    "text": "4 of 9",
+    "bbox": [270, 800, 300, 812],
+    "page_idx": 4
+  },
+  {
+    "type": "text",
+    "text": "Methods",
+    "text_level": 2,
+    "bbox": [72, 50, 540, 65],
+    "page_idx": 5
+  },
+  {
+    "type": "text",
+    "text": "Protein expression and puri<sup>fi</sup>cation. Full-length human NKCC1 (SLC12A2, UniProt P55011) was expressed in HEK293F cells using a baculovirus transduction system. Cells were harvested 48 h post-transduction and lysed by nitrogen cavitation. Membranes were solubilized in 1% (w/v) lauryl maltose neopentyl glycol (LMNG) with 0.1% cholesterol hemisuccinate (CHS) for 2 h at 4 °C.",
+    "text_level": null,
+    "bbox": [72, 70, 540, 140],
+    "page_idx": 5
+  },
+  {
+    "type": "list",
+    "sub_type": "ref_text",
+    "list_items": [
+      "1. Kahle, K. T.; Khanna, A. R.; Alper, S. L.; Adragna, N. C.; Lauf, P. K.; Sun, D.; Bhatt, D. L. K-Cl cotransporters, cell volume homeostasis, and neurological disease. Trends Mol. Med. 2015, 21, 513–523. DOI: 10.1016/j.molmed.2015.05.008",
+      "2. Delpire, E.; Gagnon, K. B. SPAK and OSR1: STE20 kinases involved in the regulation of ion homoeostasis and volume control in mammalian cells. Biochem. J. 2008, 409, 321–331. DOI: 10.1042/BJ20071324",
+      "3. Bhatt, D. L.; Bhatt, A. S.; Löscher, W.; Boyko, A. Schrödinger equation application in pharmacokinetics. Nat. Rev. Drug Discov. 2022, 21, 100–115. DOI: 10.1038/s41573-021-00354-z",
+      "4. Stödberg, T.; McTague, A.; Ruiz, A. J. Mutations in SLC12A5 in epilepsy of infancy with migrating focal seizures. Nat. Commun. 2015, 6, 8038. DOI: 10.1038/ncomms9038",
+      "5. Payne, J. A.; Rivera, C.; Voipio, J.; Kaila, K. Cation-chloride co-transporters in neuronal communication, development and trauma. Trends Neurosci. 2003, 26, 199–206. DOI: 10.1016/S0166-2236(03)00068-7"
+    ],
+    "bbox": [72, 600, 540, 780],
+    "page_idx": 8
+  }
+]
