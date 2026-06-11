@@ -550,3 +550,248 @@ def test_concurrent_writes_no_corruption(tmp_path):
     registry = _read_registry(reg_path)
     assert "key-a" in registry, f"Expected 'key-a' in registry after concurrent writes, got {registry.keys()}"
     assert "key-b" in registry, f"Expected 'key-b' in registry after concurrent writes, got {registry.keys()}"
+
+
+# ---------------------------------------------------------------------------
+# Task 2 (Plan 03): Dedup check wired into ingest() — skip on cache hit
+# ---------------------------------------------------------------------------
+
+import unittest.mock as mock  # noqa: E402
+
+
+def _make_ingest_config(tmp_path, extra=None):
+    """Build a minimal config dict pointing registry to a tmp file."""
+    cfg = {
+        "registry_path": str(tmp_path / "registry.json"),
+        "project_name": "test-project",
+        "mineru_path": "/fake/mineru",
+    }
+    if extra:
+        cfg.update(extra)
+    return cfg
+
+
+# Minimal blocks that pass the quality gate (title + some text)
+MINIMAL_BLOCKS = [
+    {"type": "text", "text": "A Great Paper Title", "text_level": 1, "page_idx": 0},
+    {"type": "text", "text": "Abstract content goes here with enough characters to pass gate.", "text_level": None, "page_idx": 0},
+]
+
+
+def test_dedup_skip_returns_cached(tmp_path):
+    """When key is already in registry, ingest() returns cached entry without calling _run_mineru."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate the registry with the paper's DOI key
+    cached = {
+        "title": "A Great Paper Title",
+        "doi": "10.1/dedup-test",
+        "projects": ["other-project"],
+        "summary": None,
+        "key_findings": None,
+        "authors": None,
+        "year": None,
+        "journal": None,
+        "arxiv_id": None,
+        "source_path": "/old/paper.pdf",
+        "paperjson_path": "/old/paper.json",
+    }
+    _write_registry(cached, reg_path, "10.1/dedup-test")
+
+    # Create a fake PDF file (non-empty so file-exists check passes)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for hash")
+
+    # Patch _run_mineru to raise if called — should NOT be called on cache hit
+    # Also patch _find_content_list and the content reading to serve MINIMAL_BLOCKS
+    # so that parse-then-check-registry works
+    with mock.patch("scripts.ingest._run_mineru", side_effect=AssertionError("_run_mineru called on cache hit")), \
+         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps(MINIMAL_BLOCKS))):
+        # Provide blocks that mine a DOI that matches the cached key
+        blocks_with_doi = [
+            {"type": "text", "text": "A Great Paper Title", "text_level": 1, "page_idx": 0},
+            {"type": "text", "text": "DOI 10.1/dedup-test details.", "text_level": None, "page_idx": 1},
+        ]
+        with mock.patch("scripts.ingest._parse_content_list") as mock_parse, \
+             mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
+            mock_parse.return_value = {
+                "title": "A Great Paper Title",
+                "sections": [{"heading": "", "level": 0, "blocks": [
+                    {"type": "text", "display": "A Great Paper Title", "plain": "A Great Paper Title"},
+                    {"type": "text", "display": "DOI 10.1/dedup-test details.", "plain": "DOI 10.1/dedup-test details."},
+                ]}],
+                "references": [],
+                "metadata": {
+                    "title": "A Great Paper Title",
+                    "authors": None,
+                    "year": None,
+                    "journal": None,
+                    "doi": "10.1/dedup-test",
+                    "arxiv_id": None,
+                    "accession_codes": [],
+                },
+            }
+            result = ingest(str(fake_pdf), cfg)
+
+    # On cache hit, result should be the cached registry entry (not a full PaperJSON)
+    assert result is not None, "Expected a result from ingest() on cache hit"
+    # The result must contain the cached paper's title
+    assert result.get("title") == "A Great Paper Title" or (
+        result.get("extraction", {}).get("metadata", {}).get("title") == "A Great Paper Title"
+    ), f"Expected cached entry returned, got: {result}"
+
+
+def test_new_paper_writes_entry(tmp_path):
+    """Ingesting a not-yet-registered paper calls _write_registry once and the key appears."""
+    from scripts.ingest import ingest, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for hash")
+
+    mock_parsed = {
+        "title": "New Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "New Paper", "plain": "New Paper"},
+            {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "New Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1/new-paper",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps([]))):
+        ingest(str(fake_pdf), cfg)
+
+    registry = _read_registry(reg_path)
+    assert "10.1/new-paper" in registry, (
+        f"Expected DOI key '10.1/new-paper' in registry after new ingest, got keys: {list(registry.keys())}"
+    )
+
+
+def test_force_extract_bypasses_cache(tmp_path):
+    """With force_extract=True, the pipeline runs and re-registers even if key exists."""
+    from scripts.ingest import ingest, _write_registry, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate registry
+    old_entry = {
+        "title": "Old Entry",
+        "doi": "10.1/force-test",
+        "projects": ["old-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2020, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/old.pdf",
+        "paperjson_path": "/old.json",
+    }
+    _write_registry(old_entry, reg_path, "10.1/force-test")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 force extract fake")
+
+    mock_parsed = {
+        "title": "Updated Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "Updated Paper", "plain": "Updated Paper"},
+            {"type": "text", "display": "B" * 200, "plain": "B" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Updated Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1/force-test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+
+    mineru_called = []
+
+    def fake_mineru(*args, **kwargs):
+        mineru_called.append(True)
+
+    with mock.patch("scripts.ingest._run_mineru", side_effect=fake_mineru), \
+         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps([]))):
+        result = ingest(str(fake_pdf), cfg, force_extract=True)
+
+    # _run_mineru must have been called (force_extract bypasses cache)
+    assert mineru_called, "_run_mineru should have been called when force_extract=True"
+
+    # Registry should be updated with the new entry
+    registry = _read_registry(reg_path)
+    assert "10.1/force-test" in registry, "Expected key to exist in registry after force re-ingest"
+    # The new entry's year should be updated (2024 not 2020)
+    assert registry["10.1/force-test"].get("year") == 2024, (
+        f"Expected updated year 2024 after force re-ingest, got {registry['10.1/force-test'].get('year')}"
+    )
+
+
+def test_reg01_entry_written_on_new_ingest(tmp_path):
+    """After a new ingest, _read_registry contains an entry with the paper's title and DOI (REG-01)."""
+    from scripts.ingest import ingest, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    fake_pdf = tmp_path / "reg01paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 reg01 fake content")
+
+    mock_parsed = {
+        "title": "REG-01 Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "REG-01 Test Paper", "plain": "REG-01 Test Paper"},
+            {"type": "text", "display": "C" * 200, "plain": "C" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "REG-01 Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": "Test Journal",
+            "doi": "10.1/reg01test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps([]))):
+        ingest(str(fake_pdf), cfg)
+
+    registry = _read_registry(reg_path)
+    assert "10.1/reg01test" in registry, "Expected registry to contain the new paper's DOI key"
+    entry = registry["10.1/reg01test"]
+    assert entry.get("title") == "REG-01 Test Paper", (
+        f"Expected title 'REG-01 Test Paper', got {entry.get('title')!r}"
+    )
+    assert entry.get("doi") == "10.1/reg01test", (
+        f"Expected doi '10.1/reg01test', got {entry.get('doi')!r}"
+    )
