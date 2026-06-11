@@ -833,13 +833,17 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     Fail-fast preflight (D-10): verifies PDF exists and MinerU resolves before
     launching the subprocess. Returns the assembled PaperJSON v2 dict on success.
 
+    Registry dedup (REG-02): derives the registry key (DOI → arXiv → title-hash)
+    from parsed metadata and returns the cached entry without running MinerU when
+    the paper is already registered (unless force_extract=True).
+
     Args:
         pdf_path:      Absolute or relative path to the input PDF.
         config:        Loaded config.json dict (use _load_config()).
-        force_extract: If True, re-run MinerU even if output already exists (D-15).
+        force_extract: If True, re-run MinerU and re-register even if cached (D-15).
 
     Returns:
-        PaperJSON v2 dict with extraction, analysis, and provenance namespaces.
+        PaperJSON v2 dict (new ingest) OR cached registry entry dict (cache hit).
 
     Raises:
         SystemExit: On preflight failure, emits [ingest error: ...] and exits non-zero.
@@ -862,8 +866,35 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     # D-13: persistent output dir per document stem
     out_dir = str(pathlib.Path(".mineru_output") / pdf.stem)
     timeout = int(config.get("mineru_timeout", DEFAULT_TIMEOUT))
+    registry_path = os.path.expanduser(config.get("registry_path", ""))
+    project_name = config.get("project_name", "")
 
-    # Run or reuse MinerU
+    # ---------------------------------------------------------------------------
+    # REG-02 dedup: if existing MinerU output is present and force_extract is off,
+    # parse it first to derive the registry key without re-running the GPU step.
+    # On a cache hit, return the cached entry immediately (skips _run_mineru).
+    # ---------------------------------------------------------------------------
+    if not force_extract:
+        try:
+            existing_cl = _find_content_list(out_dir)
+            # Fast path: parse existing output to derive registry key (no GPU re-run)
+            with open(existing_cl, encoding="utf-8") as f:
+                existing_blocks = json.load(f)
+            fast_parsed = _parse_content_list(existing_blocks)
+            fast_metadata = fast_parsed.get("metadata", {})
+            reg_key = _registry_key(fast_metadata)
+            cached = _check_registry(reg_key, registry_path)
+            if cached is not None:
+                # Cache hit: return the cached registry entry (REG-02 satisfied)
+                return cached
+            # Cache miss: fall through to _run_mineru (which will reuse existing output)
+        except RuntimeError:
+            pass  # No existing output — proceed with _run_mineru (GPU step required)
+        except (OSError, json.JSONDecodeError):
+            pass  # Corrupt output — fall through to full re-run
+    # ---------------------------------------------------------------------------
+
+    # Run or reuse MinerU (GPU step — skipped on cache hit above)
     try:
         _run_mineru(str(pdf), out_dir, mineru_exe, timeout, force_extract)
     except subprocess.TimeoutExpired:
@@ -911,6 +942,19 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     if gate_error:
         print(gate_error, file=sys.stderr)
         sys.exit(1)
+
+    # ---------------------------------------------------------------------------
+    # REG-01: write extraction-only registry entry for new (or force-re-ingested) paper
+    # ---------------------------------------------------------------------------
+    if registry_path:
+        meta = result.get("extraction", {}).get("metadata", {})
+        reg_key = _registry_key(meta)
+        entry = _registry_entry(result, str(pdf), "", project_name)
+        try:
+            _write_registry(entry, registry_path, reg_key)
+        except Exception as e:
+            # Registry write failure is non-fatal — log and continue
+            print(f"[ingest warning: registry write failed: {e}]", file=sys.stderr)
 
     return result
 
