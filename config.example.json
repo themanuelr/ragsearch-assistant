@@ -1,5 +1,7 @@
 {
   "registry_path": "~/research/papers_registry.json",
   "vault_path": "~/vault/MyProject",
-  "project_name": "my-project"
+  "project_name": "my-project",
+  "mineru_path": "",
+  "mineru_timeout": 1800
 }

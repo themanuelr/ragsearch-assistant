@@ -1,5 +1,7 @@
 {
   "registry_path": "./.local/papers_registry.json",
   "vault_path": "./.local/vault",
-  "project_name": "ragsearch_assistant"
+  "project_name": "ragsearch_assistant",
+  "mineru_path": "",
+  "mineru_timeout": 1800
 }

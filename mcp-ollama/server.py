@@ -4,12 +4,17 @@ Includes an autonomous research tool with DuckDuckGo web search via tool-calling
 """
 
 import json
+import os
+import pathlib
+import subprocess
+import sys
 import urllib.request
 import urllib.error
 from mcp.server.fastmcp import FastMCP
 
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
+INGEST_SCRIPT = pathlib.Path(__file__).parent.parent / "scripts" / "ingest.py"
 
 mcp = FastMCP("ollama-local")
 
@@ -235,6 +240,35 @@ def check_ollama_status() -> str:
             return f"Ollama is running. Models: {', '.join(models)}"
     except urllib.error.URLError as e:
         return f"Ollama is not reachable: {e}"
+
+
+# ---------------------------------------------------------------------------
+# PDF ingestion tool
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def process_pdf(path: str) -> str:
+    """
+    Ingest a research paper PDF via MinerU and return PaperJSON v2 as a JSON string.
+
+    Runs scripts/ingest.py as a subprocess (no shell=True). The paper is registered
+    in the global registry on success (REG-01). This tool is extraction-only;
+    LLM analysis is Phase 2.
+
+    Args:
+        path: Absolute path to the PDF file to ingest.
+    """
+    if not os.path.exists(path):
+        return f"[process_pdf error: file not found: {path}]"
+    result = subprocess.run(
+        [sys.executable, str(INGEST_SCRIPT), "--pdf", path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return f"[process_pdf error: {result.stderr.strip()}]"
+    return result.stdout.strip()
 
 
 if __name__ == "__main__":
