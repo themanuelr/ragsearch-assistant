@@ -81,6 +81,17 @@ def _build_display(text: str) -> str:
     return _normalize_text(text)
 
 
+def _despace_math(m: "re.Match") -> str:
+    """
+    Collapse intra-math whitespace and map trivially-mappable LaTeX symbols.
+
+    Used as a re.sub callback for inline $...$ spans (D-19).
+    """
+    inner = re.sub(r"\s+", "", m.group(1))
+    inner = inner.replace(r"\pm", "±").replace(r"\times", "×")
+    return inner
+
+
 def _build_plain(text: str) -> str:
     """
     Return the plain rendition of a text block (normalized for embedding).
@@ -92,13 +103,30 @@ def _build_plain(text: str) -> str:
     # D-18: flatten <sup>/<sub> tags
     plain = re.sub(r"<su[pb]>(.*?)</su[pb]>", r"\1", normalized)
     # D-19: strip inline $...$ LaTeX delimiters and collapse spaces
-    def _collapse_math(m):
-        inner = re.sub(r"\s+", "", m.group(1))
-        # Map trivially-mappable LaTeX symbols
-        inner = inner.replace(r"\pm", "±").replace(r"\times", "×")
-        return inner
-    plain = re.sub(r"\$([^$]*)\$", _collapse_math, plain)
+    plain = re.sub(r"\$([^$]*)\$", _despace_math, plain)
     return plain
+
+
+def _quarantine_figure(block: dict) -> dict:
+    """
+    Build a quarantined figure block from a MinerU image block (D-03).
+
+    The image.content field (VLM-generated, hallucination risk per MINERU.md §2)
+    goes ONLY into figure_vlm_description. Only image_caption and img_path are
+    treated as trusted figure metadata.
+
+    Returns a figure dict: {type, img_path, caption, figure_vlm_description}.
+    """
+    caption = block.get("image_caption", [])
+    if isinstance(caption, list):
+        caption = " ".join(caption)
+    caption_normalized = _normalize_text(caption)
+    return {
+        "type": "figure",
+        "img_path": block.get("img_path", ""),
+        "caption": caption_normalized,
+        "figure_vlm_description": block.get("content", ""),  # quarantined — never embed
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -211,34 +239,50 @@ def _route_block(block: dict, current_section: dict, references: list) -> None:
     if btype == "table":
         # D-06: keep genuine table blocks as typed blocks
         content = block.get("text", "")
+        # D-20: caption-derived plain placeholder (first words of caption if present)
+        table_caption = block.get("table_caption", [])
+        if isinstance(table_caption, list):
+            table_caption = " ".join(table_caption)
+        if table_caption.strip():
+            words = table_caption.split()
+            snippet = " ".join(words[:6])
+            if len(words) > 6:
+                snippet += "…"
+            plain_placeholder = f"[Table: {snippet}]"
+        else:
+            plain_placeholder = "[Table]"
         current_section["blocks"].append({
             "type": "table",
             "display": content,
-            "plain": "[Table]",  # D-20: short placeholder for embedding
+            "plain": plain_placeholder,
         })
         return
 
     if btype == "equation":
         # D-06: keep genuine equation blocks as typed blocks
         content = block.get("text", "")
+        # D-20: caption-derived plain placeholder
+        eq_caption = block.get("equation_caption", [])
+        if isinstance(eq_caption, list):
+            eq_caption = " ".join(eq_caption)
+        if eq_caption.strip():
+            words = eq_caption.split()
+            snippet = " ".join(words[:6])
+            if len(words) > 6:
+                snippet += "…"
+            plain_placeholder = f"[Equation: {snippet}]"
+        else:
+            plain_placeholder = "[Equation]"
         current_section["blocks"].append({
             "type": "equation",
             "display": content,
-            "plain": "[Equation]",  # D-20: short placeholder
+            "plain": plain_placeholder,
         })
         return
 
     if btype == "image":
-        # D-03: quarantine VLM content; keep caption + img_path as trusted metadata
-        caption = block.get("image_caption", [])
-        if isinstance(caption, list):
-            caption = " ".join(caption)
-        current_section["blocks"].append({
-            "type": "figure",
-            "img_path": block.get("img_path", ""),
-            "caption": caption,
-            "figure_vlm_description": block.get("content", ""),  # quarantined, D-03
-        })
+        # D-03: quarantine VLM content via _quarantine_figure; keep caption + img_path
+        current_section["blocks"].append(_quarantine_figure(block))
         return
 
     if btype == "text":
@@ -440,7 +484,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         "mineru_version": None,     # resolved from MinerU output in Plan 02
         "backend": MINERU_BACKEND,
         "extracted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "normalizations_applied": ["P0_ligature", "P1_ufffd", "P1_charge_sign"],
+        "normalizations_applied": ["ligature_fix", "ufffd_replacement", "charge_sign_fix"],
         "schema_version": SCHEMA_VERSION,
     }
 
