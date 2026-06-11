@@ -412,3 +412,141 @@ def test_quality_gate_fails_garbage():
     assert result.startswith("[ingest error:"), (
         f"Expected '[ingest error: ...' prefix, got: {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1 (Plan 03): Registry key derivation + filelock atomic write + entry
+# ---------------------------------------------------------------------------
+
+from scripts.ingest import (  # noqa: E402 — import here after all registry funcs are added
+    _registry_key,
+    _read_registry,
+    _write_registry,
+    _registry_entry,
+)
+
+
+SAMPLE_PAPERJSON_FOR_REGISTRY = {
+    "extraction": {
+        "metadata": {
+            "title": "A Novel Method for X",
+            "authors": [{"name": "Smith, J."}],
+            "year": 2024,
+            "journal": "J. Am. Chem. Soc.",
+            "doi": "10.1021/jacs.3c10258",
+            "arxiv_id": "2401.00001",
+            "accession_codes": [],
+        },
+        "sections": [],
+        "references": [],
+    },
+    "analysis": {"generated_by": None},
+    "provenance": {"schema_version": 2},
+}
+
+
+def test_key_priority_doi():
+    """_registry_key returns doi when doi is present."""
+    key = _registry_key({"doi": "10.1/x", "arxiv_id": "2401.00001", "title": "T"})
+    assert key == "10.1/x", f"Expected DOI key '10.1/x', got {key!r}"
+
+
+def test_key_priority_arxiv():
+    """_registry_key returns arxiv_id when doi is None."""
+    key = _registry_key({"doi": None, "arxiv_id": "2401.00001", "title": "T"})
+    assert key == "2401.00001", f"Expected arXiv key '2401.00001', got {key!r}"
+
+
+def test_key_priority_title_hash():
+    """_registry_key returns sha256:<hex> when doi and arxiv_id are both None."""
+    key = _registry_key({"doi": None, "arxiv_id": None, "title": "My Title"})
+    assert key.startswith("sha256:"), f"Expected key starting with 'sha256:', got {key!r}"
+    # Hex chars only after the prefix
+    hex_part = key[len("sha256:"):]
+    assert all(c in "0123456789abcdef" for c in hex_part), (
+        f"Expected hex after 'sha256:', got {hex_part!r}"
+    )
+    assert len(hex_part) > 0, "Expected non-empty hex prefix"
+
+
+def test_key_title_hash_stable():
+    """_registry_key returns the same hash for identical titles."""
+    k1 = _registry_key({"doi": None, "arxiv_id": None, "title": "Stable Title"})
+    k2 = _registry_key({"doi": None, "arxiv_id": None, "title": "Stable Title"})
+    assert k1 == k2, "Expected identical keys for identical titles"
+
+
+def test_registry_entry_shape():
+    """_registry_entry has the D-23 key set; summary and key_findings are None."""
+    entry = _registry_entry(
+        SAMPLE_PAPERJSON_FOR_REGISTRY,
+        source_path="/data/paper.pdf",
+        paperjson_path="/data/paper.json",
+        project_name="my-project",
+    )
+    required_keys = {
+        "title", "authors", "year", "journal", "doi", "arxiv_id",
+        "projects", "source_path", "paperjson_path", "summary", "key_findings",
+    }
+    assert set(entry.keys()) == required_keys, (
+        f"Expected keys {required_keys}, got {set(entry.keys())}"
+    )
+    assert entry["summary"] is None, "Expected summary to be None (extraction-only)"
+    assert entry["key_findings"] is None, "Expected key_findings to be None (extraction-only)"
+    assert entry["projects"] == ["my-project"], (
+        f"Expected projects=['my-project'], got {entry['projects']}"
+    )
+    assert entry["source_path"] == "/data/paper.pdf"
+    assert entry["paperjson_path"] == "/data/paper.json"
+    assert entry["doi"] == "10.1021/jacs.3c10258"
+    assert entry["arxiv_id"] == "2401.00001"
+
+
+def test_write_then_read_roundtrip(tmp_path):
+    """_write_registry then _read_registry returns a dict with the written entry."""
+    reg_path = str(tmp_path / "registry.json")
+    entry = {"title": "Test Paper", "doi": "10.1/test"}
+    _write_registry(entry, reg_path, "10.1/test")
+    registry = _read_registry(reg_path)
+    assert isinstance(registry, dict), "Expected dict from _read_registry"
+    assert "10.1/test" in registry, "Expected written key in registry"
+    assert registry["10.1/test"]["title"] == "Test Paper"
+
+
+def test_read_registry_missing_file(tmp_path):
+    """_read_registry returns {} when the registry file does not exist."""
+    reg_path = str(tmp_path / "nonexistent_registry.json")
+    result = _read_registry(reg_path)
+    assert result == {}, f"Expected empty dict for missing registry, got {result!r}"
+
+
+def test_atomic_no_partial_file(tmp_path):
+    """After _write_registry, no .tmp file remains beside the registry."""
+    reg_path = str(tmp_path / "registry.json")
+    tmp_path_file = reg_path + ".tmp"
+    _write_registry({"title": "X"}, reg_path, "key1")
+    assert not pathlib.Path(tmp_path_file).exists(), (
+        f"Expected .tmp file to be cleaned up, but {tmp_path_file} still exists"
+    )
+
+
+def test_concurrent_writes_no_corruption(tmp_path):
+    """Two concurrent writers writing distinct keys both survive; registry parses as valid JSON."""
+    import concurrent.futures
+
+    reg_path = str(tmp_path / "registry.json")
+
+    def write_entry(key):
+        _write_registry({"title": f"Paper {key}"}, reg_path, key)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(write_entry, "key-a"),
+            executor.submit(write_entry, "key-b"),
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()  # re-raise any exceptions
+
+    registry = _read_registry(reg_path)
+    assert "key-a" in registry, f"Expected 'key-a' in registry after concurrent writes, got {registry.keys()}"
+    assert "key-b" in registry, f"Expected 'key-b' in registry after concurrent writes, got {registry.keys()}"
