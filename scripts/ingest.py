@@ -716,19 +716,34 @@ def _read_registry(registry_path: str) -> dict:
     """
     Read the papers registry JSON file.
 
-    Returns {} if the file does not exist. Raises on parse errors.
+    Returns {} if the file does not exist or is empty/whitespace-only (treats these
+    as an initialised-but-empty registry, e.g. a 0-byte file created by a prior
+    interrupted write). Raises ValueError on corrupt non-empty files to avoid
+    silently clobbering user data.
 
     Args:
         registry_path: Absolute path to the registry JSON file.
 
     Returns:
-        Parsed registry dict, or empty dict if file absent.
+        Parsed registry dict, or empty dict if file absent or empty.
+
+    Raises:
+        ValueError: When the file exists, is non-empty, but is not valid JSON.
     """
     path = pathlib.Path(registry_path)
     if not path.exists():
         return {}
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        raw = f.read()
+    # Treat missing, empty, or whitespace-only file as an empty registry
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"corrupt registry file at {registry_path}: {e}"
+        ) from e
 
 
 def _write_registry(entry: dict, registry_path: str, key: str) -> None:
@@ -754,12 +769,8 @@ def _write_registry(entry: dict, registry_path: str, key: str) -> None:
     tmp_path = registry_path + ".tmp"
 
     with filelock.FileLock(lock_path):
-        # Read current registry (or start empty)
-        if path.exists():
-            with open(path, encoding="utf-8") as f:
-                registry = json.load(f)
-        else:
-            registry = {}
+        # Read current registry (or start empty); _read_registry handles missing/empty files
+        registry = _read_registry(registry_path)
 
         registry[key] = entry
 

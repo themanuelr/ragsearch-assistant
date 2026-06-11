@@ -520,6 +520,42 @@ def test_read_registry_missing_file(tmp_path):
     assert result == {}, f"Expected empty dict for missing registry, got {result!r}"
 
 
+def test_read_registry_empty_file(tmp_path):
+    """_read_registry returns {} when the registry file exists but is 0 bytes (regression: REG-empty)."""
+    reg_path = tmp_path / "empty_registry.json"
+    reg_path.write_bytes(b"")  # 0-byte file — simulates the .local/papers_registry.json bug
+    result = _read_registry(str(reg_path))
+    assert result == {}, f"Expected empty dict for 0-byte registry, got {result!r}"
+
+
+def test_read_registry_whitespace_only(tmp_path):
+    """_read_registry returns {} when the registry file contains only whitespace."""
+    reg_path = tmp_path / "ws_registry.json"
+    reg_path.write_text("   \n\t\n", encoding="utf-8")
+    result = _read_registry(str(reg_path))
+    assert result == {}, f"Expected empty dict for whitespace-only registry, got {result!r}"
+
+
+def test_read_registry_corrupt_nonempty_raises(tmp_path):
+    """_read_registry raises ValueError (not silently) on corrupt non-empty file."""
+    reg_path = tmp_path / "corrupt_registry.json"
+    reg_path.write_text("{corrupted content", encoding="utf-8")
+    with pytest.raises(ValueError, match="corrupt"):
+        _read_registry(str(reg_path))
+
+
+def test_write_registry_empty_file_no_crash(tmp_path):
+    """_write_registry succeeds when the registry file exists but is 0 bytes (REG-empty fix)."""
+    reg_path = tmp_path / "empty_registry.json"
+    reg_path.write_bytes(b"")  # 0-byte file — the exact condition that caused the bug
+    entry = {"title": "First Paper", "doi": "10.1/first"}
+    # Must not raise; should write successfully
+    _write_registry(entry, str(reg_path), "10.1/first")
+    result = _read_registry(str(reg_path))
+    assert "10.1/first" in result, f"Expected entry written, got keys: {list(result.keys())}"
+    assert result["10.1/first"]["title"] == "First Paper"
+
+
 def test_atomic_no_partial_file(tmp_path):
     """After _write_registry, no .tmp file remains beside the registry."""
     reg_path = str(tmp_path / "registry.json")
