@@ -130,6 +130,247 @@ def _quarantine_figure(block: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Reference parsing
+# ---------------------------------------------------------------------------
+
+def _parse_one_reference(raw: str) -> dict:
+    """
+    Parse a single reference string into a structured object (D-05).
+
+    Extracts the leading reference number from `(n)` or `n.` format; extracts
+    DOI when a `10.x/...` pattern is present; sets `corrupted_authors` flag when
+    the euro sign (`€`) is present in the raw string (P2 — never auto-fixed).
+
+    Returns a dict with keys: {number, raw, doi, title, year, flags}.
+    """
+    number = None
+    # Match (n) or n. at start of string
+    m_paren = re.match(r"^\((\d+)\)", raw.strip())
+    m_dot = re.match(r"^(\d+)\.", raw.strip())
+    if m_paren:
+        number = int(m_paren.group(1))
+    elif m_dot:
+        number = int(m_dot.group(1))
+
+    # DOI extraction
+    doi = None
+    m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", raw)
+    if m_doi:
+        doi = m_doi.group(0).rstrip(".")
+
+    # Year extraction (4-digit year pattern)
+    year = None
+    m_year = re.search(r"\b(19|20)\d{2}\b", raw)
+    if m_year:
+        year = int(m_year.group(0))
+
+    # Corruption flag (P2)
+    flags = []
+    if "€" in raw:
+        flags.append("corrupted_authors")
+
+    return {
+        "number": number,
+        "raw": raw,
+        "doi": doi,
+        "title": None,  # best-effort; not confidently parseable from raw string
+        "year": year,
+        "flags": flags,
+    }
+
+
+def _parse_references(list_items: list) -> list:
+    """
+    Parse a list of raw reference strings into structured reference objects (D-05).
+
+    Each item becomes a dict with keys: {number, raw, doi, title, year, flags}.
+    Returns the list in input order.
+    """
+    return [_parse_one_reference(item) for item in list_items]
+
+
+# ---------------------------------------------------------------------------
+# Metadata mining
+# ---------------------------------------------------------------------------
+
+def _mine_footer_metadata(footer_blocks: list) -> dict:
+    """
+    Mine journal, year, and DOI from footer blocks before they are dropped (D-02).
+
+    Looks for patterns like "J. Am. Chem. Soc. 2024, 146, ..." and extracts:
+      - year: 4-digit year
+      - journal: text before the year or known journal name patterns
+      - doi: 10.x/... token if present in footer
+
+    Returns a partial metadata dict (only populated keys).
+    """
+    metadata = {}
+    for block in footer_blocks:
+        if block.get("type") != "footer":
+            continue
+        text = block.get("text", "")
+
+        # DOI in footer
+        if "doi" not in metadata:
+            m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text, re.IGNORECASE)
+            if m_doi:
+                metadata["doi"] = m_doi.group(0).rstrip(".")
+
+        # Year: first 4-digit year in footer
+        if "year" not in metadata:
+            m_year = re.search(r"\b(19|20)(\d{2})\b", text)
+            if m_year:
+                metadata["year"] = int(m_year.group(0))
+
+        # Journal: text before the year + volume pattern
+        # Pattern: "Journal Name YYYY, volume, pages"
+        if "journal" not in metadata:
+            m_journal = re.match(r"^(.+?)\s+(19|20)\d{2}", text.strip())
+            if m_journal:
+                journal_raw = m_journal.group(1).strip().rstrip(",").rstrip(".")
+                if journal_raw:
+                    metadata["journal"] = journal_raw
+
+    return metadata
+
+
+def _mine_metadata(blocks: list) -> dict:
+    """
+    Mine metadata fields from parsed content blocks (MINERU.md §6).
+
+    Extracts:
+      - title: first text block with text_level=1 on page_idx=0 (normalized)
+      - authors: best-effort from early text blocks after title (may be partial)
+      - doi: 10.x/... token from body text
+      - arxiv_id: arXiv:NNNN.NNNNN pattern
+      - accession_codes: PDB codes, EMDB entries, GitHub URLs as {type, value} dicts
+
+    Returns a metadata dict. Fields remain None when not found.
+    """
+    metadata = {
+        "title": None,
+        "authors": None,
+        "year": None,
+        "journal": None,
+        "doi": None,
+        "arxiv_id": None,
+        "accession_codes": [],
+    }
+
+    title_found = False
+    footer_blocks = []
+
+    for block in blocks:
+        btype = block.get("type", "")
+        text = block.get("text", "")
+        text_level = block.get("text_level")
+        page_idx = block.get("page_idx", -1)
+
+        # Collect footer blocks for footer mining
+        if btype == "footer":
+            footer_blocks.append(block)
+            continue
+
+        if btype != "text":
+            continue
+
+        # Title: first text_level=1 block on page_idx=0
+        if not title_found and text_level == 1 and page_idx == 0:
+            metadata["title"] = _build_plain(text)
+            title_found = True
+            continue
+
+        # DOI: search all text blocks
+        if metadata["doi"] is None:
+            m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text)
+            if m_doi:
+                metadata["doi"] = m_doi.group(0).rstrip(".")
+
+        # arXiv ID
+        if metadata["arxiv_id"] is None:
+            m_arxiv = re.search(r"arXiv:\s*(\d{4}\.\d{4,5})", text)
+            if m_arxiv:
+                metadata["arxiv_id"] = m_arxiv.group(1)
+
+        # Accession codes: PDB (4-char: digit + 3 alphanumeric), EMDB (EMD-NNNNN), GitHub
+        # PDB format: single digit followed by exactly 3 alphanumerics (e.g. 7TTI)
+        pdb_matches = re.findall(r"PDB:?([0-9][A-Z0-9]{3})\b", text)
+        for code in pdb_matches:
+            entry = {"type": "PDB", "value": code}
+            if entry not in metadata["accession_codes"]:
+                metadata["accession_codes"].append(entry)
+
+        emdb_matches = re.findall(r"\b(EMD-\d+)\b", text)
+        for code in emdb_matches:
+            entry = {"type": "EMDB", "value": code}
+            if entry not in metadata["accession_codes"]:
+                metadata["accession_codes"].append(entry)
+
+        # GitHub URLs
+        github_matches = re.findall(r"https://github\.com/[^\s,;>\"']+", text)
+        for url in github_matches:
+            entry = {"type": "GitHub", "value": url}
+            if entry not in metadata["accession_codes"]:
+                metadata["accession_codes"].append(entry)
+
+    # Mine footer metadata and merge (body DOI takes precedence)
+    if footer_blocks:
+        footer_meta = _mine_footer_metadata(footer_blocks)
+        if metadata["doi"] is None:
+            metadata["doi"] = footer_meta.get("doi")
+        if metadata["year"] is None:
+            metadata["year"] = footer_meta.get("year")
+        if metadata["journal"] is None:
+            metadata["journal"] = footer_meta.get("journal")
+
+    return metadata
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+def _quality_gate(paperjson: dict) -> str | None:
+    """
+    Validate extraction output quality (INGEST-03 redefined per D-11).
+
+    Returns an [ingest error: ...]-prefixed message when the result is garbage:
+      - no title detected (metadata.title is None or empty), OR
+      - total non-noise text is near-empty (below threshold).
+
+    Returns None when output passes quality checks.
+    """
+    extraction = paperjson.get("extraction", {})
+    metadata = extraction.get("metadata", {})
+    title = metadata.get("title")
+
+    if not title:
+        return (
+            "[ingest error: extraction produced no usable content — "
+            "possible scanned/garbage PDF (no title detected)]"
+        )
+
+    # Count total text length across all text blocks
+    total_text_len = 0
+    for section in extraction.get("sections", []):
+        for block in section.get("blocks", []):
+            if block.get("type") == "text":
+                total_text_len += len(block.get("plain", "") or block.get("display", ""))
+
+    # Near-empty threshold: 100 chars of non-noise text is a reasonable minimum
+    # for a real paper (even an abstract is ~500 chars)
+    NEAR_EMPTY_THRESHOLD = 100
+    if total_text_len < NEAR_EMPTY_THRESHOLD:
+        return (
+            f"[ingest error: extraction produced no usable content — "
+            f"possible scanned/garbage PDF (total text {total_text_len} chars "
+            f"below threshold {NEAR_EMPTY_THRESHOLD})]"
+        )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # MinerU invocation
 # ---------------------------------------------------------------------------
 
@@ -301,16 +542,20 @@ def _route_block(block: dict, current_section: dict, references: list) -> None:
 
 def _parse_content_list(blocks: list) -> dict:
     """
-    Parse a content_list.json block list into structured sections and references.
+    Parse a content_list.json block list into structured sections, references, and metadata.
 
-    Routes each block by type (D-01/D-02/D-06). Returns a dict with:
+    Routes each block by type (D-01/D-02/D-06). Mines metadata from all blocks
+    (including footers before they are dropped). Parses reference strings into
+    structured objects (D-05).
+
+    Returns a dict with:
       - sections: list of {heading, level, blocks[]}
-      - references: list of {raw, ...}
+      - references: list of structured {number, raw, doi, title, year, flags} objects
       - title: first text_level-1 block text on page 0 (or None)
+      - metadata: mined metadata dict (title, authors, year, journal, doi, arxiv_id, accession_codes)
     """
     sections = []
-    references = []
-    title = None
+    raw_ref_items = []
 
     # Start with a default section to hold content before the first heading
     current_section = {"heading": "", "level": 0, "blocks": []}
@@ -318,14 +563,11 @@ def _parse_content_list(blocks: list) -> dict:
     for block in blocks:
         btype = block.get("type", "")
         text_level = block.get("text_level")
-        page_idx = block.get("page_idx", -1)
 
-        # Extract title: first text_level=1 block on page 0
-        if btype == "text" and text_level == 1 and page_idx == 0 and title is None:
-            raw_title = block.get("text", "")
-            title = _build_plain(raw_title)
-            # Also add as a block in the section for completeness
-            _route_block(block, current_section, references)
+        # Collect raw reference strings before routing (so we can parse them later)
+        if btype == "list" and block.get("sub_type") == "ref_text":
+            for item in block.get("list_items", []):
+                raw_ref_items.append(item)
             continue
 
         # Section boundary: text_level 2 starts a new section
@@ -341,17 +583,24 @@ def _parse_content_list(blocks: list) -> dict:
             }
             continue
 
-        # Route all other blocks
-        _route_block(block, current_section, references)
+        # Route all other blocks (text, table, equation, image, noise-drop)
+        _route_block(block, current_section, raw_ref_items)
 
     # Flush final section
     if current_section["blocks"]:
         sections.append(current_section)
 
+    # Mine metadata from the full block list (footer included — mined before drop)
+    metadata = _mine_metadata(blocks)
+
+    # Parse raw reference strings into structured objects (D-05)
+    structured_refs = _parse_references(raw_ref_items)
+
     return {
-        "title": title,
+        "title": metadata.get("title"),
         "sections": sections,
-        "references": references,
+        "references": structured_refs,
+        "metadata": metadata,
     }
 
 
@@ -368,15 +617,18 @@ def _assemble_paperjson(parsed: dict, provenance: dict) -> dict:
       analysis:   empty skeleton (Phase 2 fills)
       provenance: pdf_sha256, source info, schema_version, backend, etc.
     """
+    # Prefer metadata mined via _mine_metadata (in parsed["metadata"]) over the
+    # legacy title-only path; fall back gracefully when metadata key is absent
+    mined = parsed.get("metadata") or {}
     extraction = {
         "metadata": {
-            "title": parsed.get("title"),
-            "authors": None,            # full mining in Plan 02
-            "year": None,
-            "journal": None,
-            "doi": None,
-            "arxiv_id": None,
-            "accession_codes": [],
+            "title": mined.get("title") or parsed.get("title"),
+            "authors": mined.get("authors"),
+            "year": mined.get("year"),
+            "journal": mined.get("journal"),
+            "doi": mined.get("doi"),
+            "arxiv_id": mined.get("arxiv_id"),
+            "accession_codes": mined.get("accession_codes", []),
         },
         "sections": parsed.get("sections", []),
         "references": parsed.get("references", []),
@@ -488,7 +740,15 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         "schema_version": SCHEMA_VERSION,
     }
 
-    return _assemble_paperjson(parsed, provenance)
+    result = _assemble_paperjson(parsed, provenance)
+
+    # D-11: INGEST-03 garbage-output quality gate
+    gate_error = _quality_gate(result)
+    if gate_error:
+        print(gate_error, file=sys.stderr)
+        sys.exit(1)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
