@@ -14,11 +14,14 @@ import datetime
 import glob
 import hashlib
 import json
+import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
+
+import filelock
 
 # ---------------------------------------------------------------------------
 # Module constants
@@ -655,6 +658,167 @@ def _assemble_paperjson(parsed: dict, provenance: dict) -> dict:
         "extraction": extraction,
         "analysis": analysis,
         "provenance": provenance,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+# SHA-256 prefix length for title-hash registry keys (16 hex chars = 64-bit prefix).
+# Collision probability is negligible (birthday bound ~1 in 2^32 for up to ~100k papers).
+_TITLE_HASH_PREFIX_LEN = 16
+
+
+def _normalize_title(title: str) -> str:
+    """
+    Normalize a paper title for stable SHA-256 hashing.
+
+    Lowercases, strips leading/trailing whitespace, and collapses all
+    whitespace and punctuation runs to a single space so that minor
+    typography differences (dashes, extra spaces) do not produce
+    different hash keys for the same paper.
+    """
+    title = title.lower().strip()
+    # Collapse runs of whitespace and punctuation to a single space
+    title = re.sub(r"[\s\W]+", " ", title).strip()
+    return title
+
+
+def _registry_key(metadata: dict) -> str:
+    """
+    Derive the registry key for a paper from its metadata.
+
+    Priority: DOI → arXiv ID → SHA-256 prefix of normalized title (D-07).
+
+    Args:
+        metadata: Dict with optional keys doi, arxiv_id, title.
+
+    Returns:
+        DOI string if truthy; arXiv ID if truthy and DOI absent; else
+        "sha256:<16-hex-chars>" derived from the normalized title.
+    """
+    doi = metadata.get("doi")
+    if doi:
+        return doi
+
+    arxiv_id = metadata.get("arxiv_id")
+    if arxiv_id:
+        return arxiv_id
+
+    title = metadata.get("title") or ""
+    normalized = _normalize_title(title)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return "sha256:" + digest[:_TITLE_HASH_PREFIX_LEN]
+
+
+def _read_registry(registry_path: str) -> dict:
+    """
+    Read the papers registry JSON file.
+
+    Returns {} if the file does not exist. Raises on parse errors.
+
+    Args:
+        registry_path: Absolute path to the registry JSON file.
+
+    Returns:
+        Parsed registry dict, or empty dict if file absent.
+    """
+    path = pathlib.Path(registry_path)
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_registry(entry: dict, registry_path: str, key: str) -> None:
+    """
+    Write an entry to the papers registry using filelock + atomic os.replace() (D-07, REG-04).
+
+    Acquires a .lock file to serialize concurrent writers, reads the current
+    registry (or starts from {}), sets registry[key] = entry, writes to a .tmp
+    sibling, then atomically replaces the registry file. The .tmp is always
+    cleaned up (whether or not the replace succeeds).
+
+    Args:
+        entry:         The registry entry dict to write.
+        registry_path: Absolute path to the registry JSON file.
+        key:           The registry key (DOI, arXiv ID, or sha256:<prefix>).
+    """
+    registry_path = os.path.expanduser(registry_path)
+    path = pathlib.Path(registry_path)
+    # Ensure parent directory exists
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_path = registry_path + ".lock"
+    tmp_path = registry_path + ".tmp"
+
+    with filelock.FileLock(lock_path):
+        # Read current registry (or start empty)
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                registry = json.load(f)
+        else:
+            registry = {}
+
+        registry[key] = entry
+
+        # Write to tmp then atomically replace
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, registry_path)
+
+
+def _check_registry(key: str, registry_path: str) -> dict | None:
+    """
+    Return the cached registry entry for key, or None if not present.
+
+    Args:
+        key:           Registry key (DOI, arXiv ID, or sha256:<prefix>).
+        registry_path: Absolute path to the registry JSON file.
+
+    Returns:
+        The cached entry dict, or None if not found.
+    """
+    registry = _read_registry(registry_path)
+    return registry.get(key)
+
+
+def _registry_entry(
+    paperjson: dict,
+    source_path: str,
+    paperjson_path: str,
+    project_name: str,
+) -> dict:
+    """
+    Build an extraction-only registry entry from a PaperJSON v2 document (D-23).
+
+    Copies title/authors/year/journal/doi/arxiv_id from the extraction metadata.
+    Sets summary and key_findings to None (Phase 2 backfills these).
+    Sets projects to [project_name].
+
+    Args:
+        paperjson:      Full PaperJSON v2 dict.
+        source_path:    Absolute path to the source PDF.
+        paperjson_path: Absolute path to the stored PaperJSON file.
+        project_name:   Project identifier from config.json.
+
+    Returns:
+        Registry entry dict with the D-23 key set.
+    """
+    meta = paperjson.get("extraction", {}).get("metadata", {})
+    return {
+        "title": meta.get("title"),
+        "authors": meta.get("authors"),
+        "year": meta.get("year"),
+        "journal": meta.get("journal"),
+        "doi": meta.get("doi"),
+        "arxiv_id": meta.get("arxiv_id"),
+        "projects": [project_name],
+        "source_path": source_path,
+        "paperjson_path": paperjson_path,
+        "summary": None,
+        "key_findings": None,
     }
 
 
