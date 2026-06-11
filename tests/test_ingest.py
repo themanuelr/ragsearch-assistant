@@ -571,11 +571,15 @@ def _make_ingest_config(tmp_path, extra=None):
     return cfg
 
 
-# Minimal blocks that pass the quality gate (title + some text)
-MINIMAL_BLOCKS = [
-    {"type": "text", "text": "A Great Paper Title", "text_level": 1, "page_idx": 0},
-    {"type": "text", "text": "Abstract content goes here with enough characters to pass gate.", "text_level": None, "page_idx": 0},
-]
+def _write_real_content_list(tmp_path):
+    """Write a minimal real content_list.json to tmp_path for tests that need file I/O."""
+    cl_path = tmp_path / "content_list.json"
+    blocks = [
+        {"type": "text", "text": "Paper Title", "text_level": 1, "page_idx": 0},
+        {"type": "text", "text": "X" * 200, "text_level": None, "page_idx": 1},
+    ]
+    cl_path.write_text(json.dumps(blocks), encoding="utf-8")
+    return str(cl_path)
 
 
 def test_dedup_skip_returns_cached(tmp_path):
@@ -604,38 +608,32 @@ def test_dedup_skip_returns_cached(tmp_path):
     # Create a fake PDF file (non-empty so file-exists check passes)
     fake_pdf = tmp_path / "paper.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 fake content for hash")
+    cl_path = _write_real_content_list(tmp_path)
 
-    # Patch _run_mineru to raise if called — should NOT be called on cache hit
-    # Also patch _find_content_list and the content reading to serve MINIMAL_BLOCKS
-    # so that parse-then-check-registry works
+    mock_parsed = {
+        "title": "A Great Paper Title",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "A Great Paper Title", "plain": "A Great Paper Title"},
+            {"type": "text", "display": "DOI 10.1/dedup-test details.", "plain": "DOI 10.1/dedup-test details."},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "A Great Paper Title",
+            "authors": None,
+            "year": None,
+            "journal": None,
+            "doi": "10.1/dedup-test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+
+    # _run_mineru raises if called — should NOT be called on cache hit
     with mock.patch("scripts.ingest._run_mineru", side_effect=AssertionError("_run_mineru called on cache hit")), \
-         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
-         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps(MINIMAL_BLOCKS))):
-        # Provide blocks that mine a DOI that matches the cached key
-        blocks_with_doi = [
-            {"type": "text", "text": "A Great Paper Title", "text_level": 1, "page_idx": 0},
-            {"type": "text", "text": "DOI 10.1/dedup-test details.", "text_level": None, "page_idx": 1},
-        ]
-        with mock.patch("scripts.ingest._parse_content_list") as mock_parse, \
-             mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
-            mock_parse.return_value = {
-                "title": "A Great Paper Title",
-                "sections": [{"heading": "", "level": 0, "blocks": [
-                    {"type": "text", "display": "A Great Paper Title", "plain": "A Great Paper Title"},
-                    {"type": "text", "display": "DOI 10.1/dedup-test details.", "plain": "DOI 10.1/dedup-test details."},
-                ]}],
-                "references": [],
-                "metadata": {
-                    "title": "A Great Paper Title",
-                    "authors": None,
-                    "year": None,
-                    "journal": None,
-                    "doi": "10.1/dedup-test",
-                    "arxiv_id": None,
-                    "accession_codes": [],
-                },
-            }
-            result = ingest(str(fake_pdf), cfg)
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
+        result = ingest(str(fake_pdf), cfg)
 
     # On cache hit, result should be the cached registry entry (not a full PaperJSON)
     assert result is not None, "Expected a result from ingest() on cache hit"
@@ -654,6 +652,7 @@ def test_new_paper_writes_entry(tmp_path):
 
     fake_pdf = tmp_path / "paper.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 fake content for hash")
+    cl_path = _write_real_content_list(tmp_path)
 
     mock_parsed = {
         "title": "New Paper",
@@ -674,10 +673,9 @@ def test_new_paper_writes_entry(tmp_path):
     }
 
     with mock.patch("scripts.ingest._run_mineru"), \
-         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
-         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps([]))):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
         ingest(str(fake_pdf), cfg)
 
     registry = _read_registry(reg_path)
@@ -708,6 +706,7 @@ def test_force_extract_bypasses_cache(tmp_path):
 
     fake_pdf = tmp_path / "paper.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 force extract fake")
+    cl_path = _write_real_content_list(tmp_path)
 
     mock_parsed = {
         "title": "Updated Paper",
@@ -733,10 +732,9 @@ def test_force_extract_bypasses_cache(tmp_path):
         mineru_called.append(True)
 
     with mock.patch("scripts.ingest._run_mineru", side_effect=fake_mineru), \
-         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
-         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps([]))):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
         result = ingest(str(fake_pdf), cfg, force_extract=True)
 
     # _run_mineru must have been called (force_extract bypasses cache)
@@ -760,6 +758,7 @@ def test_reg01_entry_written_on_new_ingest(tmp_path):
 
     fake_pdf = tmp_path / "reg01paper.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 reg01 fake content")
+    cl_path = _write_real_content_list(tmp_path)
 
     mock_parsed = {
         "title": "REG-01 Test Paper",
@@ -780,10 +779,9 @@ def test_reg01_entry_written_on_new_ingest(tmp_path):
     }
 
     with mock.patch("scripts.ingest._run_mineru"), \
-         mock.patch("scripts.ingest._find_content_list", return_value=str(tmp_path / "content_list.json")), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
-         mock.patch("builtins.open", mock.mock_open(read_data=json.dumps([]))):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
         ingest(str(fake_pdf), cfg)
 
     registry = _read_registry(reg_path)
