@@ -288,6 +288,239 @@ def _quarantine_figure(block: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1.3 fill helpers
+# ---------------------------------------------------------------------------
+
+def _extract_first_page_and_footers(content_list: list) -> str:
+    """
+    Extract first-page text blocks + all footer blocks as a single text string.
+
+    This is the DOI probe input (D-04) — deterministic, no LLM.
+    Footer blocks are included because DOIs frequently appear in journal footers
+    (confirmed from MINERU.md empirical findings for JACS and PNAS papers).
+
+    Args:
+        content_list: List of MinerU content_list.json block dicts.
+
+    Returns:
+        Newline-joined string of qualifying block texts.
+    """
+    lines = []
+    for block in content_list:
+        btype = block.get("type", "")
+        page_idx = block.get("page_idx", 99)
+        text = block.get("text", "")
+        if not text.strip():
+            continue
+        # Include: first-page text blocks + all footer blocks (any page)
+        if (btype == "text" and page_idx == 0) or btype == "footer":
+            lines.append(text.strip())
+    return "\n".join(lines)
+
+
+def _syntactic_doi_valid(doi: str | None) -> bool:
+    """
+    Deterministic DOI syntax check (D-00c).
+
+    Returns True if doi is a non-empty string matching 10.<digits>/<suffix>.
+    NOTE: suffix truncation can still pass this (Pitfall 3 — a truncated DOI
+    like '10.1073/pnas' is syntactically valid). The probe SYSTEM prompt carries
+    the suffix-preservation burden; this function only rejects obviously malformed
+    strings (None, empty, no DOI prefix).
+    """
+    return bool(doi and DOI_RE.fullmatch(doi.strip()))
+
+
+def _doi_probe(first_page_text: str) -> "DoiProbeResult | None":
+    """
+    Cheap pre-gate call: extract DOI, arXiv ID, and title from first-page + footer text.
+
+    Raises RuntimeError on Ollama error (D-00d fail-fast).
+    Returns None if the LLM response is unparseable after strip+fence fallback.
+    """
+    system = (
+        "You are a metadata extractor for scientific papers. "
+        "Return ONLY valid JSON matching the schema. Set a field to null if not found. "
+        "Preserve the DOI exactly as printed — do not truncate or modify it."
+    )
+    prompt = (
+        "Extract the DOI, arXiv ID, and title from the following paper text.\n\n"
+        + first_page_text[:3000]    # cap probe input; first page is sufficient
+    )
+    raw = _ollama_extraction_call(
+        prompt, system, DoiProbeResult.model_json_schema(), num_ctx=4096, timeout=60
+    )
+    if raw.startswith("[Ollama error:"):
+        raise RuntimeError(raw)     # fail-fast: Ollama unreachable
+    return _parse_extraction_response(raw, DoiProbeResult)
+
+
+def _fill_metadata(first_page_text: str, probe: "DoiProbeResult | None") -> "PaperMetadata":
+    """
+    Full metadata fill call (post-cache-miss).
+
+    Uses first-page text plus the probe's title/doi/arxiv hints. Two-strike retry.
+    On total failure falls back to a PaperMetadata built from probe hints rather
+    than crashing (metadata fill failure is degradable).
+
+    Args:
+        first_page_text: Output of _extract_first_page_and_footers().
+        probe:           DoiProbeResult from _doi_probe(), or None.
+
+    Returns:
+        Filled PaperMetadata (may be minimal fallback on total failure).
+    """
+    doi_hint = probe.doi if probe else None
+    arxiv_hint = probe.arxiv_id if probe else None
+    title_hint = probe.title if probe else None
+
+    system = (
+        "You are a metadata extractor for scientific papers. "
+        "Return ONLY valid JSON matching the schema. "
+        "Preserve all values exactly as printed — do not rewrite or infer. "
+        "Set a field to null if not found."
+    )
+    prompt = (
+        "Extract the metadata from the following paper first page.\n"
+        + (f"Hint — DOI from probe: {doi_hint}\n" if doi_hint else "")
+        + (f"Hint — arXiv ID from probe: {arxiv_hint}\n" if arxiv_hint else "")
+        + (f"Hint — title from probe: {title_hint}\n" if title_hint else "")
+        + "\n"
+        + first_page_text[:3000]
+    )
+    schema = PaperMetadata.model_json_schema()
+
+    for attempt in range(2):
+        raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=60)
+        if raw.startswith("[Ollama error:"):
+            raise RuntimeError(raw)
+        result = _parse_extraction_response(raw, PaperMetadata)
+        if result is not None:
+            return result
+        if attempt == 0:
+            prompt += "\n\nIMPORTANT: Return ONLY raw JSON. Do not wrap in code fences."
+
+    # Both attempts failed — fall back to probe hints rather than crashing
+    print("[ingest warning: metadata fill_failed — using probe hints as fallback]", file=sys.stderr)
+    return PaperMetadata(
+        title=title_hint or "",
+        doi=doi_hint,
+        arxiv_id=arxiv_hint,
+    )
+
+
+def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
+    """
+    One LLM call per section body (D-01).
+
+    Two-strike retry: on first parse failure, retry once with an explicit JSON
+    reminder appended. On second failure, return fill_failed=True with raw
+    MinerU text carried (D-05/D-06).
+
+    Over-size guard: if _estimate_num_ctx(section_text) would exceed 16384 (i.e.
+    more tokens than the hard cap), skip the LLM call entirely and return
+    fill_failed=True immediately to avoid RTX 4060 OOM (T-01.3-05).
+
+    SYSTEM prompt carries D-07 faithfulness burden AND U+FFFD/hyphenation repair.
+    Raises RuntimeError on Ollama unreachable (D-00d).
+    """
+    # Over-size guard: section larger than the 16384 cap → skip LLM, return fill_failed
+    estimated_ctx = _estimate_num_ctx(section_text)
+    if estimated_ctx >= 16384 and len(section_text) > 16384 * 4:
+        print(
+            f"[ingest warning: section '{heading}' oversize — skipping LLM fill]",
+            file=sys.stderr,
+        )
+        return SectionFillResult(heading=heading, body=section_text, fill_failed=True)
+
+    system = (
+        "You are a scientific text cleaner. "
+        "Repair encoding artifacts (U+FFFD, ligature runs) and restore correct "
+        "hyphenation for compound terms. "
+        "Preserve the author's wording exactly — do not rewrite, summarise, or expand. "
+        "Return ONLY valid JSON matching the schema."
+    )
+    prompt = (
+        f"Clean the following section text from a research paper PDF.\n"
+        f"Section heading: {heading}\n\n"
+        f"{section_text}"
+    )
+    schema = SectionFillResult.model_json_schema()
+
+    for attempt in range(2):                             # two-strike: try, retry, flag
+        raw = _ollama_extraction_call(
+            prompt, system, schema,
+            num_ctx=_estimate_num_ctx(section_text),
+            timeout=120,
+        )
+        if raw.startswith("[Ollama error:"):
+            raise RuntimeError(raw)                      # Ollama unreachable → abort pipeline
+        result = _parse_extraction_response(raw, SectionFillResult)
+        if result is not None:
+            return result
+        if attempt == 0:
+            # First attempt failed — retry with explicit JSON reminder
+            prompt += "\n\nIMPORTANT: Return ONLY raw JSON. Do not wrap in code fences."
+
+    # Both attempts failed — flag the section, carry raw MinerU text (D-06)
+    print(f"[ingest warning: section '{heading}' fill_failed]", file=sys.stderr)
+    return SectionFillResult(heading=heading, body=section_text, fill_failed=True)
+
+
+def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
+    """
+    Fill reference list in batches of BATCH_SIZE (~10 refs per call, D-02).
+
+    Returns (filled_refs, failure_count).
+    A failed batch increments failure_count by 1 and flags each ref in that
+    batch with fill_failed=True, carrying the raw string. Raw loss is bounded
+    to at most 10 refs per failed batch.
+
+    Raises RuntimeError on Ollama unreachable (D-00d).
+    """
+    BATCH_SIZE = 10
+    system = (
+        "You are a reference parser for scientific papers. "
+        "For each reference string, extract the number, DOI, title, and year if present. "
+        "Set fields to null if not found. Do not invent values. "
+        "Return ONLY valid JSON matching the schema."
+    )
+    filled: list = []
+    failures = 0
+
+    for i in range(0, len(raw_refs), BATCH_SIZE):
+        batch = raw_refs[i:i + BATCH_SIZE]
+        batch_text = "\n".join(
+            ref.get("raw", str(ref)) if isinstance(ref, dict) else str(ref)
+            for ref in batch
+        )
+        prompt = f"Parse the following references:\n\n{batch_text}"
+        schema = RefBatchResult.model_json_schema()
+        result = None
+
+        for attempt in range(2):
+            raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=60)
+            if raw.startswith("[Ollama error:"):
+                raise RuntimeError(raw)
+            result = _parse_extraction_response(raw, RefBatchResult)
+            if result is not None:
+                break
+            if attempt == 0:
+                prompt += "\n\nIMPORTANT: Return ONLY raw JSON. Do not wrap in code fences."
+
+        if result is not None:
+            filled.extend(r.model_dump() for r in result.refs)
+        else:
+            # Both attempts failed — flag each ref in batch as fill_failed
+            failures += 1
+            for ref in batch:
+                raw_str = ref.get("raw", str(ref)) if isinstance(ref, dict) else str(ref)
+                filled.append(RefEntry(raw=raw_str, fill_failed=True).model_dump())
+
+    return filled, failures
+
+
+# ---------------------------------------------------------------------------
 # Quality gate
 # ---------------------------------------------------------------------------
 
