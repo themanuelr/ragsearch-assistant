@@ -796,3 +796,234 @@ def test_models_schema_generation():
             f"Expected 'properties' key in {Model.__name__}.model_json_schema() for Ollama format= compatibility, "
             f"got: {list(schema.keys())}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 02 Task 1: probe + fill helpers
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch
+import json as _json_mod
+
+
+def test_extract_first_page_and_footers_basic():
+    """_extract_first_page_and_footers returns first-page text and footer blocks."""
+    from scripts.ingest import _extract_first_page_and_footers
+    blocks = [
+        {"type": "text", "page_idx": 0, "text": "Title on page 0"},
+        {"type": "text", "page_idx": 1, "text": "Body on page 1"},
+        {"type": "footer", "page_idx": 1, "text": "DOI 10.1073/pnas.123"},
+        {"type": "footer", "page_idx": 0, "text": "Journal Name"},
+        {"type": "text", "page_idx": 0, "text": "   "},  # blank — should be skipped
+    ]
+    result = _extract_first_page_and_footers(blocks)
+    assert "Title on page 0" in result
+    assert "DOI 10.1073/pnas.123" in result
+    assert "Journal Name" in result
+    # Body page 1 text block should NOT be included
+    assert "Body on page 1" not in result
+    # Blank text should not produce a blank line entry
+    assert "   " not in result
+
+
+def test_extract_first_page_and_footers_empty():
+    """_extract_first_page_and_footers returns empty string for empty block list."""
+    from scripts.ingest import _extract_first_page_and_footers
+    result = _extract_first_page_and_footers([])
+    assert result == ""
+
+
+def test_syntactic_doi_valid_good():
+    """_syntactic_doi_valid returns True for a valid full DOI."""
+    from scripts.ingest import _syntactic_doi_valid
+    assert _syntactic_doi_valid("10.1073/pnas.2209111120") is True
+    assert _syntactic_doi_valid("10.1021/jacs.3c10258") is True
+    assert _syntactic_doi_valid("10.1016/j.cell.2023.01.001") is True
+
+
+def test_syntactic_doi_valid_none():
+    """_syntactic_doi_valid returns False for None input."""
+    from scripts.ingest import _syntactic_doi_valid
+    assert _syntactic_doi_valid(None) is False
+
+
+def test_syntactic_doi_valid_garbage():
+    """_syntactic_doi_valid returns False for non-DOI strings."""
+    from scripts.ingest import _syntactic_doi_valid
+    assert _syntactic_doi_valid("garbage") is False
+    assert _syntactic_doi_valid("http://example.com") is False
+    assert _syntactic_doi_valid("") is False
+
+
+def test_doi_probe_raises_on_ollama_error():
+    """_doi_probe raises RuntimeError when _ollama_extraction_call returns an error string (D-00d)."""
+    from scripts.ingest import _doi_probe
+    with patch("scripts.ingest._ollama_extraction_call", return_value="[Ollama error: connection refused]"):
+        with pytest.raises(RuntimeError):
+            _doi_probe("First page text with DOI 10.1073/pnas.123")
+
+
+def test_doi_probe_returns_result_on_success():
+    """_doi_probe returns a DoiProbeResult on a valid LLM response."""
+    from scripts.ingest import _doi_probe
+    mock_resp = _json_mod.dumps({
+        "doi": "10.1073/pnas.2209111120",
+        "arxiv_id": None,
+        "title": "Sample Paper Title",
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        result = _doi_probe("First page text")
+    assert result is not None
+    assert result.doi == "10.1073/pnas.2209111120"
+    assert result.title == "Sample Paper Title"
+
+
+def test_fill_section_succeeds_on_valid_response():
+    """_fill_section returns a SectionFillResult with the LLM body on success."""
+    from scripts.ingest import _fill_section
+    mock_resp = _json_mod.dumps({
+        "heading": "Methods",
+        "body": "Cleaned methods section text.",
+        "fill_failed": False,
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        result = _fill_section("Raw methods text", "Methods")
+    assert result is not None
+    assert result.fill_failed is False
+    assert result.body == "Cleaned methods section text."
+    assert result.heading == "Methods"
+
+
+def test_fill_section_fill_failed_on_two_parse_failures():
+    """_fill_section returns fill_failed=True + raw text after two parse failures (D-05/D-06)."""
+    from scripts.ingest import _fill_section
+    with patch("scripts.ingest._ollama_extraction_call", return_value="not valid json"), \
+         patch("scripts.ingest._parse_extraction_response", return_value=None):
+        result = _fill_section("raw body text", "Methods")
+    assert result.fill_failed is True
+    assert result.body == "raw body text"
+    assert result.heading == "Methods"
+
+
+def test_fill_section_raises_on_ollama_error():
+    """_fill_section raises RuntimeError when Ollama is unreachable (D-00d)."""
+    from scripts.ingest import _fill_section
+    with patch("scripts.ingest._ollama_extraction_call", return_value="[Ollama error: timeout]"):
+        with pytest.raises(RuntimeError):
+            _fill_section("some text", "Introduction")
+
+
+def test_fill_section_system_prompt_faithfulness():
+    """_fill_section SYSTEM prompt contains the D-07 faithfulness phrase."""
+    from scripts.ingest import _fill_section
+    captured_system = []
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_system.append(system)
+        return "[Ollama error: stop]"  # trigger RuntimeError after capture
+
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        try:
+            _fill_section("text", "heading")
+        except RuntimeError:
+            pass
+
+    assert captured_system, "Expected _ollama_extraction_call to be called"
+    assert "do not rewrite, summarise, or expand" in captured_system[0], (
+        f"Expected faithfulness phrase in system prompt, got: {captured_system[0]!r}"
+    )
+
+
+def test_doi_probe_system_prompt_preservation():
+    """_doi_probe SYSTEM prompt contains the DOI-preservation phrase (Pitfall 3)."""
+    from scripts.ingest import _doi_probe
+    captured_system = []
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_system.append(system)
+        return "[Ollama error: stop]"
+
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        try:
+            _doi_probe("text")
+        except RuntimeError:
+            pass
+
+    assert captured_system, "Expected _ollama_extraction_call to be called"
+    assert "Preserve the DOI exactly as printed" in captured_system[0], (
+        f"Expected DOI preservation phrase in system prompt, got: {captured_system[0]!r}"
+    )
+
+
+def test_fill_section_oversize_guard():
+    """_fill_section returns fill_failed immediately when section exceeds 16384-token cap (T-01.3-05)."""
+    from scripts.ingest import _fill_section
+    # ~200000 chars → >16384 estimated tokens → should skip LLM and return fill_failed
+    huge_text = "x" * 200000
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=AssertionError("LLM must not be called")):
+        result = _fill_section(huge_text, "Huge Section")
+    assert result.fill_failed is True
+    assert result.body == huge_text
+
+
+def test_fill_references_batched_success():
+    """_fill_references_batched returns filled refs + 0 failures on a successful batch."""
+    from scripts.ingest import _fill_references_batched
+    raw_refs = [
+        {"raw": "1. Smith J. et al. Nature 2024. 10.1/abc"},
+        {"raw": "2. Jones A. Cell 2023. 10.2/xyz"},
+    ]
+    mock_resp = _json_mod.dumps({
+        "refs": [
+            {"number": 1, "raw": "1. Smith J. et al. Nature 2024. 10.1/abc",
+             "doi": "10.1/abc", "title": "Paper 1", "year": 2024, "fill_failed": False},
+            {"number": 2, "raw": "2. Jones A. Cell 2023. 10.2/xyz",
+             "doi": "10.2/xyz", "title": "Paper 2", "year": 2023, "fill_failed": False},
+        ]
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        filled, failures = _fill_references_batched(raw_refs)
+    assert failures == 0
+    assert len(filled) == 2
+    assert filled[0]["doi"] == "10.1/abc"
+    assert filled[1]["doi"] == "10.2/xyz"
+
+
+def test_fill_references_batched_failed_batch():
+    """_fill_references_batched flags each ref in a failed batch with fill_failed=True."""
+    from scripts.ingest import _fill_references_batched
+    raw_refs = [{"raw": "1. Bad ref"}, {"raw": "2. Also bad"}]
+    with patch("scripts.ingest._ollama_extraction_call", return_value="not json"), \
+         patch("scripts.ingest._parse_extraction_response", return_value=None):
+        filled, failures = _fill_references_batched(raw_refs)
+    assert failures == 1  # one failed batch
+    assert len(filled) == 2
+    for ref in filled:
+        assert ref.get("fill_failed") is True
+
+
+def test_fill_references_batched_raises_on_ollama_error():
+    """_fill_references_batched raises RuntimeError on Ollama unreachable."""
+    from scripts.ingest import _fill_references_batched
+    raw_refs = [{"raw": "1. Some ref"}]
+    with patch("scripts.ingest._ollama_extraction_call", return_value="[Ollama error: down]"):
+        with pytest.raises(RuntimeError):
+            _fill_references_batched(raw_refs)
+
+
+def test_six_helpers_exist():
+    """All six probe/fill helpers exist in scripts.ingest (acceptance criterion)."""
+    from scripts.ingest import (
+        _extract_first_page_and_footers,
+        _doi_probe,
+        _syntactic_doi_valid,
+        _fill_metadata,
+        _fill_section,
+        _fill_references_batched,
+    )
+    assert callable(_extract_first_page_and_footers)
+    assert callable(_doi_probe)
+    assert callable(_syntactic_doi_valid)
+    assert callable(_fill_metadata)
+    assert callable(_fill_section)
+    assert callable(_fill_references_batched)
