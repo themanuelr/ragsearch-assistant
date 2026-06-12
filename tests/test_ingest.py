@@ -1229,3 +1229,173 @@ def test_ingest_check_registry_after_doi_probe():
     assert probe_pos < check_pos, (
         f"Expected _doi_probe (pos {probe_pos}) to appear before _check_registry (pos {check_pos}) in ingest()"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 02 Task 3: Mock-LLM integration tests
+# REG-02 / D-00b: cache-hit-no-fill
+# REG-01: miss-fills-and-writes
+# E9 / D-05/D-06: fill_failed graceful degradation
+# D-00d: Ollama unreachable aborts
+# ---------------------------------------------------------------------------
+
+def test_cache_hit_skips_all_fill(tmp_path):
+    """REG-02/D-00b: with registry pre-populated for the probe DOI, ingest() returns
+    cached entry and all fill helpers raise if called."""
+    from scripts.ingest import ingest, _write_registry, DoiProbeResult, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    doi_key = "10.1073/pnas.2209111120"  # real DOI format
+    cached_entry = {
+        "title": "Attention Is All You Need",
+        "doi": doi_key,
+        "projects": ["prior-project"],
+        "summary": None, "key_findings": None,
+        "authors": ["Vaswani A.", "Shazeer N."],
+        "year": 2017,
+        "journal": "NeurIPS",
+        "arxiv_id": "1706.03762",
+        "source_path": "/prior/paper.pdf",
+        "paperjson_path": "/prior/paper.json",
+    }
+    _write_registry(cached_entry, reg_path, doi_key)
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 attention is all you need")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id="1706.03762", title="Attention Is All You Need")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Attention Is All You Need",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "Attention Is All You Need", "plain": "Attention Is All You Need"},
+                 {"type": "text", "display": "X" * 200, "plain": "X" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Attention Is All You Need", "authors": None, "year": None,
+                          "journal": None, "doi": doi_key, "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata",
+                    side_effect=AssertionError("D-00b violated: _fill_metadata called on cache hit")), \
+         mock.patch("scripts.ingest._fill_section",
+                    side_effect=AssertionError("D-00b violated: _fill_section called on cache hit")), \
+         mock.patch("scripts.ingest._fill_references_batched",
+                    side_effect=AssertionError("D-00b violated: _fill_references_batched called on cache hit")):
+        result = ingest(str(fake_pdf), cfg)
+
+    # Must return the cached entry (not a full PaperJSON)
+    assert result.get("title") == "Attention Is All You Need", (
+        f"Expected cached title returned, got: {result.get('title')}"
+    )
+    assert result.get("doi") == doi_key, (
+        f"Expected cached doi returned, got: {result.get('doi')}"
+    )
+
+
+def test_miss_fills_and_writes_entry(tmp_path):
+    """REG-01: on cache miss, ingest() calls fill helpers + writes registry entry keyed by probe DOI."""
+    from scripts.ingest import ingest, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    doi_key = "10.1021/jacs.3c10258"  # real DOI format, NOT in registry
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 new paper to fill")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id=None, title="A Novel Method for X")
+    metadata_result = PaperMetadata(
+        title="A Novel Method for X",
+        authors=["Smith J.", "Jones A."],
+        doi=doi_key,
+        year=2024,
+        journal="J. Am. Chem. Soc.",
+    )
+    section_fill = SectionFillResult(heading="", body="Cleaned section body text.", fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "A Novel Method for X",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A Novel Method for X", "plain": "A Novel Method for X"},
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "A Novel Method for X", "authors": None, "year": None,
+                          "journal": None, "doi": doi_key, "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result) as mock_fill_meta, \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill) as mock_fill_sec, \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)) as mock_fill_refs:
+        result = ingest(str(fake_pdf), cfg)
+
+    # Fill helpers were called
+    assert mock_fill_meta.called, "Expected _fill_metadata to be called on cache miss"
+    assert mock_fill_sec.called, "Expected _fill_section to be called on cache miss"
+    assert mock_fill_refs.called, "Expected _fill_references_batched to be called on cache miss"
+
+    # Registry was written with the probe DOI key
+    registry = _read_registry(reg_path)
+    assert doi_key in registry, (
+        f"Expected DOI key '{doi_key}' in registry after fill, got keys: {list(registry.keys())}"
+    )
+    # Registry entry title comes from PaperMetadata fill result
+    entry = registry[doi_key]
+    assert entry.get("title") == "A Novel Method for X", (
+        f"Expected filled title in registry, got: {entry.get('title')!r}"
+    )
+
+
+def test_fill_failed_graceful(tmp_path, capsys):
+    """E9/D-05/D-06: _fill_section with two parse failures returns fill_failed=True + raw text."""
+    from scripts.ingest import _fill_section
+
+    with patch("scripts.ingest._ollama_extraction_call", return_value="not json at all"), \
+         patch("scripts.ingest._parse_extraction_response", return_value=None):
+        result = _fill_section("raw body text of the Methods section", "Methods")
+
+    assert result.fill_failed is True, "Expected fill_failed=True after two parse failures"
+    assert result.body == "raw body text of the Methods section", (
+        f"Expected raw text preserved in body, got: {result.body!r}"
+    )
+    assert result.heading == "Methods", f"Expected heading preserved, got: {result.heading!r}"
+
+    # Warning should have been printed to stderr
+    captured = capsys.readouterr()
+    assert "fill_failed" in captured.err, (
+        f"Expected 'fill_failed' warning in stderr, got: {captured.err!r}"
+    )
+
+
+def test_ollama_unreachable_aborts(tmp_path):
+    """D-00d: Ollama unreachable causes RuntimeError in fill helpers and _doi_probe."""
+    from scripts.ingest import _fill_section, _doi_probe
+
+    # _fill_section raises on Ollama error
+    with patch("scripts.ingest._ollama_extraction_call", return_value="[Ollama error: connection refused]"):
+        with pytest.raises(RuntimeError) as exc_info:
+            _fill_section("some section text", "Introduction")
+    assert "Ollama error" in str(exc_info.value), (
+        f"Expected RuntimeError with Ollama error message, got: {exc_info.value}"
+    )
+
+    # _doi_probe also raises on Ollama error
+    with patch("scripts.ingest._ollama_extraction_call", return_value="[Ollama error: timeout]"):
+        with pytest.raises(RuntimeError) as exc_info:
+            _doi_probe("first page text with doi")
+    assert "Ollama error" in str(exc_info.value), (
+        f"Expected RuntimeError from _doi_probe on Ollama error, got: {exc_info.value}"
+    )
