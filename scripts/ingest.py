@@ -125,7 +125,7 @@ class PaperMetadata(BaseModel):
     title: str
     authors: list[str] = Field(default_factory=list)
     journal: str | None = None          # journal abbreviation, e.g. "J. Am. Chem. Soc."
-    journal_full: str | None = None     # full journal title, e.g. "Journal of the American Chemical Society"
+    journal_full: str | None = None     # full journal title verbatim from document text; null if only abbreviation
                                         # additive optional field (Plan 06 GAP D); no SCHEMA_VERSION bump
     year: int | None = None
     doi: str | None = None
@@ -456,14 +456,13 @@ def _syntactic_doi_valid(doi: str | None) -> bool:
     return bool(doi and DOI_RE.fullmatch(doi.strip()))
 
 
-def _doi_probe(full_text: str, first_page_text: str | None = None) -> "DoiProbeResult | None":
+def _doi_probe(full_text: str) -> "DoiProbeResult | None":
     """
     Pre-gate call: extract DOI, arXiv ID, and title from the FULL document text.
 
-    Plan 06 GAP C: the probe now receives the full MinerU document text (all text +
-    footer blocks, every page) so a DOI in Supporting Information is found. The title
-    hint is still sourced from first_page_text (cover page) when provided; if omitted,
-    full_text is used for the title hint too (backward-compatible single-arg callers).
+    The probe receives the full MinerU document text (all text + footer blocks, every
+    page) so a DOI in Supporting Information is found. The title hint derives from the
+    start of full_text (the cover page is at the beginning of the document).
 
     Raises RuntimeError on Ollama error (D-00d fail-fast — a probe failure means
     the server is unhealthy; proceeding probe-less would derive a garbage title-hash
@@ -471,11 +470,10 @@ def _doi_probe(full_text: str, first_page_text: str | None = None) -> "DoiProbeR
     Returns None if the LLM response is unparseable after strip+fence fallback.
 
     Args:
-        full_text:        Full document text (_extract_full_text output — all pages).
-        first_page_text:  Cover-page text used for the title hint. If None, full_text
-                          is used (backward-compatible single-arg call path).
+        full_text: Full document text (_extract_full_text output — all pages). The title
+                   is at the start of this text (cover page); the DOI may be anywhere
+                   including Supporting Information sections on later pages.
     """
-    title_source = first_page_text if first_page_text is not None else full_text
     system = (
         "You are a metadata extractor for scientific papers. "
         "Return ONLY valid JSON matching the schema. Set a field to null if not found. "
@@ -484,9 +482,7 @@ def _doi_probe(full_text: str, first_page_text: str | None = None) -> "DoiProbeR
         "section on a later page. The title is on the cover page."
     )
     prompt = (
-        "Extract the DOI, arXiv ID, and title from the following paper text.\n"
-        "The title appears on the cover page (beginning of text); the DOI may be "
-        "anywhere in the document including Supporting Information.\n\n"
+        "Extract the DOI, arXiv ID, and title from the following paper text:\n\n"
         + full_text
     )
     raw = _ollama_extraction_call(
@@ -523,8 +519,10 @@ def _fill_metadata(first_page_text: str, probe: "DoiProbeResult | None") -> "Pap
         "Return ONLY valid JSON matching the schema. "
         "Preserve all values exactly as printed — do not rewrite or infer. "
         "Set a field to null if not found. "
-        "Return the journal abbreviation in `journal` (e.g. 'J. Am. Chem. Soc.') and "
-        "the full journal name in `journal_full` (e.g. 'Journal of the American Chemical Society')."
+        "Return the journal abbreviation in `journal` (exactly as printed, e.g. 'J. Am. Chem. Soc.'). "
+        "Set `journal_full` to the full journal name ONLY if it appears verbatim in the text. "
+        "If only an abbreviation is present, set `journal_full` to null. "
+        "Never expand or guess the full name from the abbreviation."
     )
     prompt = (
         "Extract the metadata from the following paper first page.\n"
@@ -1403,14 +1401,14 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     _log(f"warming up {OLLAMA_MODEL}")
     _warmup_ollama()
 
-    # Step 6: DOI probe — LLM call on FULL document (GAP C) + cover-page for title hint (D-03, D-04)
+    # Step 6: DOI probe — LLM call on FULL document text; title hint is at the start of the document.
     # full_text feeds the DOI probe (may include Supporting Information DOI on later pages);
     # first_page_text feeds _fill_metadata (cover-page metadata is more reliable for title/authors).
     _log("doi probe")
     full_text = _extract_full_text(blocks)
     first_page_text = _extract_first_page_and_footers(blocks)
     try:
-        probe = _doi_probe(full_text, first_page_text)
+        probe = _doi_probe(full_text)
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)

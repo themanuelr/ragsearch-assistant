@@ -2053,7 +2053,11 @@ def test_extract_full_text_includes_non_first_page():
 
 
 def test_doi_probe_scans_full_text():
-    """_doi_probe receives the full_text in the prompt; num_ctx sized by _estimate_num_ctx(full_text)."""
+    """_doi_probe receives the full_text in the prompt; num_ctx sized by _estimate_num_ctx(full_text).
+
+    Updated in Plan 07 (GAP A): first_page_text kwarg removed — probe now takes full_text only.
+    The title hint is at the start of the document (no separate first_page_text arg needed).
+    """
     import scripts.ingest as _m
     from scripts.ingest import _doi_probe, _estimate_num_ctx
     import json as _json
@@ -2068,7 +2072,7 @@ def test_doi_probe_scans_full_text():
 
     full_text = "Cover page text only\n" + "page 3 contains: 10.1021/jacs.3c10258"
     with mock.patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
-        _doi_probe(full_text=full_text, first_page_text="Cover page text only")
+        _doi_probe(full_text=full_text)
 
     assert captured_prompt, "Expected _ollama_extraction_call to be called"
     assert "10.1021/jacs.3c10258" in captured_prompt[0], (
@@ -2296,11 +2300,14 @@ def test_fill_metadata_journal_full_extraction_only():
 
     def capture_call(prompt, system, schema, **kwargs):
         captured_system.append(system)
-        return "[Ollama error: stop]"  # trigger fallback after capture
+        return "[Ollama error: stop]"  # triggers RuntimeError on first call
 
     probe = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="T")
     with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
-        _fill_metadata("Trends Chem. text", probe)  # fallback on error — that's fine
+        try:
+            _fill_metadata("Trends Chem. text", probe)
+        except RuntimeError:
+            pass  # expected — we only care about the captured SYSTEM prompt
 
     assert captured_system, "Expected _ollama_extraction_call to be called"
     sys_prompt = captured_system[0]
