@@ -1399,3 +1399,47 @@ def test_ollama_unreachable_aborts(tmp_path):
     assert "Ollama error" in str(exc_info.value), (
         f"Expected RuntimeError from _doi_probe on Ollama error, got: {exc_info.value}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 03 Task 2 (RED): _crossref_validate existence + HTTPS contract
+# ---------------------------------------------------------------------------
+
+def test_crossref_validate_exists():
+    """_crossref_validate must exist in scripts.ingest (Task 2 RED gate)."""
+    from scripts.ingest import _crossref_validate
+    assert callable(_crossref_validate), "_crossref_validate must be callable"
+
+
+def test_crossref_validate_uses_https():
+    """_crossref_validate must use HTTPS URL for api.crossref.org (V9 — DOI-only outbound)."""
+    import inspect
+    from scripts.ingest import _crossref_validate
+    source = inspect.getsource(_crossref_validate)
+    assert "https://api.crossref.org" in source, (
+        "Expected 'https://api.crossref.org' in _crossref_validate source (V9 HTTPS-only)"
+    )
+    assert "http://api.crossref.org" not in source, (
+        "Plain http:// must NOT be used for Crossref (V9)"
+    )
+
+
+def test_crossref_validate_config_user_agent():
+    """_crossref_validate must read crossref_contact_email from config (D-13/V14 — not hardcoded)."""
+    import inspect
+    from scripts.ingest import _crossref_validate
+    source = inspect.getsource(_crossref_validate)
+    assert "crossref_contact_email" in source, (
+        "Expected 'crossref_contact_email' read from config in _crossref_validate"
+    )
+
+
+def test_crossref_hook_wired_in_ingest():
+    """ingest() must call _crossref_validate (not just a comment) when the flag is on."""
+    import inspect
+    from scripts.ingest import ingest
+    source = inspect.getsource(ingest)
+    # After Plan 03, the real call (not the commented-out placeholder) must appear
+    assert "_crossref_validate(" in source, (
+        "Expected live _crossref_validate( call in ingest() (Plan 03 hook activated)"
+    )
