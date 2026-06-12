@@ -1703,3 +1703,70 @@ def test_artifact_scanner_detects_residue():
     assert len(violations) >= 3, (
         f"Expected >= 3 offending entries from artifact-laden control dict, got {len(violations)}: {violations}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 05 (gap closure) Task 1: timeout hardening
+# ---------------------------------------------------------------------------
+
+def test_extraction_call_timeout_returns_string():
+    """_ollama_extraction_call returns [Ollama timeout: ...] string on bare TimeoutError — no exception escapes."""
+    with patch("scripts.ingest.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+        result = _ollama_extraction_call("prompt", "system", {})
+    assert isinstance(result, str), "Expected a string return, not an exception"
+    assert result.startswith("[Ollama timeout:"), (
+        f"Expected result starting with '[Ollama timeout:', got: {result!r}"
+    )
+
+
+def test_fill_section_timeout_degrades_to_fill_failed(capsys):
+    """Core gap (Plan 05): [Ollama timeout:] return from _ollama_extraction_call degrades to fill_failed=True."""
+    from scripts.ingest import _fill_section
+    timeout_str = "[Ollama timeout: no response within 180s]"
+    with patch("scripts.ingest._ollama_extraction_call", return_value=timeout_str):
+        result = _fill_section("raw body text", "RESULTS")
+    assert result.fill_failed is True, "Expected fill_failed=True on timeout degradation"
+    assert result.body == "raw body text", (
+        f"Expected raw body text preserved, got: {result.body!r}"
+    )
+    captured = capsys.readouterr()
+    assert "fill_failed" in captured.err, (
+        f"Expected 'fill_failed' in stderr on timeout, got: {captured.err!r}"
+    )
+    # Must NOT raise RuntimeError
+    # (the with block above already proves no raise)
+
+
+def test_fill_metadata_timeout_falls_back_to_probe_hints():
+    """[Ollama timeout:] in _fill_metadata falls back to probe hints — no raise."""
+    from scripts.ingest import _fill_metadata, DoiProbeResult
+    timeout_str = "[Ollama timeout: no response within 120s]"
+    probe = DoiProbeResult(doi="10.1000/x", arxiv_id=None, title="Fallback Title")
+    with patch("scripts.ingest._ollama_extraction_call", return_value=timeout_str):
+        result = _fill_metadata("some first page text", probe)
+    # Must return a PaperMetadata built from probe hints — no raise
+    assert result is not None, "Expected PaperMetadata fallback on timeout, not None"
+    from scripts.ingest import PaperMetadata
+    assert isinstance(result, PaperMetadata), (
+        f"Expected PaperMetadata, got: {type(result)}"
+    )
+
+
+def test_warmup_swallows_timeout():
+    """_warmup_ollama swallows bare TimeoutError — never raises (best-effort contract)."""
+    with patch("scripts.ingest.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+        result = _warmup_ollama()  # must not raise
+    assert result is None, f"Expected None from _warmup_ollama on timeout, got {result!r}"
+
+
+def test_crossref_fail_open_on_timeout(capsys):
+    """_crossref_validate fails open on TimeoutError during urlopen (D-16 preserved for timeouts)."""
+    from scripts.ingest import _crossref_validate
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with patch("scripts.ingest.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+        result = _crossref_validate("10.1000/x", "Some Title", cfg)
+    assert result is None, f"Expected None (fail-open) on TimeoutError, got {result!r}"
+    captured = capsys.readouterr()
+    assert "crossref unreachable" in captured.err, (
+        f"Expected 'crossref unreachable' in stderr on timeout, got: {captured.err!r}"
+    )
