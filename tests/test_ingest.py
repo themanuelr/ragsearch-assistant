@@ -1027,3 +1027,157 @@ def test_six_helpers_exist():
     assert callable(_fill_metadata)
     assert callable(_fill_section)
     assert callable(_fill_references_batched)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 02 Task 2: ingest() reordering — probe-gate-fill cascade
+# ---------------------------------------------------------------------------
+
+def _make_ingest_config_with_probe(tmp_path, extra=None):
+    """Build a minimal config dict for probe-gate-fill cascade tests."""
+    cfg = {
+        "registry_path": str(tmp_path / "registry.json"),
+        "project_name": "test-project",
+        "mineru_path": "/fake/mineru",
+    }
+    if extra:
+        cfg.update(extra)
+    return cfg
+
+
+def _write_content_list_for_probe(tmp_path, title="Paper Title"):
+    """Write a minimal content_list.json with first-page blocks for probe input."""
+    cl_path = tmp_path / "content_list.json"
+    blocks = [
+        {"type": "text", "text": title, "text_level": 1, "page_idx": 0},
+        {"type": "text", "text": "X" * 200, "text_level": None, "page_idx": 1},
+    ]
+    cl_path.write_text(json.dumps(blocks), encoding="utf-8")
+    return str(cl_path)
+
+
+def test_ingest_cache_hit_doi_probe_skips_fill(tmp_path):
+    """Cache hit after DOI probe must skip all fill helpers (D-00b/REG-02)."""
+    from scripts.ingest import ingest, _write_registry, DoiProbeResult
+
+    cfg = _make_ingest_config_with_probe(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate registry with the probe-derived key
+    doi_key = "10.1/probe-dedup-test"
+    cached_entry = {
+        "title": "Cached Paper Title",
+        "doi": doi_key,
+        "projects": ["other"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": None, "journal": None, "arxiv_id": None,
+        "source_path": "/old/paper.pdf", "paperjson_path": "/old/paper.json",
+    }
+    _write_registry(cached_entry, reg_path, doi_key)
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake for probe dedup")
+    cl_path = _write_content_list_for_probe(tmp_path)
+
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id=None, title="Cached Paper Title")
+
+    # Fill helpers must NOT be called on a cache hit
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata",
+                    side_effect=AssertionError("_fill_metadata must not be called on cache hit")), \
+         mock.patch("scripts.ingest._fill_section",
+                    side_effect=AssertionError("_fill_section must not be called on cache hit")), \
+         mock.patch("scripts.ingest._fill_references_batched",
+                    side_effect=AssertionError("_fill_references_batched must not be called on cache hit")):
+        result = ingest(str(fake_pdf), cfg)
+
+    # Result must be the cached registry entry
+    assert result.get("title") == "Cached Paper Title" or result.get("doi") == doi_key, (
+        f"Expected cached entry returned on DOI probe hit, got: {result}"
+    )
+
+
+def test_ingest_normalizations_applied_llm_fill(tmp_path):
+    """After ingest(), provenance.normalizations_applied contains ligature_fix and llm_fill (D-10)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config_with_probe(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 normalization test")
+    cl_path = _write_content_list_for_probe(tmp_path)
+
+    mock_parsed = {
+        "title": "Norms Paper",
+        "sections": [{"heading": "Abstract", "level": 0, "blocks": [
+            {"type": "text", "display": "Norms Paper", "plain": "Norms Paper"},
+            {"type": "text", "display": "X" * 200, "plain": "X" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Norms Paper",
+            "authors": None, "year": 2024, "journal": None,
+            "doi": "10.1/norms-paper", "arxiv_id": None, "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1/norms-paper", arxiv_id=None, title="Norms Paper")
+    metadata_result = PaperMetadata(title="Norms Paper", doi="10.1/norms-paper")
+    section_fill = SectionFillResult(heading="Abstract", body="Cleaned abstract", fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    norms = result.get("provenance", {}).get("normalizations_applied", [])
+    assert "ligature_fix" in norms, f"Expected 'ligature_fix' in normalizations_applied: {norms}"
+    assert "llm_fill" in norms, f"Expected 'llm_fill' in normalizations_applied: {norms}"
+    assert "ufffd_replacement" not in norms, (
+        f"Expected 'ufffd_replacement' NOT in normalizations_applied: {norms}"
+    )
+
+
+def test_ingest_fast_path_dedup_removed():
+    """1.2 fast-path dedup block (fast_parsed, fast_metadata) is absent from ingest() source."""
+    import inspect
+    from scripts.ingest import ingest
+    source = inspect.getsource(ingest)
+    assert "fast_parsed" not in source, (
+        "Expected 'fast_parsed' to be removed from ingest() (1.2 fast-path dedup deleted)"
+    )
+    assert "fast_metadata" not in source, (
+        "Expected 'fast_metadata' to be removed from ingest() (1.2 fast-path dedup deleted)"
+    )
+
+
+def test_ingest_crossref_hook_comment_present():
+    """ingest() contains the Plan 03 Crossref validation anchor comment."""
+    import inspect
+    from scripts.ingest import ingest
+    source = inspect.getsource(ingest)
+    assert "Crossref validation hook (Plan 03)" in source, (
+        "Expected '# Crossref validation hook (Plan 03)' anchor comment in ingest()"
+    )
+
+
+def test_ingest_check_registry_after_doi_probe():
+    """In ingest() source, _check_registry appears after _doi_probe (ordering constraint D-00b)."""
+    import inspect
+    from scripts.ingest import ingest
+    source = inspect.getsource(ingest)
+    probe_pos = source.find("_doi_probe")
+    check_pos = source.find("_check_registry")
+    assert probe_pos != -1, "Expected _doi_probe call in ingest()"
+    assert check_pos != -1, "Expected _check_registry call in ingest()"
+    assert probe_pos < check_pos, (
+        f"Expected _doi_probe (pos {probe_pos}) to appear before _check_registry (pos {check_pos}) in ingest()"
+    )
