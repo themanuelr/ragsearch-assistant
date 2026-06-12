@@ -1829,7 +1829,14 @@ def test_num_ctx_cap_config_flow(tmp_path):
 
 
 def test_fill_call_timeouts():
-    """_fill_section passes timeout=180; _doi_probe passes timeout=120."""
+    """_fill_section passes timeout=_SECTION_TIMEOUT; _doi_probe passes timeout=_SECTION_TIMEOUT (section tier).
+
+    Updated in Plan 06 (gap closure Tasks 2+3):
+    - _fill_section now uses _SECTION_TIMEOUT (default 300, was hardcoded 180)
+    - _doi_probe now uses _SECTION_TIMEOUT (section tier for full-doc probe, was 120)
+    Both read the module constant so the assertion tracks the configured default.
+    """
+    import scripts.ingest as _ingest_mod
     from scripts.ingest import _fill_section, _doi_probe
     import json as _json
 
@@ -1841,8 +1848,9 @@ def test_fill_call_timeouts():
 
     with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_fill_call):
         _fill_section("short text", "H")
-    assert captured_kwargs.get("timeout") == 180, (
-        f"Expected _fill_section to pass timeout=180, got {captured_kwargs.get('timeout')}"
+    assert captured_kwargs.get("timeout") == _ingest_mod._SECTION_TIMEOUT, (
+        f"Expected _fill_section to pass timeout={_ingest_mod._SECTION_TIMEOUT} (_SECTION_TIMEOUT), "
+        f"got {captured_kwargs.get('timeout')}"
     )
 
     # Capture kwargs for _doi_probe
@@ -1853,8 +1861,9 @@ def test_fill_call_timeouts():
 
     with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_probe_call):
         _doi_probe("first page text")
-    assert captured_probe_kwargs.get("timeout") == 120, (
-        f"Expected _doi_probe to pass timeout=120, got {captured_probe_kwargs.get('timeout')}"
+    assert captured_probe_kwargs.get("timeout") == _ingest_mod._SECTION_TIMEOUT, (
+        f"Expected _doi_probe to pass timeout={_ingest_mod._SECTION_TIMEOUT} (_SECTION_TIMEOUT), "
+        f"got {captured_probe_kwargs.get('timeout')}"
     )
 
 

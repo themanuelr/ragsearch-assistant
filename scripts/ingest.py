@@ -54,6 +54,20 @@ NUM_CTX_LADDER = (2048, 4096, 8192, 16384, 32768, 65536)
 DEFAULT_NUM_CTX_CAP = 65536
 _NUM_CTX_CAP: int = DEFAULT_NUM_CTX_CAP  # mutable module global; set by ingest() from config
 
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 06 — GAP E: configurable section-fill timeout
+#
+# gemma4:e4b benchmarks on RTX 4060 (8GB VRAM):
+#   ~55 tok/s at 16K-65K num_ctx (100% GPU)
+# A long RESULTS section repaired at ~55 tok/s can easily exceed 180s of generation
+# (observed live-UAT: test_manuel1 RESULTS → fill_failed under gap-05's 180s budget).
+# 300s gives substantial headroom while still bounding a genuine hang.
+# Per-clone configurable via config.json key "ollama_section_timeout".
+# Also applied to the full-document DOI probe (GAP C) — large input on same tier.
+# ---------------------------------------------------------------------------
+DEFAULT_SECTION_TIMEOUT = 300
+_SECTION_TIMEOUT: int = DEFAULT_SECTION_TIMEOUT  # mutable module global; set by ingest() from config
+
 
 # ---------------------------------------------------------------------------
 # Phase 1.3 Plan 06 — GAP A: timestamped progress helper
@@ -110,7 +124,9 @@ class DoiProbeResult(BaseModel):
 class PaperMetadata(BaseModel):
     title: str
     authors: list[str] = Field(default_factory=list)
-    journal: str | None = None
+    journal: str | None = None          # journal abbreviation, e.g. "J. Am. Chem. Soc."
+    journal_full: str | None = None     # full journal title, e.g. "Journal of the American Chemical Society"
+                                        # additive optional field (Plan 06 GAP D); no SCHEMA_VERSION bump
     year: int | None = None
     doi: str | None = None
     arxiv_id: str | None = None
@@ -397,6 +413,36 @@ def _extract_first_page_and_footers(content_list: list) -> str:
     return "\n".join(lines)
 
 
+def _extract_full_text(content_list: list) -> str:
+    """
+    Extract ALL text blocks (any page) + all footer blocks as a single text string.
+
+    This is the full-document DOI probe input (Plan 06 GAP C). Unlike
+    _extract_first_page_and_footers, this function does NOT restrict to page_idx == 0.
+    The DOI may appear in Supporting Information on a later page (confirmed on test_manuel1:
+    10.1021/jacs.3c10258 appears in SI, not the cover page).
+
+    LLM-only probe input — no regex content mining introduced (LOCKED no-regex-prefill
+    architecture preserved; GAP C only widens the LLM probe's input).
+
+    Args:
+        content_list: List of MinerU content_list.json block dicts.
+
+    Returns:
+        Newline-joined string of all text + footer block texts (any page, non-empty).
+    """
+    lines = []
+    for block in content_list:
+        btype = block.get("type", "")
+        text = block.get("text", "")
+        if not text.strip():
+            continue
+        # Include: ALL text blocks (any page) + all footer blocks (any page)
+        if btype in ("text", "footer"):
+            lines.append(text.strip())
+    return "\n".join(lines)
+
+
 def _syntactic_doi_valid(doi: str | None) -> bool:
     """
     Deterministic DOI syntax check (D-00c).
@@ -410,29 +456,45 @@ def _syntactic_doi_valid(doi: str | None) -> bool:
     return bool(doi and DOI_RE.fullmatch(doi.strip()))
 
 
-def _doi_probe(first_page_text: str) -> "DoiProbeResult | None":
+def _doi_probe(full_text: str, first_page_text: str | None = None) -> "DoiProbeResult | None":
     """
-    Cheap pre-gate call: extract DOI, arXiv ID, and title from first-page + footer text.
+    Pre-gate call: extract DOI, arXiv ID, and title from the FULL document text.
 
-    Raises RuntimeError on Ollama error (D-00d fail-fast).
+    Plan 06 GAP C: the probe now receives the full MinerU document text (all text +
+    footer blocks, every page) so a DOI in Supporting Information is found. The title
+    hint is still sourced from first_page_text (cover page) when provided; if omitted,
+    full_text is used for the title hint too (backward-compatible single-arg callers).
+
+    Raises RuntimeError on Ollama error (D-00d fail-fast — a probe failure means
+    the server is unhealthy; proceeding probe-less would derive a garbage title-hash
+    registry key, which is the unsafe disposition per T-01.3-14).
     Returns None if the LLM response is unparseable after strip+fence fallback.
+
+    Args:
+        full_text:        Full document text (_extract_full_text output — all pages).
+        first_page_text:  Cover-page text used for the title hint. If None, full_text
+                          is used (backward-compatible single-arg call path).
     """
+    title_source = first_page_text if first_page_text is not None else full_text
     system = (
         "You are a metadata extractor for scientific papers. "
         "Return ONLY valid JSON matching the schema. Set a field to null if not found. "
-        "Preserve the DOI exactly as printed — do not truncate or modify it."
+        "Preserve the DOI exactly as printed — do not truncate or modify it. "
+        "The DOI may appear anywhere in the document, including a Supporting Information "
+        "section on a later page. The title is on the cover page."
     )
     prompt = (
-        "Extract the DOI, arXiv ID, and title from the following paper text.\n\n"
-        + first_page_text[:3000]    # cap probe input; first page is sufficient
+        "Extract the DOI, arXiv ID, and title from the following paper text.\n"
+        "The title appears on the cover page (beginning of text); the DOI may be "
+        "anywhere in the document including Supporting Information.\n\n"
+        + full_text
     )
     raw = _ollama_extraction_call(
-        prompt, system, DoiProbeResult.model_json_schema(), num_ctx=4096, timeout=120
+        prompt, system, DoiProbeResult.model_json_schema(),
+        num_ctx=_estimate_num_ctx(full_text),  # dynamic sizing under configurable cap
+        timeout=_SECTION_TIMEOUT,             # section tier — full-doc probe is a large call
     )
     if raw.startswith(("[Ollama error:", "[Ollama timeout:")):
-        # A probe timeout (≤3000-char input, num_ctx 4096, warmed model, 120s budget)
-        # means the server is unhealthy. Proceeding probe-less would derive a
-        # garbage title-hash registry key — abort is the safe disposition (T-01.3-14).
         raise RuntimeError(raw)
     return _parse_extraction_response(raw, DoiProbeResult)
 
@@ -460,7 +522,9 @@ def _fill_metadata(first_page_text: str, probe: "DoiProbeResult | None") -> "Pap
         "You are a metadata extractor for scientific papers. "
         "Return ONLY valid JSON matching the schema. "
         "Preserve all values exactly as printed — do not rewrite or infer. "
-        "Set a field to null if not found."
+        "Set a field to null if not found. "
+        "Return the journal abbreviation in `journal` (e.g. 'J. Am. Chem. Soc.') and "
+        "the full journal name in `journal_full` (e.g. 'Journal of the American Chemical Society')."
     )
     prompt = (
         "Extract the metadata from the following paper first page.\n"
@@ -485,6 +549,7 @@ def _fill_metadata(first_page_text: str, probe: "DoiProbeResult | None") -> "Pap
             prompt += "\n\nIMPORTANT: Return ONLY raw JSON. Do not wrap in code fences."
 
     # Both attempts failed (parse failures or timeouts) — fall back to probe hints rather than crashing
+    # journal_full is not set here (probe has no journal info) — defaults to None gracefully (GAP D)
     print("[ingest warning: metadata fill_failed — using probe hints as fallback]", file=sys.stderr)
     return PaperMetadata(
         title=title_hint or "",
@@ -1335,11 +1400,14 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     _log(f"warming up {OLLAMA_MODEL}")
     _warmup_ollama()
 
-    # Step 6: DOI probe — cheap first LLM call on first-page + footer blocks (D-03, D-04)
+    # Step 6: DOI probe — LLM call on FULL document (GAP C) + cover-page for title hint (D-03, D-04)
+    # full_text feeds the DOI probe (may include Supporting Information DOI on later pages);
+    # first_page_text feeds _fill_metadata (cover-page metadata is more reliable for title/authors).
     _log("doi probe")
+    full_text = _extract_full_text(blocks)
     first_page_text = _extract_first_page_and_footers(blocks)
     try:
-        probe = _doi_probe(first_page_text)
+        probe = _doi_probe(full_text, first_page_text)
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
