@@ -2351,3 +2351,113 @@ def test_fill_metadata_journal_full_null_when_only_abbreviation():
     assert result.journal == "Trends Chem.", (
         f"Expected journal='Trends Chem.' (abbreviation as-is), got {result.journal!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 07 (gap closure) Task 2: echo-aware num_ctx sizing
+# ---------------------------------------------------------------------------
+
+def test_estimate_num_ctx_output_ratio():
+    """_estimate_num_ctx(output_ratio=1.0) returns strictly larger rung for mid-size text — GAP D."""
+    from scripts.ingest import _estimate_num_ctx
+
+    # Default (input-only) — unchanged behaviour
+    default_large = _estimate_num_ctx("x" * 200000)
+    assert default_large == 65536, (
+        f"Expected 65536 for 200000-char default, got {default_large}"
+    )
+
+    # Mid-size text: input-only vs echo-aware
+    mid_text = "x" * 60000
+    input_only = _estimate_num_ctx(mid_text)
+    echo_aware = _estimate_num_ctx(mid_text, output_ratio=1.0)
+    assert echo_aware > input_only, (
+        f"Expected echo-aware ({echo_aware}) > input-only ({input_only}) for 60000-char text"
+    )
+
+    # 2x budget exceeding cap must clamp to cap
+    echo_cap = _estimate_num_ctx("x" * 200000, output_ratio=1.0)
+    assert echo_cap == 65536, (
+        f"Expected echo-aware for 200000-char text to clamp to cap 65536, got {echo_cap}"
+    )
+
+
+def test_estimate_num_ctx_default_unchanged():
+    """_estimate_num_ctx default (output_ratio=0.0) is byte-for-byte identical to old behaviour — GAP D backward compat."""
+    from scripts.ingest import _estimate_num_ctx
+
+    for chars in [100, 24000, 100000, 200000]:
+        text = "x" * chars
+        assert _estimate_num_ctx(text) == _estimate_num_ctx(text, output_ratio=0.0), (
+            f"Expected _estimate_num_ctx({chars}) == _estimate_num_ctx({chars}, output_ratio=0.0)"
+        )
+
+
+def test_fill_section_requests_echo_aware_num_ctx():
+    """_fill_section passes num_ctx=_estimate_num_ctx(section_text, output_ratio=1.0) — GAP D fix."""
+    import json as _json
+    from scripts.ingest import _fill_section, _estimate_num_ctx
+
+    section_text = "x" * 60000
+    captured_kwargs = {}
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _json.dumps({"heading": "RESULTS", "body": "result body", "fill_failed": False})
+
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        _fill_section(section_text, "RESULTS")
+
+    echo_expected = _estimate_num_ctx(section_text, output_ratio=1.0)
+    input_only = _estimate_num_ctx(section_text)
+
+    assert captured_kwargs.get("num_ctx") == echo_expected, (
+        f"Expected _fill_section to use echo-aware num_ctx={echo_expected}, "
+        f"got {captured_kwargs.get('num_ctx')}"
+    )
+    assert captured_kwargs.get("num_ctx") > input_only, (
+        f"Expected echo-aware num_ctx ({captured_kwargs.get('num_ctx')}) > "
+        f"input-only ({input_only}) — proves output budget is reserved"
+    )
+
+
+def test_fill_references_batched_echo_aware_num_ctx():
+    """_fill_references_batched uses echo-aware num_ctx (not fixed 4096) for the ref-batch call — GAP D fix."""
+    import json as _json
+    from scripts.ingest import _fill_references_batched, _estimate_num_ctx
+
+    # Large batch to make the dynamic num_ctx exceed 4096
+    raw_refs = [{"raw": "r" * 400} for _ in range(10)]
+    captured_kwargs = {}
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _json.dumps({"refs": []})
+
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        _fill_references_batched(raw_refs)
+
+    assert captured_kwargs.get("num_ctx") is not None, "Expected num_ctx kwarg to be captured"
+    assert captured_kwargs["num_ctx"] > 4096, (
+        f"Expected echo-aware num_ctx > 4096 (old fixed value), "
+        f"got {captured_kwargs.get('num_ctx')}"
+    )
+    # Verify it's sized via the sizer with output_ratio=1.0
+    batch_text = "\n".join(ref["raw"] for ref in raw_refs)
+    expected = _estimate_num_ctx(batch_text, output_ratio=1.0)
+    assert captured_kwargs["num_ctx"] == expected, (
+        f"Expected num_ctx={expected} (_estimate_num_ctx(batch_text, output_ratio=1.0)), "
+        f"got {captured_kwargs['num_ctx']}"
+    )
+
+
+def test_fill_section_oversize_guard_echo_aware():
+    """_fill_section guard uses echo-aware sizing (output_ratio=1.0); 300000-char section still trips — GAP D."""
+    from scripts.ingest import _fill_section
+
+    # 300000 chars → echo-aware estimate still >= 65536 cap AND 300000 > 65536*4=262144 → guard trips
+    huge_text = "x" * 300000
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=AssertionError("LLM must not be called")):
+        result = _fill_section(huge_text, "Huge Section")
+    assert result.fill_failed is True, "Expected fill_failed=True for oversize section"
+    assert result.body == huge_text
