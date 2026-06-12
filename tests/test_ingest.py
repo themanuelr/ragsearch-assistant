@@ -2133,3 +2133,56 @@ def test_fill_metadata_fallback_journal_full_none():
     assert result.journal_full is None, (
         f"Expected journal_full=None on fallback, got {result.journal_full!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 06 (gap closure) Task 3: section timeout config
+# ---------------------------------------------------------------------------
+
+def test_section_timeout_default_is_300():
+    """DEFAULT_SECTION_TIMEOUT is 300 and config.json has ollama_section_timeout==300."""
+    import scripts.ingest as _ingest_mod
+
+    assert _ingest_mod.DEFAULT_SECTION_TIMEOUT == 300, (
+        f"Expected DEFAULT_SECTION_TIMEOUT=300, got {_ingest_mod.DEFAULT_SECTION_TIMEOUT}"
+    )
+    # Verify config.json has the key set to 300
+    import json as _json
+    import pathlib
+    cfg_path = pathlib.Path(__file__).parent.parent / "config.json"
+    cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert cfg.get("ollama_section_timeout") == 300, (
+        f"Expected config.json ollama_section_timeout=300, got {cfg.get('ollama_section_timeout')}"
+    )
+
+
+def test_section_timeout_config_flow(tmp_path):
+    """ingest() reads ollama_section_timeout from config and sets _SECTION_TIMEOUT module global."""
+    import scripts.ingest as _ingest_mod
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult, DEFAULT_SECTION_TIMEOUT
+
+    cfg = _make_ingest_config(tmp_path, extra={"ollama_section_timeout": 450})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 section timeout config flow test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi="10.1000/timeout.config.test", arxiv_id=None, title="Timeout Config Paper")
+    metadata_result = PaperMetadata(title="Timeout Config Paper", doi="10.1000/timeout.config.test")
+    section_fill = SectionFillResult(heading="", body="Test body " + "A" * 200, fill_failed=False)
+
+    try:
+        with mock.patch("scripts.ingest._run_mineru"), \
+             mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+             mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+             mock.patch("scripts.ingest._warmup_ollama"), \
+             mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+             mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+             mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+             mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+            ingest(str(fake_pdf), cfg)
+        assert _ingest_mod._SECTION_TIMEOUT == 450, (
+            f"Expected _SECTION_TIMEOUT=450 after ingest() with ollama_section_timeout=450, "
+            f"got {_ingest_mod._SECTION_TIMEOUT}"
+        )
+    finally:
+        _ingest_mod._SECTION_TIMEOUT = DEFAULT_SECTION_TIMEOUT
