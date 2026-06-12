@@ -1918,3 +1918,95 @@ def test_reference_batch_progress(capsys):
     assert "reference batch 2/2" in captured.err, (
         f"Expected 'reference batch 2/2' in stderr, got: {captured.err!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 06 (gap closure) Task 1: timestamped progress + --output
+# ---------------------------------------------------------------------------
+
+import re as _re_mod  # noqa: E402
+
+
+def test_log_helper_timestamp_format(capsys):
+    """_log() writes '[ingest YYYY-MM-DD HH:MM:SS] <msg>' to stderr; stdout stays clean."""
+    from scripts.ingest import _log
+
+    _log("hello world")
+    captured = capsys.readouterr()
+    assert _re_mod.search(
+        r"^\[ingest \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] hello world",
+        captured.err,
+    ), f"Expected timestamped stderr line, got: {captured.err!r}"
+    assert "hello world" not in captured.out, (
+        "Expected _log() output to go to stderr only, not stdout"
+    )
+
+
+def test_progress_lines_smoke_timestamped(tmp_path, capsys):
+    """ingest() emits timestamped [ingest <date> <time>] progress lines on stderr; stdout stays clean."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 progress smoke test v2")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi="10.1000/progress.test2", arxiv_id=None, title="Progress Paper v2")
+    metadata_result = PaperMetadata(title="Progress Paper v2", doi="10.1000/progress.test2")
+    section_fill = SectionFillResult(heading="", body="Section body " + "A" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    captured = capsys.readouterr()
+    # Stderr must carry a [ingest <date> <time>] prefix on progress lines
+    assert _re_mod.search(
+        r"\[ingest \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] mineru extraction starting",
+        captured.err,
+    ), f"Expected timestamped 'mineru extraction starting' in stderr, got: {captured.err!r}"
+    assert "] mineru extraction starting" in captured.err, (
+        f"Expected mineru stage suffix in stderr, got: {captured.err!r}"
+    )
+    assert "] registry write" in captured.err, (
+        f"Expected registry write stage suffix in stderr, got: {captured.err!r}"
+    )
+    # stdout must stay clean of [ingest text
+    assert "[ingest" not in captured.out, (
+        f"Expected no '[ingest' text in stdout, got: {captured.out!r}"
+    )
+
+
+def test_output_flag_writes_utf8_file(tmp_path):
+    """_emit_result(result, path) writes UTF-8 JSON directly to file; round-trip is clean (GAP B)."""
+    from scripts.ingest import _emit_result
+
+    out_path = str(tmp_path / "out.json")
+    data = {"title": "José — ‘quote’"}
+    _emit_result(data, out_path)
+
+    with open(out_path, encoding="utf-8") as f:
+        loaded = json.load(f)
+    assert loaded == data, (
+        f"Expected round-trip clean UTF-8, got: {loaded!r}"
+    )
+
+
+def test_output_omitted_uses_stdout(tmp_path, capsys):
+    """_emit_result(result, None) prints JSON to stdout; no file is written."""
+    from scripts.ingest import _emit_result
+
+    data = {"title": "plain ascii"}
+    _emit_result(data, None)
+    captured = capsys.readouterr()
+
+    loaded = json.loads(captured.out)
+    assert loaded == data, f"Expected JSON on stdout, got: {captured.out!r}"
+    # No file should exist in tmp_path
+    assert not list(tmp_path.iterdir()), "Expected no file written when output_path is None"
