@@ -604,7 +604,8 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
         raw = _ollama_extraction_call(
             prompt, system, schema,
             num_ctx=_estimate_num_ctx(section_text),
-            timeout=180,  # RTX 4060 benchmark: ~55 tok/s → ~8K output tokens needs ~150s; 180s has headroom
+            timeout=_SECTION_TIMEOUT,  # configurable via config.json "ollama_section_timeout" (default 300)
+            # RTX 4060 benchmark: ~55 tok/s → a long RESULTS section can exceed 180s (observed gap-05 failure)
         )
         if raw.startswith("[Ollama error:"):
             raise RuntimeError(raw)                      # Ollama unreachable → abort pipeline
@@ -1343,6 +1344,8 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
 
     global _NUM_CTX_CAP
     _NUM_CTX_CAP = int(config.get("ollama_num_ctx_cap", DEFAULT_NUM_CTX_CAP))
+    global _SECTION_TIMEOUT
+    _SECTION_TIMEOUT = int(config.get("ollama_section_timeout", DEFAULT_SECTION_TIMEOUT))
 
     out_dir = str(pathlib.Path(".mineru_output") / pdf.stem)
     timeout = int(config.get("mineru_timeout", DEFAULT_TIMEOUT))
