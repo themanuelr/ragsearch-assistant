@@ -1856,3 +1856,65 @@ def test_fill_call_timeouts():
     assert captured_probe_kwargs.get("timeout") == 120, (
         f"Expected _doi_probe to pass timeout=120, got {captured_probe_kwargs.get('timeout')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 05 (gap closure) Task 3: progress lines
+# ---------------------------------------------------------------------------
+
+def test_progress_lines_smoke(tmp_path, capsys):
+    """ingest() emits [ingest] progress lines on stderr; stdout has no [ingest] text."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 progress smoke test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi="10.1000/progress.test", arxiv_id=None, title="Progress Paper")
+    metadata_result = PaperMetadata(title="Progress Paper", doi="10.1000/progress.test")
+    section_fill = SectionFillResult(heading="", body="Section body " + "A" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    captured = capsys.readouterr()
+    assert "[ingest] mineru extraction starting" in captured.err, (
+        f"Expected '[ingest] mineru extraction starting' in stderr, got: {captured.err!r}"
+    )
+    assert "[ingest] section fill" in captured.err, (
+        f"Expected '[ingest] section fill' in stderr, got: {captured.err!r}"
+    )
+    assert "[ingest] registry write" in captured.err, (
+        f"Expected '[ingest] registry write' in stderr, got: {captured.err!r}"
+    )
+    # stdout must stay clean of [ingest] text — only final JSON goes to stdout
+    assert "[ingest]" not in captured.out, (
+        f"Expected no '[ingest]' text in stdout, got: {captured.out!r}"
+    )
+
+
+def test_reference_batch_progress(capsys):
+    """_fill_references_batched emits [ingest] reference batch i/n lines on stderr."""
+    from scripts.ingest import _fill_references_batched
+    import json as _json
+
+    raw_refs = [{"raw": f"r{i}"} for i in range(12)]
+    with patch("scripts.ingest._ollama_extraction_call",
+               return_value=_json.dumps({"refs": []})):
+        _fill_references_batched(raw_refs)
+
+    captured = capsys.readouterr()
+    assert "reference batch 1/2" in captured.err, (
+        f"Expected 'reference batch 1/2' in stderr, got: {captured.err!r}"
+    )
+    assert "reference batch 2/2" in captured.err, (
+        f"Expected 'reference batch 2/2' in stderr, got: {captured.err!r}"
+    )
