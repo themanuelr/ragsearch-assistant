@@ -1572,3 +1572,134 @@ def test_crossref_off_by_default_no_call(tmp_path):
         ingest(str(fake_pdf), cfg)  # must not raise AssertionError
 
     mock_cv.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 04 Task 1: E3 artifact-cleanliness scan
+# ---------------------------------------------------------------------------
+
+import re as _re_mod
+
+
+def _scan_extraction_artifacts(extraction: dict) -> list[str]:
+    """Scan the assembled extraction namespace for artifact residue.
+
+    Returns a list of "<field-path>: <reason>" strings for any string that contains:
+    - U+FFFD (replacement character, codepoint 0xFFFD)
+    - Any codepoint in range(0xFB00, 0xFB07) — the ﬀﬁﬂﬃﬄﬅﬆ ligature block
+    - The regex <sup>(fi|fl|ff|ffi|ffl)</sup> substring (HTML ligature artifacts)
+
+    Walks:
+    - extraction["metadata"]["title"]
+    - extraction["sections"][i]["body"] / ["display"] / ["plain"]
+    - extraction["references"][j]["raw"]
+    """
+    _LIGATURE_RANGE = range(0xFB00, 0xFB07)
+    _SUP_LIGATURE_RE = _re_mod.compile(r"<sup>(fi|fl|ff|ffi|ffl)</sup>")
+    offending: list[str] = []
+
+    def _check(field_path: str, value) -> None:
+        if not isinstance(value, str):
+            return
+        if "�" in value:
+            offending.append(f"{field_path}: contains U+FFFD replacement character")
+        for ch in value:
+            if ord(ch) in _LIGATURE_RANGE:
+                offending.append(f"{field_path}: contains ligature codepoint U+{ord(ch):04X} ({ch!r})")
+                break  # one entry per field per category
+        if _SUP_LIGATURE_RE.search(value):
+            offending.append(f"{field_path}: contains <sup>ligature</sup> artifact")
+
+    # Walk metadata.title
+    metadata = extraction.get("metadata", {})
+    _check("metadata.title", metadata.get("title"))
+
+    # Walk sections
+    for i, section in enumerate(extraction.get("sections", [])):
+        for key in ("body", "display", "plain"):
+            val = section.get(key)
+            if val is not None:
+                _check(f"sections[{i}].{key}", val)
+
+    # Walk references.raw
+    for j, ref in enumerate(extraction.get("references", [])):
+        _check(f"references[{j}].raw", ref.get("raw"))
+
+    return offending
+
+
+def test_no_artifact_residue(tmp_path):
+    """E3 (Plan 04): given an ingest() run with mocked clean LLM fill, no string anywhere
+    in the assembled extraction namespace contains U+FFFD, ligature codepoints, or
+    <sup>ligature</sup> substrings. (No GPU required — all fill helpers are mocked.)("""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 E3 artifact scan test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "A Clean Publication-Faithful Title",
+        "sections": [{"heading": "Introduction", "level": 0, "blocks": [
+            {"type": "text", "display": "Clean body text.", "plain": "Clean body text."},
+            {"type": "text", "display": "X" * 200, "plain": "X" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "A Clean Publication-Faithful Title",
+            "authors": None, "year": 2024, "journal": None,
+            "doi": "10.1000/e3.clean.test", "arxiv_id": None, "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/e3.clean.test", arxiv_id=None, title="A Clean Publication-Faithful Title")
+    metadata_result = PaperMetadata(title="A Clean Publication-Faithful Title", doi="10.1000/e3.clean.test", year=2024)
+    section_fill = SectionFillResult(
+        heading="Introduction",
+        body="Clean body text with no artifacts or residue, only faithful publication text.",
+        fill_failed=False,
+    )
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    # Result must be a full PaperJSON with an extraction namespace
+    assert "extraction" in result, f"Expected full PaperJSON result with 'extraction' key, got: {list(result.keys())}"
+
+    violations = _scan_extraction_artifacts(result["extraction"])
+    assert violations == [], (
+        f"Expected no artifact residue in clean extraction namespace, found violations: {violations}"
+    )
+
+
+def test_artifact_scanner_detects_residue():
+    """Negative control (Plan 04): _scan_extraction_artifacts returns >= 3 offending entries
+    on a hand-built extraction dict that contains a U+FFFD title, a ligature-codepoint
+    section body, and a <sup>fi</sup> reference raw string.  Proves the scanner is not a no-op."""
+    artifact_extraction = {
+        "metadata": {
+            "title": "Paper with � replacement character in title",
+        },
+        "sections": [
+            {
+                "body": "Signiﬁcant result in this section body (ﬀect)",  # ﬁ=U+FB01, ﬀ=U+FB00
+                "display": None,
+                "plain": None,
+            }
+        ],
+        "references": [
+            {"raw": "1. Smith J. et al. Nature 2024. E<sup>fi</sup>ciency study."},
+        ],
+    }
+    violations = _scan_extraction_artifacts(artifact_extraction)
+    assert len(violations) >= 3, (
+        f"Expected >= 3 offending entries from artifact-laden control dict, got {len(violations)}: {violations}"
+    )
