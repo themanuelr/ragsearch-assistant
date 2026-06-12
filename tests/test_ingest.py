@@ -1443,3 +1443,132 @@ def test_crossref_hook_wired_in_ingest():
     assert "_crossref_validate(" in source, (
         "Expected live _crossref_validate( call in ingest() (Plan 03 hook activated)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 03 Task 3: Mock-urllib tests for Crossref control flow
+# E10/D-15: abort-on-mismatch
+# E10/D-16: fail-open-on-network-error
+# D-14: same-paper pass (no abort)
+# D-13: off-by-default no-call
+# ---------------------------------------------------------------------------
+
+import io as _io
+import urllib.error as _urllib_error
+
+
+class _FakeHttpResponse:
+    """Minimal context-manager fake for urllib.request.urlopen return value."""
+
+    def __init__(self, body_bytes: bytes):
+        self._body = body_bytes
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+def test_crossref_abort_on_mismatch(capsys):
+    """E10/D-15: LLM confirms different paper → RuntimeError with [ingest error: prefix."""
+    from scripts.ingest import _crossref_validate
+    import json as _json
+
+    crossref_payload = _json.dumps({
+        "message": {"title": ["Some Other Paper That Is Not The Same"]}
+    }).encode()
+    llm_verdict = _json.dumps({"same_paper": False})
+
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(crossref_payload)), \
+         mock.patch("scripts.ingest._ollama_extraction_call", return_value=llm_verdict):
+        with pytest.raises(RuntimeError) as exc_info:
+            _crossref_validate("10.1/x", "Real Title", cfg)
+
+    assert str(exc_info.value).startswith("[ingest error:"), (
+        f"Expected RuntimeError starting with '[ingest error:', got: {exc_info.value!r}"
+    )
+
+
+def test_crossref_fail_open_on_network_error(capsys):
+    """E10/D-16: URLError → returns None (no raise) + [ingest warning: crossref unreachable."""
+    from scripts.ingest import _crossref_validate
+
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    side_effect=_urllib_error.URLError("connection refused")):
+        result = _crossref_validate("10.1000/any.doi", "Some Title", cfg)
+
+    assert result is None, f"Expected None (fail-open) on URLError, got {result!r}"
+    captured = capsys.readouterr()
+    assert "crossref unreachable" in captured.err, (
+        f"Expected 'crossref unreachable' in stderr, got: {captured.err!r}"
+    )
+
+
+def test_crossref_same_paper_no_abort():
+    """D-14: LLM confirms same paper → no raise (returns None)."""
+    from scripts.ingest import _crossref_validate
+    import json as _json
+
+    crossref_payload = _json.dumps({
+        "message": {"title": ["A Novel Method for X"]}
+    }).encode()
+    llm_verdict = _json.dumps({"same_paper": True})
+
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(crossref_payload)), \
+         mock.patch("scripts.ingest._ollama_extraction_call", return_value=llm_verdict):
+        result = _crossref_validate("10.1000/any.doi", "A Novel Method for X", cfg)
+
+    assert result is None, f"Expected None (no abort) on matching paper, got {result!r}"
+
+
+def test_crossref_off_by_default_no_call(tmp_path):
+    """D-13: with crossref_validate absent/false, ingest() never calls _crossref_validate."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    # Config has no crossref_validate key at all (default off)
+    cfg = _make_ingest_config(tmp_path)
+    assert "crossref_validate" not in cfg, "Fixture must not set crossref_validate for this test"
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 crossref off by default test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi="10.1000/off.default", arxiv_id=None, title="Test Paper")
+    metadata_result = PaperMetadata(title="Test Paper", doi="10.1000/off.default", year=2024)
+    section_fill = SectionFillResult(heading="", body="Test body " + "A" * 200, fill_failed=False)
+
+    # _crossref_validate patched with a raising side_effect — must never be called
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Test Paper",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "Test Paper", "plain": "Test Paper"},
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {
+                 "title": "Test Paper", "authors": None, "year": 2024, "journal": None,
+                 "doi": "10.1000/off.default", "arxiv_id": None, "accession_codes": [],
+             },
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate",
+                    side_effect=AssertionError("crossref called when flag off")) as mock_cv:
+        ingest(str(fake_pdf), cfg)  # must not raise AssertionError
+
+    mock_cv.assert_not_called()
