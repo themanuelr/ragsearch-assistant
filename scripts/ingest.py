@@ -38,6 +38,22 @@ OLLAMA_BASE = "http://localhost:11434"
 OLLAMA_MODEL = "gemma4:e4b"
 DOI_RE = re.compile(r"10\.\d{4,}/\S+")
 
+# ---------------------------------------------------------------------------
+# num_ctx ladder + cap (Phase 1.3 Plan 05 — RTX 4060 benchmark 2026-06-12)
+#
+# gemma4:e4b benchmarks on RTX 4060 (8GB VRAM):
+#   num_ctx 16384/32768/65536 → 100% GPU, ~3.1-3.2GB footprint, ~55 tok/s
+#   num_ctx 131072             → 9.8GB → 70% CPU offload → 32.9 tok/s (worse with full contexts)
+#
+# DEFAULT_NUM_CTX_CAP = 65536 is the benchmark-validated sweet spot: full GPU,
+# acceptable throughput, headroom for long sections. 131072 would CPU-offload
+# on the RTX 4060 and is NOT the default. Per-clone configurable via config.json
+# key "ollama_num_ctx_cap" for users on different hardware.
+# ---------------------------------------------------------------------------
+NUM_CTX_LADDER = (2048, 4096, 8192, 16384, 32768, 65536)
+DEFAULT_NUM_CTX_CAP = 65536
+_NUM_CTX_CAP: int = DEFAULT_NUM_CTX_CAP  # mutable module global; set by ingest() from config
+
 
 # ---------------------------------------------------------------------------
 # Pydantic output models (Phase 1.3 LLM fill layer)
@@ -168,18 +184,34 @@ def _parse_extraction_response(raw: str, model_cls: type[BaseModel]) -> BaseMode
     return None
 
 
-def _estimate_num_ctx(text: str, overhead: int = 2048) -> int:
+def _estimate_num_ctx(text: str, overhead: int = 2048, cap: int | None = None) -> int:
     """
     Approximate num_ctx from input length (~4 chars/token).
 
-    Rounds up to nearest power of two; hard cap 16384 (RTX 4060 8GB VRAM safety).
+    Rounds up to the nearest rung in NUM_CTX_LADDER that fits the estimated token count.
+    The cap is configurable per clone via config.json "ollama_num_ctx_cap" (default 65536,
+    benchmark-validated for 100% GPU on RTX 4060 at ~55 tok/s with ~3.2GB footprint).
+
+    Args:
+        text:     Input text whose token count is estimated.
+        overhead: Token overhead added to the raw estimate (default 2048).
+        cap:      Override the cap explicitly. When None, reads the module-level
+                  _NUM_CTX_CAP (set once by ingest() from config). Pass a value
+                  to override — e.g. for tests or probe calls with known small inputs.
+
+    Returns:
+        The smallest NUM_CTX_LADDER rung >= (estimated_tokens + overhead) that does
+        not exceed the active cap; or the cap itself when no rung fits.
     """
+    active_cap = cap if cap is not None else _NUM_CTX_CAP
     estimated_tokens = len(text) // 4
     raw = estimated_tokens + overhead
-    for ctx in (2048, 4096, 8192, 16384):
+    for ctx in NUM_CTX_LADDER:
+        if ctx > active_cap:
+            break
         if raw <= ctx:
             return ctx
-    return 16384
+    return active_cap
 
 
 def _warmup_ollama(model: str = OLLAMA_MODEL) -> None:
@@ -431,20 +463,24 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
     """
     One LLM call per section body (D-01).
 
-    Two-strike retry: on first parse failure, retry once with an explicit JSON
-    reminder appended. On second failure, return fill_failed=True with raw
-    MinerU text carried (D-05/D-06).
+    Two-strike retry: on first parse failure (or timeout), retry once; on second
+    failure, return fill_failed=True with raw MinerU text carried (D-05/D-06).
 
-    Over-size guard: if _estimate_num_ctx(section_text) would exceed 16384 (i.e.
-    more tokens than the hard cap), skip the LLM call entirely and return
-    fill_failed=True immediately to avoid RTX 4060 OOM (T-01.3-05).
+    Over-size guard: if _estimate_num_ctx(section_text) >= the active num_ctx cap
+    (default 65536 — configurable via config.json "ollama_num_ctx_cap") AND
+    len(section_text) > cap * 4, skip the LLM call entirely and return fill_failed=True
+    immediately (T-01.3-05). The guard uses the module-level _NUM_CTX_CAP, not a
+    hardcoded value, so the cap source is shared with the sizer.
 
     SYSTEM prompt carries D-07 faithfulness burden AND U+FFFD/hyphenation repair.
     Raises RuntimeError on Ollama unreachable (D-00d).
     """
-    # Over-size guard: section larger than the 16384 cap → skip LLM, return fill_failed
+    # Over-size guard: section larger than the active num_ctx cap → skip LLM, return fill_failed
+    # The cap is derived from _NUM_CTX_CAP (set by ingest() from config), not hardcoded.
+    # This ensures the guard and the sizer share one configurable cap source (T-01.3-05 carried).
+    cap = _NUM_CTX_CAP
     estimated_ctx = _estimate_num_ctx(section_text)
-    if estimated_ctx >= 16384 and len(section_text) > 16384 * 4:
+    if estimated_ctx >= cap and len(section_text) > cap * 4:
         print(
             f"[ingest warning: section '{heading}' oversize — skipping LLM fill]",
             file=sys.stderr,
@@ -469,7 +505,7 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
         raw = _ollama_extraction_call(
             prompt, system, schema,
             num_ctx=_estimate_num_ctx(section_text),
-            timeout=180,
+            timeout=180,  # RTX 4060 benchmark: ~55 tok/s → ~8K output tokens needs ~150s; 180s has headroom
         )
         if raw.startswith("[Ollama error:"):
             raise RuntimeError(raw)                      # Ollama unreachable → abort pipeline
@@ -1202,6 +1238,9 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    global _NUM_CTX_CAP
+    _NUM_CTX_CAP = int(config.get("ollama_num_ctx_cap", DEFAULT_NUM_CTX_CAP))
 
     out_dir = str(pathlib.Path(".mineru_output") / pdf.stem)
     timeout = int(config.get("mineru_timeout", DEFAULT_TIMEOUT))
