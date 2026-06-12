@@ -3,5 +3,7 @@
   "vault_path": "./.local/vault",
   "project_name": "ragsearch_assistant",
   "mineru_path": "",
-  "mineru_timeout": 1800
+  "mineru_timeout": 1800,
+  "crossref_validate": false,
+  "crossref_contact_email": "your-email@example.com"
 }
