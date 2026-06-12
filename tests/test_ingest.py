@@ -11,7 +11,7 @@ import json
 import pathlib
 import pytest
 
-# Importing from scripts.ingest — this will FAIL (RED) until Task 2 creates the file.
+# Importing from scripts.ingest
 from scripts.ingest import (
     _parse_content_list,
     _assemble_paperjson,
@@ -19,10 +19,16 @@ from scripts.ingest import (
     _build_display,
     _build_plain,
     _quarantine_figure,
-    _parse_references,
-    _mine_metadata,
-    _mine_footer_metadata,
     _quality_gate,
+    _ollama_extraction_call,
+    _parse_extraction_response,
+    _estimate_num_ctx,
+    _warmup_ollama,
+    DoiProbeResult,
+    PaperMetadata,
+    SectionFillResult,
+    RefEntry,
+    RefBatchResult,
     NOISE_BLOCK_TYPES,
     MINERU_BACKEND,
     SCHEMA_VERSION,
@@ -252,8 +258,8 @@ def test_table_equation_plain_placeholder(parsed):
 
 
 def test_normalizations_recorded():
-    """provenance.normalizations_applied contains the three normalization tag names."""
-    from scripts.ingest import _assemble_paperjson, _parse_content_list, MINERU_BACKEND, SCHEMA_VERSION
+    """provenance.normalizations_applied contains ligature_fix and llm_fill; not ufffd/charge_sign."""
+    from scripts.ingest import _assemble_paperjson, MINERU_BACKEND, SCHEMA_VERSION
     parsed = {"title": "Test", "sections": [], "references": []}
     provenance = {
         "pdf_sha256": "abc",
@@ -261,131 +267,20 @@ def test_normalizations_recorded():
         "mineru_version": None,
         "backend": MINERU_BACKEND,
         "extracted_at": "2026-01-01T00:00:00Z",
-        "normalizations_applied": ["ligature_fix", "ufffd_replacement", "charge_sign_fix"],
+        "normalizations_applied": ["ligature_fix", "llm_fill"],
         "schema_version": SCHEMA_VERSION,
     }
     doc = _assemble_paperjson(parsed, provenance)
     norms = doc["provenance"]["normalizations_applied"]
+    assert "llm_fill" in norms, f"Expected 'llm_fill' in normalizations_applied: {norms}"
     assert "ligature_fix" in norms, f"Expected 'ligature_fix' in normalizations_applied: {norms}"
-    assert "ufffd_replacement" in norms, f"Expected 'ufffd_replacement' in normalizations_applied: {norms}"
-    assert "charge_sign_fix" in norms, f"Expected 'charge_sign_fix' in normalizations_applied: {norms}"
+    assert "ufffd_replacement" not in norms, f"Expected 'ufffd_replacement' NOT in normalizations_applied: {norms}"
+    assert "charge_sign_fix" not in norms, f"Expected 'charge_sign_fix' NOT in normalizations_applied: {norms}"
 
 
 # ---------------------------------------------------------------------------
-# Task 2 (Plan 02): Structured references + metadata mining + quality gate
+# Quality gate
 # ---------------------------------------------------------------------------
-
-# --- Reference fixtures ---
-
-REF_ITEMS = [
-    "1. Kahle, K. T.; Khanna, A. R. K-Cl cotransporters. Trends Mol. Med. 2015. DOI: 10.1016/j.molmed.2015.05.008",
-    "2. Delpire, E.; Gagnon, K. B. SPAK and OSR1. Biochem. J. 2008. DOI: 10.1042/BJ20071324",
-    "(3) Smith, J. Normal reference without DOI. J. Chem. 2020.",
-    "4. St€odberg, T.; McTague, A. Mutations in SLC12A5. Nat. Commun. 2015. DOI: 10.1038/ncomms9038",
-]
-
-FOOTER_BLOCKS = [
-    {"type": "footer", "text": "J. Am. Chem. Soc. 2024, 146, 12345–12358. DOI: 10.1021/jacs.3c10258", "page_idx": 4},
-]
-
-PARSED_BLOCKS_WITH_TITLE = [
-    {"type": "text", "text": "My Paper Title", "text_level": 1, "page_idx": 0},
-    {"type": "text", "text": "Abstract", "text_level": 2, "page_idx": 0},
-    {"type": "text", "text": "This paper discusses PDB:7TTI and EMD-26116 accessions.", "text_level": None, "page_idx": 1},
-    {"type": "footer", "text": "J. Am. Chem. Soc. 2024, 146, 12345. DOI: 10.1021/jacs.3c10258", "page_idx": 2},
-]
-
-
-def test_reference_objects():
-    """_parse_references returns objects with required keys; number and doi extracted."""
-    refs = _parse_references(REF_ITEMS)
-    assert len(refs) == len(REF_ITEMS), "Expected one ref object per input item"
-    for ref in refs:
-        assert "number" in ref, "Expected 'number' key in reference object"
-        assert "raw" in ref, "Expected 'raw' key in reference object"
-        assert "doi" in ref, "Expected 'doi' key in reference object"
-        assert "title" in ref, "Expected 'title' key in reference object"
-        assert "year" in ref, "Expected 'year' key in reference object"
-        assert "flags" in ref, "Expected 'flags' key in reference object"
-
-    # First ref: number 1, DOI extracted
-    assert refs[0]["number"] == 1, f"Expected number=1, got {refs[0]['number']}"
-    assert refs[0]["doi"] == "10.1016/j.molmed.2015.05.008", (
-        f"Expected DOI extracted, got {refs[0]['doi']!r}"
-    )
-
-    # Third ref: parenthetical number format (3)
-    assert refs[2]["number"] == 3, f"Expected number=3 from '(3)' format, got {refs[2]['number']}"
-    assert refs[2]["doi"] is None, f"Expected doi=None for ref without DOI, got {refs[2]['doi']!r}"
-
-
-def test_corrupted_author_flag():
-    """References with euro sign in raw string get 'corrupted_authors' in flags."""
-    refs = _parse_references(REF_ITEMS)
-    # Fourth ref contains St€odberg (euro sign in author name)
-    corrupted = refs[3]
-    assert "corrupted_authors" in corrupted["flags"], (
-        f"Expected 'corrupted_authors' flag for ref with '€', got flags={corrupted['flags']}"
-    )
-
-
-def test_clean_reference_no_flag():
-    """References without euro sign have empty flags list."""
-    refs = _parse_references(REF_ITEMS)
-    # First ref has no euro sign
-    assert refs[0]["flags"] == [], (
-        f"Expected empty flags for clean ref, got {refs[0]['flags']}"
-    )
-
-
-def test_title_from_text_level_1():
-    """_mine_metadata sets metadata.title from page_idx 0 text_level-1 block."""
-    metadata = _mine_metadata(PARSED_BLOCKS_WITH_TITLE)
-    assert metadata.get("title") == "My Paper Title", (
-        f"Expected title 'My Paper Title', got {metadata.get('title')!r}"
-    )
-
-
-def test_journal_year_from_footer():
-    """_mine_footer_metadata extracts journal and year from footer block."""
-    metadata = _mine_footer_metadata(FOOTER_BLOCKS)
-    assert metadata.get("journal"), f"Expected journal extracted from footer, got {metadata.get('journal')!r}"
-    assert metadata.get("year") == 2024, (
-        f"Expected year=2024 from footer, got {metadata.get('year')!r}"
-    )
-
-
-def test_doi_extraction():
-    """_mine_metadata extracts DOI from body text; arxiv_id parsed when present."""
-    blocks_with_doi = [
-        {"type": "text", "text": "Title Block", "text_level": 1, "page_idx": 0},
-        {"type": "text", "text": "See DOI 10.1021/jacs.3c10258 for details.", "text_level": None, "page_idx": 1},
-        {"type": "text", "text": "arXiv:2309.12345 preprint version.", "text_level": None, "page_idx": 1},
-    ]
-    metadata = _mine_metadata(blocks_with_doi)
-    assert metadata.get("doi") == "10.1021/jacs.3c10258", (
-        f"Expected DOI extracted, got {metadata.get('doi')!r}"
-    )
-    assert metadata.get("arxiv_id") == "2309.12345", (
-        f"Expected arxiv_id '2309.12345', got {metadata.get('arxiv_id')!r}"
-    )
-
-
-def test_accession_codes():
-    """PDB/EMDB tokens in body text captured as structured accession_codes entries."""
-    blocks_with_accessions = [
-        {"type": "text", "text": "Title", "text_level": 1, "page_idx": 0},
-        {"type": "text", "text": "Data deposited in PDB:7TTI and EMDB entry EMD-26116.", "text_level": None, "page_idx": 1},
-    ]
-    metadata = _mine_metadata(blocks_with_accessions)
-    codes = metadata.get("accession_codes", [])
-    types = {entry["type"] for entry in codes}
-    values = {entry["value"] for entry in codes}
-    assert "PDB" in types, f"Expected PDB accession, got {codes}"
-    assert "7TTI" in values, f"Expected 7TTI value, got {values}"
-    assert "EMDB" in types, f"Expected EMDB accession, got {codes}"
-    assert "EMD-26116" in values, f"Expected EMD-26116 value, got {values}"
-
 
 def test_quality_gate_passes_good(paper_json):
     """_quality_gate returns None for a valid parse with title and content."""
