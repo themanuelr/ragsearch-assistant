@@ -146,29 +146,12 @@ def test_ligature_fix():
     assert _normalize_text("ba<sup>ffl</sup>e") == "baffle"
 
 
-def test_ufffd_replacement():
-    """_normalize_text replaces U+FFFD replacement character with a dash (P1)."""
-    assert _normalize_text("red�o xygen") == "red-o xygen"
-    assert _normalize_text("bundles� also") == "bundles- also"
-    assert _normalize_text("no replacement here") == "no replacement here"
-
-
-def test_charge_sign_targeted():
-    """_normalize_text fixes halide charge-sign misread (P1) but leaves squared intact."""
-    # Halide tokens should be fixed
-    assert _normalize_text("Cl<sup>2</sup>") == "Cl<sup>−</sup>"
-    assert _normalize_text("Br<sup>2</sup>") == "Br<sup>−</sup>"
-    assert _normalize_text("I<sup>2</sup>") == "I<sup>−</sup>"
-    assert _normalize_text("F<sup>2</sup>") == "F<sup>−</sup>"
-    # Legitimate squared (Angstrom squared) must NOT be changed
-    assert _normalize_text("Å<sup>2</sup>") == "Å<sup>2</sup>"
-
-
 def test_plain_flattens_supsub():
     """_build_plain flattens <sup>/<sub> tags to their inner content."""
     assert _build_plain("Å<sup>2</sup>") == "Å2"
-    # Charge sign normalized first (Cl<sup>2</sup> → Cl<sup>−</sup>), then flattened
-    assert _build_plain("Cl<sup>2</sup>") == "Cl−"
+    # U+FFFD and charge-sign fixes removed (D-09) — LLM fill handles these.
+    # Verify that without charge-sign fix, Cl<sup>2</sup> flattens to Cl2 (not Cl−).
+    assert _build_plain("Cl<sup>2</sup>") == "Cl2"
 
 
 def test_plain_collapses_inline_math():

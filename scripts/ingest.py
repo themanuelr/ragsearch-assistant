@@ -22,6 +22,9 @@ import subprocess
 import sys
 
 import filelock
+import urllib.request
+import urllib.error
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
 # Module constants
@@ -31,6 +34,163 @@ SCHEMA_VERSION = 2
 DEFAULT_TIMEOUT = 1800          # 30 minutes — covers long papers + first model download
 MINERU_BACKEND = "hybrid_auto"
 NOISE_BLOCK_TYPES = {"footer", "page_number", "aside_text", "header"}
+OLLAMA_BASE = "http://localhost:11434"
+OLLAMA_MODEL = "gemma4:e4b"
+DOI_RE = re.compile(r"10\.\d{4,}/\S+")
+
+
+# ---------------------------------------------------------------------------
+# Pydantic output models (Phase 1.3 LLM fill layer)
+# ---------------------------------------------------------------------------
+
+class DoiProbeResult(BaseModel):
+    doi: str | None = None
+    arxiv_id: str | None = None
+    title: str | None = None
+
+    @field_validator("doi")
+    @classmethod
+    def validate_doi_syntax(cls, v: str | None) -> str | None:
+        """Reject syntactically invalid DOIs at the model level (D-00c)."""
+        if v is not None and not DOI_RE.fullmatch(v.strip()):
+            return None
+        return v.strip() if v else v
+
+
+class PaperMetadata(BaseModel):
+    title: str
+    authors: list[str] = Field(default_factory=list)
+    journal: str | None = None
+    year: int | None = None
+    doi: str | None = None
+    arxiv_id: str | None = None
+
+
+class SectionFillResult(BaseModel):
+    heading: str
+    body: str
+    fill_failed: bool = False
+
+
+class RefEntry(BaseModel):
+    number: int | None = None
+    raw: str
+    doi: str | None = None
+    title: str | None = None
+    year: int | None = None
+    fill_failed: bool = False
+
+
+class RefBatchResult(BaseModel):
+    refs: list[RefEntry]
+
+
+# ---------------------------------------------------------------------------
+# Ollama LLM client + response helpers (Phase 1.3)
+# ---------------------------------------------------------------------------
+
+def _ollama_extraction_call(
+    prompt: str,
+    system: str,
+    schema: dict,
+    num_ctx: int = 4096,
+    timeout: int = 120,
+) -> str:
+    """
+    POST to /api/chat with format=<json_schema>. Returns raw content string.
+
+    Mirrors mcp-ollama/server.py _ollama_chat but adds structured-output params:
+    format, options.temperature=0, options.num_ctx, and CRITICALLY omits think key
+    (Ollama #15260 drops format if think=false).
+    """
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        "stream": False,
+        "format": schema,
+        "options": {
+            "temperature": 0,
+            "num_ctx": num_ctx,
+        },
+        # CRITICAL: omit "think" key entirely (Ollama #15260 drops format if think=false)
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/chat",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.URLError as e:
+        return f"[Ollama error: {e}]"
+    try:
+        return data["message"]["content"]
+    except (KeyError, TypeError):
+        return f"[Ollama error: unexpected response envelope: {data}]"
+
+
+def _parse_extraction_response(raw: str, model_cls: type[BaseModel]) -> BaseModel | None:
+    """
+    Strip-then-parse-then-pydantic fallback for gemma4:e4b structured output.
+
+    Ollama bug #15416: even with format=<schema>, gemma4:e4b in thinking mode
+    wraps valid JSON in markdown code fences (```json ... ```).
+    Strip the fence, then validate. Returns None on all failures.
+    """
+    stripped = raw.strip()
+    candidates = [
+        stripped,
+        re.sub(r"^```[a-z]*\n?", "", stripped).rstrip("`").strip(),
+    ]
+    for candidate in candidates:
+        try:
+            return model_cls.model_validate_json(candidate)
+        except (ValidationError, ValueError):
+            continue
+    return None
+
+
+def _estimate_num_ctx(text: str, overhead: int = 2048) -> int:
+    """
+    Approximate num_ctx from input length (~4 chars/token).
+
+    Rounds up to nearest power of two; hard cap 16384 (RTX 4060 8GB VRAM safety).
+    """
+    estimated_tokens = len(text) // 4
+    raw = estimated_tokens + overhead
+    for ctx in (2048, 4096, 8192, 16384):
+        if raw <= ctx:
+            return ctx
+    return 16384
+
+
+def _warmup_ollama(model: str = OLLAMA_MODEL) -> None:
+    """
+    Pin model in VRAM for pipeline run. Best-effort — preflight catches real outages.
+
+    Sets keep_alive="-1" so the model stays loaded for the full ingest run.
+    """
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": False,
+        "keep_alive": "-1",
+        "options": {"num_ctx": 512},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE}/api/chat", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+    except urllib.error.URLError:
+        pass  # warm-up is best-effort
 
 
 # ---------------------------------------------------------------------------
@@ -64,18 +224,13 @@ def _resolve_mineru(config: dict) -> str | None:
 
 def _normalize_text(text: str) -> str:
     """
-    Apply P0/P1 normalization fixes (MINERU.md §3).
+    Apply P0 normalization fix (MINERU.md §3, D-09).
 
     P0 (mandatory): fi/fl/ff/ffi/ffl ligature superscript misread.
-    P1: U+FFFD replacement character → dash.
-    P1: charge sign (halide superscript-2 → superscript-minus).
+    U+FFFD and charge-sign replacements removed (D-09); LLM fill layer handles these.
     """
     # P0 — ligature superscript fix (95+ occurrences per paper)
     text = re.sub(r"<sup>\s*(fi|fl|ff|ffi|ffl)\s*</sup>", r"\1", text)
-    # P1 — U+FFFD replacement character (em-dash/corruption)
-    text = text.replace("�", "-")
-    # P1 — charge sign misread (halide token + superscript-2 → superscript-minus)
-    text = re.sub(r"\b(Cl|Br|I|F)<sup>2</sup>", r"\1<sup>−</sup>", text)
     return text
 
 
@@ -130,203 +285,6 @@ def _quarantine_figure(block: dict) -> dict:
         "caption": caption_normalized,
         "figure_vlm_description": block.get("content", ""),  # quarantined — never embed
     }
-
-
-# ---------------------------------------------------------------------------
-# Reference parsing
-# ---------------------------------------------------------------------------
-
-def _parse_one_reference(raw: str) -> dict:
-    """
-    Parse a single reference string into a structured object (D-05).
-
-    Extracts the leading reference number from `(n)` or `n.` format; extracts
-    DOI when a `10.x/...` pattern is present; sets `corrupted_authors` flag when
-    the euro sign (`€`) is present in the raw string (P2 — never auto-fixed).
-
-    Returns a dict with keys: {number, raw, doi, title, year, flags}.
-    """
-    number = None
-    # Match (n) or n. at start of string
-    m_paren = re.match(r"^\((\d+)\)", raw.strip())
-    m_dot = re.match(r"^(\d+)\.", raw.strip())
-    if m_paren:
-        number = int(m_paren.group(1))
-    elif m_dot:
-        number = int(m_dot.group(1))
-
-    # DOI extraction
-    doi = None
-    m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", raw)
-    if m_doi:
-        doi = m_doi.group(0).rstrip(".")
-
-    # Year extraction (4-digit year pattern)
-    year = None
-    m_year = re.search(r"\b(19|20)\d{2}\b", raw)
-    if m_year:
-        year = int(m_year.group(0))
-
-    # Corruption flag (P2)
-    flags = []
-    if "€" in raw:
-        flags.append("corrupted_authors")
-
-    return {
-        "number": number,
-        "raw": raw,
-        "doi": doi,
-        "title": None,  # best-effort; not confidently parseable from raw string
-        "year": year,
-        "flags": flags,
-    }
-
-
-def _parse_references(list_items: list) -> list:
-    """
-    Parse a list of raw reference strings into structured reference objects (D-05).
-
-    Each item becomes a dict with keys: {number, raw, doi, title, year, flags}.
-    Returns the list in input order.
-    """
-    return [_parse_one_reference(item) for item in list_items]
-
-
-# ---------------------------------------------------------------------------
-# Metadata mining
-# ---------------------------------------------------------------------------
-
-def _mine_footer_metadata(footer_blocks: list) -> dict:
-    """
-    Mine journal, year, and DOI from footer blocks before they are dropped (D-02).
-
-    Looks for patterns like "J. Am. Chem. Soc. 2024, 146, ..." and extracts:
-      - year: 4-digit year
-      - journal: text before the year or known journal name patterns
-      - doi: 10.x/... token if present in footer
-
-    Returns a partial metadata dict (only populated keys).
-    """
-    metadata = {}
-    for block in footer_blocks:
-        if block.get("type") != "footer":
-            continue
-        text = block.get("text", "")
-
-        # DOI in footer
-        if "doi" not in metadata:
-            m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text, re.IGNORECASE)
-            if m_doi:
-                metadata["doi"] = m_doi.group(0).rstrip(".")
-
-        # Year: first 4-digit year in footer
-        if "year" not in metadata:
-            m_year = re.search(r"\b(19|20)(\d{2})\b", text)
-            if m_year:
-                metadata["year"] = int(m_year.group(0))
-
-        # Journal: text before the year + volume pattern
-        # Pattern: "Journal Name YYYY, volume, pages"
-        if "journal" not in metadata:
-            m_journal = re.match(r"^(.+?)\s+(19|20)\d{2}", text.strip())
-            if m_journal:
-                journal_raw = m_journal.group(1).strip().rstrip(",").rstrip(".")
-                if journal_raw:
-                    metadata["journal"] = journal_raw
-
-    return metadata
-
-
-def _mine_metadata(blocks: list) -> dict:
-    """
-    Mine metadata fields from parsed content blocks (MINERU.md §6).
-
-    Extracts:
-      - title: first text block with text_level=1 on page_idx=0 (normalized)
-      - authors: best-effort from early text blocks after title (may be partial)
-      - doi: 10.x/... token from body text
-      - arxiv_id: arXiv:NNNN.NNNNN pattern
-      - accession_codes: PDB codes, EMDB entries, GitHub URLs as {type, value} dicts
-
-    Returns a metadata dict. Fields remain None when not found.
-    """
-    metadata = {
-        "title": None,
-        "authors": None,
-        "year": None,
-        "journal": None,
-        "doi": None,
-        "arxiv_id": None,
-        "accession_codes": [],
-    }
-
-    title_found = False
-    footer_blocks = []
-
-    for block in blocks:
-        btype = block.get("type", "")
-        text = block.get("text", "")
-        text_level = block.get("text_level")
-        page_idx = block.get("page_idx", -1)
-
-        # Collect footer blocks for footer mining
-        if btype == "footer":
-            footer_blocks.append(block)
-            continue
-
-        if btype != "text":
-            continue
-
-        # Title: first text_level=1 block on page_idx=0
-        if not title_found and text_level == 1 and page_idx == 0:
-            metadata["title"] = _build_plain(text)
-            title_found = True
-            continue
-
-        # DOI: search all text blocks
-        if metadata["doi"] is None:
-            m_doi = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", text)
-            if m_doi:
-                metadata["doi"] = m_doi.group(0).rstrip(".")
-
-        # arXiv ID
-        if metadata["arxiv_id"] is None:
-            m_arxiv = re.search(r"arXiv:\s*(\d{4}\.\d{4,5})", text)
-            if m_arxiv:
-                metadata["arxiv_id"] = m_arxiv.group(1)
-
-        # Accession codes: PDB (4-char: digit + 3 alphanumeric), EMDB (EMD-NNNNN), GitHub
-        # PDB format: single digit followed by exactly 3 alphanumerics (e.g. 7TTI)
-        pdb_matches = re.findall(r"PDB:?([0-9][A-Z0-9]{3})\b", text)
-        for code in pdb_matches:
-            entry = {"type": "PDB", "value": code}
-            if entry not in metadata["accession_codes"]:
-                metadata["accession_codes"].append(entry)
-
-        emdb_matches = re.findall(r"\b(EMD-\d+)\b", text)
-        for code in emdb_matches:
-            entry = {"type": "EMDB", "value": code}
-            if entry not in metadata["accession_codes"]:
-                metadata["accession_codes"].append(entry)
-
-        # GitHub URLs
-        github_matches = re.findall(r"https://github\.com/[^\s,;>\"']+", text)
-        for url in github_matches:
-            entry = {"type": "GitHub", "value": url}
-            if entry not in metadata["accession_codes"]:
-                metadata["accession_codes"].append(entry)
-
-    # Mine footer metadata and merge (body DOI takes precedence)
-    if footer_blocks:
-        footer_meta = _mine_footer_metadata(footer_blocks)
-        if metadata["doi"] is None:
-            metadata["doi"] = footer_meta.get("doi")
-        if metadata["year"] is None:
-            metadata["year"] = footer_meta.get("year")
-        if metadata["journal"] is None:
-            metadata["journal"] = footer_meta.get("journal")
-
-    return metadata
 
 
 # ---------------------------------------------------------------------------
@@ -547,18 +505,19 @@ def _parse_content_list(blocks: list) -> dict:
     """
     Parse a content_list.json block list into structured sections, references, and metadata.
 
-    Routes each block by type (D-01/D-02/D-06). Mines metadata from all blocks
-    (including footers before they are dropped). Parses reference strings into
-    structured objects (D-05).
+    Routes each block by type (D-01/D-02/D-06). Derives a minimal title from the
+    first text_level-1 block on page 0 (the only metadata field needed pre-fill).
+    Reference strings are collected as raw items; Plan 02 LLM fill will structure them.
 
     Returns a dict with:
       - sections: list of {heading, level, blocks[]}
-      - references: list of structured {number, raw, doi, title, year, flags} objects
+      - references: list of raw {raw} objects (structured by LLM fill in Plan 02)
       - title: first text_level-1 block text on page 0 (or None)
-      - metadata: mined metadata dict (title, authors, year, journal, doi, arxiv_id, accession_codes)
+      - metadata: minimal metadata dict with title only (LLM fill populates remaining fields)
     """
     sections = []
     raw_ref_items = []
+    title = None
 
     # Start with a default section to hold content before the first heading
     current_section = {"heading": "", "level": 0, "blocks": []}
@@ -566,12 +525,17 @@ def _parse_content_list(blocks: list) -> dict:
     for block in blocks:
         btype = block.get("type", "")
         text_level = block.get("text_level")
+        page_idx = block.get("page_idx", -1)
 
         # Collect raw reference strings before routing (so we can parse them later)
         if btype == "list" and block.get("sub_type") == "ref_text":
             for item in block.get("list_items", []):
                 raw_ref_items.append(item)
             continue
+
+        # Inline title detection: first text_level-1 block on page 0 (registry key + quality gate)
+        if title is None and btype == "text" and text_level == 1 and page_idx == 0:
+            title = _build_plain(block.get("text", "").strip())
 
         # Section boundary: text_level 2 starts a new section
         if btype == "text" and text_level == 2:
@@ -593,16 +557,24 @@ def _parse_content_list(blocks: list) -> dict:
     if current_section["blocks"]:
         sections.append(current_section)
 
-    # Mine metadata from the full block list (footer included — mined before drop)
-    metadata = _mine_metadata(blocks)
+    # Minimal metadata: title only (LLM fill in Plan 02 populates remaining fields)
+    metadata = {
+        "title": title,
+        "authors": None,
+        "year": None,
+        "journal": None,
+        "doi": None,
+        "arxiv_id": None,
+        "accession_codes": [],
+    }
 
-    # Parse raw reference strings into structured objects (D-05)
-    structured_refs = _parse_references(raw_ref_items)
+    # References as raw items; LLM fill in Plan 02 structures them
+    references = [{"raw": item} for item in raw_ref_items]
 
     return {
-        "title": metadata.get("title"),
+        "title": title,
         "sections": sections,
-        "references": structured_refs,
+        "references": references,
         "metadata": metadata,
     }
 
@@ -620,8 +592,8 @@ def _assemble_paperjson(parsed: dict, provenance: dict) -> dict:
       analysis:   empty skeleton (Phase 2 fills)
       provenance: pdf_sha256, source info, schema_version, backend, etc.
     """
-    # Prefer metadata mined via _mine_metadata (in parsed["metadata"]) over the
-    # legacy title-only path; fall back gracefully when metadata key is absent
+    # Use metadata from parsed["metadata"]; fall back gracefully when key is absent.
+    # Plan 01: metadata has title only; Plan 02 LLM fill populates remaining fields.
     mined = parsed.get("metadata") or {}
     extraction = {
         "metadata": {
@@ -942,7 +914,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         "mineru_version": None,     # resolved from MinerU output in Plan 02
         "backend": MINERU_BACKEND,
         "extracted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "normalizations_applied": ["ligature_fix", "ufffd_replacement", "charge_sign_fix"],
+        "normalizations_applied": ["ligature_fix", "llm_fill"],
         "schema_version": SCHEMA_VERSION,
     }
 
