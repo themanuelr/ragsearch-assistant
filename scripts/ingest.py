@@ -56,6 +56,40 @@ _NUM_CTX_CAP: int = DEFAULT_NUM_CTX_CAP  # mutable module global; set by ingest(
 
 
 # ---------------------------------------------------------------------------
+# Phase 1.3 Plan 06 — GAP A: timestamped progress helper
+# ---------------------------------------------------------------------------
+
+def _log(msg: str) -> None:
+    """Emit a timestamped progress line to stderr.
+
+    Format: [ingest YYYY-MM-DD HH:MM:SS] <msg>
+    stdout stays reserved for the final PaperJSON output.
+    """
+    print(f"[ingest {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 06 — GAP B: UTF-8 file-write helper
+# ---------------------------------------------------------------------------
+
+def _emit_result(result: dict, output_path: "str | None") -> None:
+    """Emit the final PaperJSON result to a file or stdout.
+
+    When output_path is given, writes the result directly as UTF-8 JSON to that
+    path using open(..., encoding='utf-8'), bypassing PowerShell '>' redirection
+    which re-decodes correct UTF-8 through the OEM console code page and writes
+    UTF-16LE with mojibake (observed on Windows — José→"Jos├⌐", U+2019→"ΓÇÖ").
+    When output_path is None, prints to stdout (preserving prior behavior).
+    """
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        _log(f"wrote {output_path}")
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # Pydantic output models (Phase 1.3 LLM fill layer)
 # ---------------------------------------------------------------------------
 
@@ -547,7 +581,7 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
 
     for i in range(0, len(raw_refs), BATCH_SIZE):
         batch_no = i // BATCH_SIZE + 1
-        print(f"[ingest] reference batch {batch_no}/{total_batches}", file=sys.stderr)
+        _log(f"reference batch {batch_no}/{total_batches}")
         batch = raw_refs[i:i + BATCH_SIZE]
         batch_text = "\n".join(
             ref.get("raw", str(ref)) if isinstance(ref, dict) else str(ref)
@@ -1251,7 +1285,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     project_name = config.get("project_name", "")
 
     # Step 2: Run-or-reuse MinerU → find + load content_list.json
-    print("[ingest] mineru extraction starting", file=sys.stderr)
+    _log("mineru extraction starting")
     try:
         _run_mineru(str(pdf), out_dir, mineru_exe, timeout, force_extract)
     except subprocess.TimeoutExpired:
@@ -1260,7 +1294,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
-    print("[ingest] mineru extraction finished", file=sys.stderr)
+    _log("mineru extraction finished")
 
     try:
         cl_path = _find_content_list(out_dir)
@@ -1298,11 +1332,11 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         sys.exit(1)
 
     # Step 5: Warm up Ollama to pin gemma4:e4b in VRAM for the full run (D-00d / Pattern 4)
-    print(f"[ingest] warming up {OLLAMA_MODEL}", file=sys.stderr)
+    _log(f"warming up {OLLAMA_MODEL}")
     _warmup_ollama()
 
     # Step 6: DOI probe — cheap first LLM call on first-page + footer blocks (D-03, D-04)
-    print("[ingest] doi probe", file=sys.stderr)
+    _log("doi probe")
     first_page_text = _extract_first_page_and_footers(blocks)
     try:
         probe = _doi_probe(first_page_text)
@@ -1333,7 +1367,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     failed_count = 0
 
     # Step 10a: Metadata fill (one call post-miss)
-    print("[ingest] metadata fill", file=sys.stderr)
+    _log("metadata fill")
     try:
         metadata = _fill_metadata(first_page_text, probe)
     except RuntimeError as e:
@@ -1352,7 +1386,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
                     raw_parts.append(blk.get("display") or blk.get("plain") or "")
             raw_section_text = "\n".join(raw_parts)
             heading = section.get("heading") or f"Section {i}"
-            print(f"[ingest] section fill {i + 1}/{total}: '{heading}'", file=sys.stderr)
+            _log(f"section fill {i + 1}/{total}: '{heading}'")
             fill_result = _fill_section(raw_section_text, heading)
             skeleton["extraction"]["sections"][i]["body"] = fill_result.body
             skeleton["extraction"]["sections"][i]["fill_failed"] = fill_result.fill_failed
@@ -1375,11 +1409,11 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     # _build_display / _build_plain already applied during block routing;
     # the section body from LLM fill replaces the concatenated block text.
     # No additional rendition pass is required here — the body IS the cleaned text.
-    print("[ingest] renditions", file=sys.stderr)
+    _log("renditions")
 
     # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
     if registry_path:
-        print("[ingest] registry write", file=sys.stderr)
+        _log("registry write")
         entry = _registry_entry(skeleton, str(pdf), "", project_name)
         try:
             _write_registry(entry, registry_path, registry_key)
@@ -1417,6 +1451,16 @@ if __name__ == "__main__":
         default=DEFAULT_TIMEOUT,
         help=f"MinerU subprocess timeout in seconds (default: {DEFAULT_TIMEOUT}).",
     )
+    parser.add_argument(
+        "--output", "-o",
+        default=None,
+        help=(
+            "Write the final PaperJSON to this path as UTF-8. "
+            "Preferred over '>' on Windows — PowerShell '>' re-decodes correct UTF-8 "
+            "through the OEM console code page and rewrites as UTF-16LE with mojibake "
+            "(José → 'Jos├⌐', U+2019 → 'ΓÇÖ'). Use -o to bypass redirection entirely."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1426,7 +1470,7 @@ if __name__ == "__main__":
         if args.timeout != DEFAULT_TIMEOUT:
             config["mineru_timeout"] = args.timeout
         result = ingest(args.pdf, config, force_extract=args.force_extract)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        _emit_result(result, args.output)
     except SystemExit:
         raise
     except Exception as e:

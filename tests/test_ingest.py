@@ -1863,7 +1863,12 @@ def test_fill_call_timeouts():
 # ---------------------------------------------------------------------------
 
 def test_progress_lines_smoke(tmp_path, capsys):
-    """ingest() emits [ingest] progress lines on stderr; stdout has no [ingest] text."""
+    """ingest() emits [ingest <date> <time>] timestamped progress lines on stderr; stdout stays clean.
+
+    Updated in Plan 06 (gap closure Task 1): progress lines now carry a local date+time prefix
+    via _log(), so assertions use regex/substring checks rather than literal '[ingest] ' strings.
+    """
+    import re as _re
     from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
 
     cfg = _make_ingest_config(tmp_path)
@@ -1886,18 +1891,20 @@ def test_progress_lines_smoke(tmp_path, capsys):
         ingest(str(fake_pdf), cfg)
 
     captured = capsys.readouterr()
-    assert "[ingest] mineru extraction starting" in captured.err, (
-        f"Expected '[ingest] mineru extraction starting' in stderr, got: {captured.err!r}"
+    # Lines carry a [ingest <date> <time>] prefix — check with regex + tail substring
+    assert _re.search(
+        r"\[ingest \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] mineru extraction starting",
+        captured.err,
+    ), f"Expected timestamped 'mineru extraction starting' in stderr, got: {captured.err!r}"
+    assert "] section fill" in captured.err, (
+        f"Expected section fill stage in stderr, got: {captured.err!r}"
     )
-    assert "[ingest] section fill" in captured.err, (
-        f"Expected '[ingest] section fill' in stderr, got: {captured.err!r}"
+    assert "] registry write" in captured.err, (
+        f"Expected registry write stage in stderr, got: {captured.err!r}"
     )
-    assert "[ingest] registry write" in captured.err, (
-        f"Expected '[ingest] registry write' in stderr, got: {captured.err!r}"
-    )
-    # stdout must stay clean of [ingest] text — only final JSON goes to stdout
-    assert "[ingest]" not in captured.out, (
-        f"Expected no '[ingest]' text in stdout, got: {captured.out!r}"
+    # stdout must stay clean of [ingest text — only final JSON goes to stdout
+    assert "[ingest" not in captured.out, (
+        f"Expected no '[ingest' text in stdout, got: {captured.out!r}"
     )
 
 
