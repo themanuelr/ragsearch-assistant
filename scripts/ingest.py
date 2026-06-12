@@ -810,6 +810,49 @@ def _crossref_validate(doi: str, title_hint: str | None, config: dict) -> None:
     # same is True or None (None = model returned unexpected shape) — proceed
 
 
+def _crossref_journal_full(doi: str, config: dict) -> str | None:
+    """
+    Resolve DOI at Crossref over HTTPS and return the full journal name.
+
+    Returns ``message['container-title'][0]`` verbatim from the Crossref API response,
+    or ``None`` on any network / parse / missing-field error (fail-open contract).
+
+    Outbound data: the DOI string in the URL only — no paper content leaves the machine
+    (V9 privacy constraint preserved; identical trust level to _crossref_validate).
+
+    Sits alongside _crossref_validate, sharing its HTTPS GET + User-Agent (V14) +
+    DOI-only + fail-open conventions. Do NOT refactor or call _crossref_validate.
+
+    Note: config.json crossref_validate=true enables BOTH the existing same-paper guard
+    (_crossref_validate) AND this journal enrichment helper. The pipeline is intentionally
+    no longer fully-offline by default for the Crossref DOI-only path (Plan 08 user decision);
+    only the DOI string leaves the machine. CLAUDE.md's offline-by-default line is superseded
+    for this DOI-only path but CLAUDE.md is NOT edited here.
+    """
+    url = f"https://api.crossref.org/works/{doi}"
+    contact = config.get("crossref_contact_email", "unknown@example.com")
+    req = urllib.request.Request(url, method="GET")
+    req.add_header(
+        "User-Agent",
+        f"ragsearch-assistant/1.3 (mailto:{contact})",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        _log("crossref journal lookup unavailable")
+        return None  # fail-open — one quiet log line; ingest proceeds
+
+    # Extract container-title[0]; fail-open on missing/empty/wrong-type
+    try:
+        full = data["message"]["container-title"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not full:
+        return None
+    return full  # verbatim from Crossref — extract-never-infer (Plan 08)
+
+
 # ---------------------------------------------------------------------------
 # Quality gate
 # ---------------------------------------------------------------------------
@@ -1479,6 +1522,18 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
+
+    # Step 10a+: Crossref journal_full enrichment (Plan 08 GAP B).
+    # Fires when crossref_validate is on (same flag as the same-paper guard above) AND
+    # a syntactically-valid DOI exists AND journal_full was not extracted from the PDF.
+    # Sets journal_full verbatim from Crossref container-title[0] — extract-never-infer preserved.
+    # journal (abbreviation) is left exactly as extracted; only journal_full is enriched.
+    # The same flag governs _crossref_validate (same-paper guard, Step 8) and this enrichment.
+    if config.get("crossref_validate", False) and doi and metadata.journal_full is None:
+        full = _crossref_journal_full(doi, config)
+        if full is not None:
+            metadata.journal_full = full  # set before model_dump() so it reaches the output
+
     skeleton["extraction"]["metadata"] = metadata.model_dump()
 
     # Step 10b: Per-section fill (one call per section, two-strike, D-01)
