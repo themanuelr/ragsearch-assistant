@@ -801,22 +801,12 @@ def test_doi_probe_full_suffix():
 
 
 def test_estimate_num_ctx_buckets():
-    """_estimate_num_ctx returns correct power-of-two bucket and caps at 16384."""
-    # Short text (~25 tokens + 2048 overhead = ~2073 → rounds up to 2048? No, 2073 > 2048 → 4096)
-    # Actually 100 chars // 4 = 25 tokens, 25 + 2048 = 2073, so 4096 is the first bucket >= 2073.
-    # Wait — but per spec, "x"*100 → 2048. Let's check: 100//4 = 25, 25+2048 = 2073, first ctx >= 2073 is 4096.
-    # The plan says "_estimate_num_ctx('x'*100) returns 2048" — that means the plan considers 25+2048=2073 <= 2048? No.
-    # Re-check spec: "tokens = len(text)//4; raw = estimated_tokens + overhead; for ctx in (2048,4096,...): if raw <= ctx: return ctx"
-    # 100//4=25, raw=25+2048=2073, 2073<=2048 is False, 2073<=4096 is True → returns 4096. But plan says 2048.
-    # The plan example uses overhead=2048 as default. With text="x"*100: 25+2048=2073 → bucket 4096, not 2048.
-    # CORRECTION: the plan says "returns 2048" — this may only hold if overhead is 0 or text is very short.
-    # For "_estimate_num_ctx('x'*100) == 2048": 100 chars // 4 = 25 tokens, +2048 overhead = 2073.
-    # 2073 > 2048, so it returns 4096 with default overhead=2048.
-    # But plan task behavior says short→2048. Use overhead=0 for the 100-char case, or accept 4096.
-    # Since the function signature is _estimate_num_ctx(text, overhead=2048), to get 2048 from 100 chars
-    # we'd need overhead <= 2047 such that 25+overhead <= 2048, i.e. overhead <= 2023.
-    # The plan may have been written with the intent that "short text" returns 2048.
-    # To make the test pass as spec'd, pass overhead=0 for short-input verification.
+    """_estimate_num_ctx returns correct bucket from extended ladder and caps at DEFAULT_NUM_CTX_CAP=65536.
+
+    Updated in Plan 05: ladder now reaches 65536; explicit cap override still works.
+    """
+    from scripts.ingest import DEFAULT_NUM_CTX_CAP
+    # Short text (~25 tokens + 2048 overhead = 2073 → bucket 4096 with default overhead)
     assert _estimate_num_ctx("x" * 100, overhead=0) == 2048, (
         "Expected 2048 for 100-char text with no overhead (25 tokens <= 2048 bucket)"
     )
@@ -825,10 +815,19 @@ def test_estimate_num_ctx_buckets():
     assert _estimate_num_ctx(mid_text) == 8192, (
         f"Expected 8192 for ~24000-char text, got {_estimate_num_ctx(mid_text)}"
     )
-    # Oversized text: ~200000 chars → ~50000 tokens + 2048 = 52048 → capped at 16384
-    large_text = "x" * 200000
-    assert _estimate_num_ctx(large_text) == 16384, (
-        f"Expected 16384 cap for 200000-char text, got {_estimate_num_ctx(large_text)}"
+    # Large text: ~100000 chars → 25000 tokens + 2048 = 27048 → bucket 32768
+    large_text = "x" * 100000
+    assert _estimate_num_ctx(large_text) == 32768, (
+        f"Expected 32768 for ~100000-char text, got {_estimate_num_ctx(large_text)}"
+    )
+    # Very large text: ~200000 chars → 50000 tokens + 2048 = 52048 → bucket 65536 (new default cap)
+    very_large_text = "x" * 200000
+    assert _estimate_num_ctx(very_large_text) == 65536, (
+        f"Expected 65536 for ~200000-char text (new default cap), got {_estimate_num_ctx(very_large_text)}"
+    )
+    # Explicit cap override: cap=16384 clamps large text back to 16384
+    assert _estimate_num_ctx(very_large_text, cap=16384) == 16384, (
+        f"Expected 16384 with explicit cap=16384, got {_estimate_num_ctx(very_large_text, cap=16384)}"
     )
 
 
@@ -1002,10 +1001,14 @@ def test_doi_probe_system_prompt_preservation():
 
 
 def test_fill_section_oversize_guard():
-    """_fill_section returns fill_failed immediately when section exceeds 16384-token cap (T-01.3-05)."""
+    """_fill_section returns fill_failed immediately when section exceeds cap*4 chars (T-01.3-05).
+
+    Updated in Plan 05: guard uses active cap (65536 default), not hardcoded 16384.
+    Use 300000 chars (77048 estimated → ≥ 65536 cap AND len > 65536*4 = 262144) to trip the guard.
+    """
     from scripts.ingest import _fill_section
-    # ~200000 chars → >16384 estimated tokens → should skip LLM and return fill_failed
-    huge_text = "x" * 200000
+    # ~300000 chars → 77048 estimated tokens → ≥ 65536 cap; 300000 > 65536*4 = 262144 → guard trips
+    huge_text = "x" * 300000
     with patch("scripts.ingest._ollama_extraction_call", side_effect=AssertionError("LLM must not be called")):
         result = _fill_section(huge_text, "Huge Section")
     assert result.fill_failed is True
@@ -1769,4 +1772,87 @@ def test_crossref_fail_open_on_timeout(capsys):
     captured = capsys.readouterr()
     assert "crossref unreachable" in captured.err, (
         f"Expected 'crossref unreachable' in stderr on timeout, got: {captured.err!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 05 (gap closure) Task 2: num_ctx cap + timeouts
+# ---------------------------------------------------------------------------
+
+def test_oversize_guard_uses_cap(monkeypatch):
+    """_fill_section guard derives from _NUM_CTX_CAP, not a hardcoded literal (Plan 05 T-01.3-05)."""
+    import scripts.ingest as _ingest_mod
+    from scripts.ingest import _fill_section, DEFAULT_NUM_CTX_CAP
+    # Monkeypatch _NUM_CTX_CAP to 4096: 20000 chars → 7048 estimated ≥ 4096 cap; 20000 > 4096*4=16384 → guard trips
+    original_cap = _ingest_mod._NUM_CTX_CAP
+    try:
+        _ingest_mod._NUM_CTX_CAP = 4096
+        huge_text = "x" * 20000
+        with patch("scripts.ingest._ollama_extraction_call",
+                   side_effect=AssertionError("LLM must not be called under low cap")):
+            result = _fill_section(huge_text, "Section")
+        assert result.fill_failed is True, "Expected fill_failed=True under low cap override"
+    finally:
+        _ingest_mod._NUM_CTX_CAP = original_cap
+
+
+def test_num_ctx_cap_config_flow(tmp_path):
+    """ingest() reads ollama_num_ctx_cap from config and sets _NUM_CTX_CAP module global."""
+    import scripts.ingest as _ingest_mod
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult, DEFAULT_NUM_CTX_CAP
+
+    cfg = _make_ingest_config(tmp_path, extra={"ollama_num_ctx_cap": 8192})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 cap config flow test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(doi="10.1000/cap.config.test", arxiv_id=None, title="Cap Config Paper")
+    metadata_result = PaperMetadata(title="Cap Config Paper", doi="10.1000/cap.config.test")
+    section_fill = SectionFillResult(heading="", body="Test body " + "A" * 200, fill_failed=False)
+
+    try:
+        with mock.patch("scripts.ingest._run_mineru"), \
+             mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+             mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+             mock.patch("scripts.ingest._warmup_ollama"), \
+             mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+             mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+             mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+             mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+            ingest(str(fake_pdf), cfg)
+        assert _ingest_mod._NUM_CTX_CAP == 8192, (
+            f"Expected _NUM_CTX_CAP=8192 after ingest() with ollama_num_ctx_cap=8192, "
+            f"got {_ingest_mod._NUM_CTX_CAP}"
+        )
+    finally:
+        _ingest_mod._NUM_CTX_CAP = DEFAULT_NUM_CTX_CAP
+
+
+def test_fill_call_timeouts():
+    """_fill_section passes timeout=180; _doi_probe passes timeout=120."""
+    from scripts.ingest import _fill_section, _doi_probe
+    import json as _json
+
+    # Capture kwargs for _fill_section
+    captured_kwargs = {}
+    def capture_fill_call(prompt, system, schema, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _json.dumps({"heading": "H", "body": "body text", "fill_failed": False})
+
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_fill_call):
+        _fill_section("short text", "H")
+    assert captured_kwargs.get("timeout") == 180, (
+        f"Expected _fill_section to pass timeout=180, got {captured_kwargs.get('timeout')}"
+    )
+
+    # Capture kwargs for _doi_probe
+    captured_probe_kwargs = {}
+    def capture_probe_call(prompt, system, schema, **kwargs):
+        captured_probe_kwargs.update(kwargs)
+        return _json.dumps({"doi": "10.1000/x", "arxiv_id": None, "title": "T"})
+
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_probe_call):
+        _doi_probe("first page text")
+    assert captured_probe_kwargs.get("timeout") == 120, (
+        f"Expected _doi_probe to pass timeout=120, got {captured_probe_kwargs.get('timeout')}"
     )
