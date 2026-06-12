@@ -2762,3 +2762,256 @@ def test_abstract_empty_heading_relabel(tmp_path):
     assert "INTRODUCTION" in headings, (
         f"Expected 'INTRODUCTION' (unchanged existing heading) in output sections, got: {headings}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 08 (gap closure) Task 2: Crossref journal_full enrichment + flag default
+# ---------------------------------------------------------------------------
+
+def test_crossref_journal_full_enriches_when_none(capsys):
+    """_crossref_journal_full returns container-title[0] verbatim on success (Plan 08 T2)."""
+    import json as _json
+    from scripts.ingest import _crossref_journal_full
+
+    payload = _json.dumps({
+        "message": {"container-title": ["Journal of the American Chemical Society"]}
+    }).encode()
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(payload)):
+        result = _crossref_journal_full("10.1021/jacs.3c10258", cfg)
+
+    assert result == "Journal of the American Chemical Society", (
+        f"Expected 'Journal of the American Chemical Society', got {result!r}"
+    )
+
+
+def test_crossref_journal_full_fail_open_on_network_error(capsys):
+    """_crossref_journal_full returns None + emits one quiet log line on URLError (Plan 08 T2)."""
+    from scripts.ingest import _crossref_journal_full
+
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    side_effect=_urllib_error.URLError("connection refused")):
+        result = _crossref_journal_full("10.1/x", cfg)
+
+    assert result is None, f"Expected None (fail-open) on URLError, got {result!r}"
+    captured = capsys.readouterr()
+    assert "crossref journal lookup unavailable" in captured.err, (
+        f"Expected 'crossref journal lookup unavailable' in stderr, got: {captured.err!r}"
+    )
+
+
+def test_crossref_journal_full_none_on_missing_container_title():
+    """_crossref_journal_full returns None when container-title is absent or empty (Plan 08 T2)."""
+    import json as _json
+    from scripts.ingest import _crossref_journal_full
+
+    # Missing container-title key
+    payload_no_key = _json.dumps({"message": {"title": ["Some Paper"]}}).encode()
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(payload_no_key)):
+        result = _crossref_journal_full("10.1/x", cfg)
+    assert result is None, f"Expected None on missing container-title, got {result!r}"
+
+    # Empty container-title list
+    payload_empty = _json.dumps({"message": {"container-title": []}}).encode()
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(payload_empty)):
+        result2 = _crossref_journal_full("10.1/x", cfg)
+    assert result2 is None, f"Expected None on empty container-title list, got {result2!r}"
+
+
+def test_crossref_journal_full_uses_https_and_contact():
+    """_crossref_journal_full source uses HTTPS, crossref_contact_email, and container-title (Plan 08 T2)."""
+    import inspect
+    from scripts.ingest import _crossref_journal_full
+
+    source = inspect.getsource(_crossref_journal_full)
+    assert "https://api.crossref.org" in source, (
+        "Expected 'https://api.crossref.org' in _crossref_journal_full source"
+    )
+    assert "http://api.crossref.org" not in source, (
+        "Plain http:// must NOT be used for Crossref"
+    )
+    assert "crossref_contact_email" in source, (
+        "Expected 'crossref_contact_email' in _crossref_journal_full source"
+    )
+    assert "container-title" in source, (
+        "Expected 'container-title' in _crossref_journal_full source"
+    )
+
+
+def test_ingest_enriches_journal_full_when_none(tmp_path):
+    """ingest() sets metadata.journal_full from _crossref_journal_full when it's None + DOI valid + crossref on (Plan 08 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 journal full enrich test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    # journal_full=None triggers the enrichment
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=2024,
+        journal="J. Am. Chem. Soc.",
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full",
+                    return_value="Journal of the American Chemical Society") as mock_jf:
+        result = ingest(str(fake_pdf), cfg)
+
+    assert mock_jf.called, "Expected _crossref_journal_full to be called"
+    assert result["extraction"]["metadata"]["journal_full"] == "Journal of the American Chemical Society", (
+        f"Expected journal_full='Journal of the American Chemical Society', "
+        f"got {result['extraction']['metadata']['journal_full']!r}"
+    )
+    assert result["extraction"]["metadata"]["journal"] == "J. Am. Chem. Soc.", (
+        f"Expected journal abbreviation unchanged, got {result['extraction']['metadata']['journal']!r}"
+    )
+
+
+def test_ingest_no_journal_lookup_when_already_set(tmp_path):
+    """ingest() does NOT call _crossref_journal_full when journal_full is already set (Plan 08 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 no lookup when already set")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed()
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    # journal_full already set — no lookup needed
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=2024,
+        journal="J. Am. Chem. Soc.",
+        journal_full="Journal of the American Chemical Society",  # already set
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full",
+                    side_effect=AssertionError("must not be called when already set")) as mock_jf:
+        ingest(str(fake_pdf), cfg)
+
+    assert mock_jf.call_count == 0, (
+        f"Expected _crossref_journal_full call_count == 0 when journal_full already set, "
+        f"got {mock_jf.call_count}"
+    )
+
+
+def test_ingest_no_journal_lookup_when_crossref_off(tmp_path):
+    """ingest() does NOT call _crossref_journal_full when crossref_validate is False (Plan 08 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    # crossref_validate is absent (defaults False in the code guard)
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 no lookup when crossref off")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed()
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=2024,
+        journal="J. Am. Chem. Soc.",
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_journal_full",
+                    side_effect=AssertionError("must not be called when crossref off")) as mock_jf:
+        ingest(str(fake_pdf), cfg)
+
+    assert mock_jf.call_count == 0, (
+        f"Expected _crossref_journal_full call_count == 0 when crossref_validate off, "
+        f"got {mock_jf.call_count}"
+    )
+
+
+def test_ingest_journal_full_stays_none_on_lookup_failure(tmp_path):
+    """When _crossref_journal_full returns None (network error), journal_full stays None — fail-open (Plan 08 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fail open journal lookup test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed()
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=2024,
+        journal="J. Am. Chem. Soc.",
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full", return_value=None):
+        result = ingest(str(fake_pdf), cfg)
+
+    assert result["extraction"]["metadata"]["journal_full"] is None, (
+        f"Expected journal_full=None on lookup failure (fail-open), "
+        f"got {result['extraction']['metadata']['journal_full']!r}"
+    )
+
+
+def test_config_crossref_validate_default_true():
+    """config.json crossref_validate is True — the single flag enabling same-paper guard + journal enrichment (Plan 08 T2)."""
+    import json as _json
+    cfg = _json.load(open("config.json", encoding="utf-8"))
+    assert cfg["crossref_validate"] is True, (
+        f"Expected crossref_validate=True in config.json (Plan 08 default flip), got {cfg['crossref_validate']!r}"
+    )
