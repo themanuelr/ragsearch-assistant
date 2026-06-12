@@ -2017,3 +2017,110 @@ def test_output_omitted_uses_stdout(tmp_path, capsys):
     assert loaded == data, f"Expected JSON on stdout, got: {captured.out!r}"
     # No file should exist in tmp_path
     assert not list(tmp_path.iterdir()), "Expected no file written when output_path is None"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 06 (gap closure) Task 2: full-doc DOI probe + journal_full
+# ---------------------------------------------------------------------------
+
+def test_extract_full_text_includes_non_first_page():
+    """_extract_full_text includes text from all pages; contrast with _extract_first_page_and_footers."""
+    from scripts.ingest import _extract_full_text, _extract_first_page_and_footers
+
+    blocks = [
+        {"type": "text", "page_idx": 0, "text": "Cover title"},
+        {"type": "text", "page_idx": 3, "text": "10.1021/jacs.3c10258"},  # Supporting Info DOI
+        {"type": "footer", "page_idx": 1, "text": "Journal footer"},
+    ]
+    full = _extract_full_text(blocks)
+    first = _extract_first_page_and_footers(blocks)
+
+    assert "Cover title" in full, f"Expected cover title in full text, got: {full!r}"
+    assert "10.1021/jacs.3c10258" in full, f"Expected page-3 DOI in full text, got: {full!r}"
+    # first-page extractor should NOT include page-3 text
+    assert "10.1021/jacs.3c10258" not in first, (
+        f"Expected page-3 DOI absent from first-page extract, got: {first!r}"
+    )
+
+
+def test_doi_probe_scans_full_text():
+    """_doi_probe receives the full_text in the prompt; num_ctx sized by _estimate_num_ctx(full_text)."""
+    import scripts.ingest as _m
+    from scripts.ingest import _doi_probe, _estimate_num_ctx
+    import json as _json
+
+    captured_prompt = []
+    captured_kwargs = {}
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_prompt.append(prompt)
+        captured_kwargs.update(kwargs)
+        return _json.dumps({"doi": "10.1021/jacs.3c10258", "arxiv_id": None, "title": "T"})
+
+    full_text = "Cover page text only\n" + "page 3 contains: 10.1021/jacs.3c10258"
+    with mock.patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        _doi_probe(full_text=full_text, first_page_text="Cover page text only")
+
+    assert captured_prompt, "Expected _ollama_extraction_call to be called"
+    assert "10.1021/jacs.3c10258" in captured_prompt[0], (
+        f"Expected full_text (with page-3 DOI) in prompt, got: {captured_prompt[0]!r}"
+    )
+    expected_ctx = _estimate_num_ctx(full_text)
+    assert captured_kwargs.get("num_ctx") == expected_ctx, (
+        f"Expected num_ctx={expected_ctx} (dynamic sizing), got {captured_kwargs.get('num_ctx')}"
+    )
+
+
+def test_paper_metadata_journal_full_field():
+    """PaperMetadata carries journal_full (full title) alongside journal (abbreviation)."""
+    from scripts.ingest import PaperMetadata
+
+    pm = PaperMetadata(
+        title="T",
+        journal="J. Am. Chem. Soc.",
+        journal_full="Journal of the American Chemical Society",
+    )
+    assert pm.journal == "J. Am. Chem. Soc."
+    assert pm.journal_full == "Journal of the American Chemical Society"
+
+    # Default is None
+    pm2 = PaperMetadata(title="T")
+    assert pm2.journal_full is None
+
+
+def test_fill_metadata_returns_journal_full():
+    """_fill_metadata returns PaperMetadata with journal_full when LLM provides it."""
+    from scripts.ingest import _fill_metadata, DoiProbeResult
+    import json as _json
+
+    probe = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="JACS Paper")
+    mock_resp = _json.dumps({
+        "title": "JACS Paper",
+        "authors": [],
+        "journal": "J. Am. Chem. Soc.",
+        "journal_full": "Journal of the American Chemical Society",
+        "year": 2023,
+        "doi": "10.1021/jacs.3c10258",
+        "arxiv_id": None,
+    })
+    with mock.patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        result = _fill_metadata("Cover page text", probe)
+
+    assert result.journal == "J. Am. Chem. Soc.", f"Expected abbreviation, got {result.journal!r}"
+    assert result.journal_full == "Journal of the American Chemical Society", (
+        f"Expected full journal name, got {result.journal_full!r}"
+    )
+
+
+def test_fill_metadata_fallback_journal_full_none():
+    """_fill_metadata fallback path (two-strike timeout) sets journal_full=None gracefully."""
+    from scripts.ingest import _fill_metadata, DoiProbeResult
+
+    probe = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="JACS Paper")
+    timeout_resp = "[Ollama timeout: no response within 120s]"
+    with mock.patch("scripts.ingest._ollama_extraction_call", return_value=timeout_resp):
+        result = _fill_metadata("Cover page text", probe)
+
+    assert result.journal_full is None, (
+        f"Expected journal_full=None on fallback, got {result.journal_full!r}"
+    )
