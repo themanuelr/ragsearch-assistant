@@ -14,6 +14,7 @@ import datetime
 import glob
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -234,7 +235,8 @@ def _parse_extraction_response(raw: str, model_cls: type[BaseModel]) -> BaseMode
     return None
 
 
-def _estimate_num_ctx(text: str, overhead: int = 2048, cap: int | None = None) -> int:
+def _estimate_num_ctx(text: str, overhead: int = 2048, cap: int | None = None,
+                      output_ratio: float = 0.0) -> int:
     """
     Approximate num_ctx from input length (~4 chars/token).
 
@@ -243,19 +245,25 @@ def _estimate_num_ctx(text: str, overhead: int = 2048, cap: int | None = None) -
     benchmark-validated for 100% GPU on RTX 4060 at ~55 tok/s with ~3.2GB footprint).
 
     Args:
-        text:     Input text whose token count is estimated.
-        overhead: Token overhead added to the raw estimate (default 2048).
-        cap:      Override the cap explicitly. When None, reads the module-level
-                  _NUM_CTX_CAP (set once by ingest() from config). Pass a value
-                  to override — e.g. for tests or probe calls with known small inputs.
+        text:         Input text whose token count is estimated.
+        overhead:     Token overhead added to the raw estimate (default 2048).
+        cap:          Override the cap explicitly. When None, reads the module-level
+                      _NUM_CTX_CAP (set once by ingest() from config). Pass a value
+                      to override — e.g. for tests or probe calls with known small inputs.
+        output_ratio: Fraction of the input size to reserve for ECHO output (the model
+                      regenerates its input as output). 0.0 (default) = size for input
+                      only (probe, metadata — backward compatible). 1.0 = size for input
+                      + an equal-size output (section/ref-batch echo calls, which regenerate
+                      the full body/refs as JSON). The result is still clamped to the
+                      configurable cap, so a 2x budget exceeding the cap falls back to cap.
 
     Returns:
-        The smallest NUM_CTX_LADDER rung >= (estimated_tokens + overhead) that does
-        not exceed the active cap; or the cap itself when no rung fits.
+        The smallest NUM_CTX_LADDER rung >= ceil(estimated_tokens * (1 + output_ratio) + overhead)
+        that does not exceed the active cap; or the cap itself when no rung fits.
     """
     active_cap = cap if cap is not None else _NUM_CTX_CAP
     estimated_tokens = len(text) // 4
-    raw = estimated_tokens + overhead
+    raw = math.ceil(estimated_tokens * (1 + output_ratio)) + overhead
     for ctx in NUM_CTX_LADDER:
         if ctx > active_cap:
             break
@@ -573,10 +581,11 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
     Raises RuntimeError on Ollama unreachable (D-00d).
     """
     # Over-size guard: section larger than the active num_ctx cap → skip LLM, return fill_failed
-    # The cap is derived from _NUM_CTX_CAP (set by ingest() from config), not hardcoded.
-    # This ensures the guard and the sizer share one configurable cap source (T-01.3-05 carried).
+    # Uses the SAME echo-aware sizing (output_ratio=1.0) as the actual call below so the guard and
+    # the call share one sizing basis (T-01.3-05 carried). A section whose 2x budget exceeds the cap
+    # still falls back to the cap via the ladder, and a genuinely-too-big section short-circuits here.
     cap = _NUM_CTX_CAP
-    estimated_ctx = _estimate_num_ctx(section_text)
+    estimated_ctx = _estimate_num_ctx(section_text, output_ratio=1.0)
     if estimated_ctx >= cap and len(section_text) > cap * 4:
         print(
             f"[ingest warning: section '{heading}' oversize — skipping LLM fill]",
@@ -601,9 +610,14 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
     for attempt in range(2):                             # two-strike: try, retry, flag
         raw = _ollama_extraction_call(
             prompt, system, schema,
-            num_ctx=_estimate_num_ctx(section_text),
-            timeout=_SECTION_TIMEOUT,  # configurable via config.json "ollama_section_timeout" (default 300)
-            # RTX 4060 benchmark: ~55 tok/s → a long RESULTS section can exceed 180s (observed gap-05 failure)
+            # Echo-aware sizing: _fill_section regenerates the full section body as output (≈ input size),
+            # so budget ≈ 2x input + overhead. Sized for 1x (prior behaviour), the output JSON truncated
+            # mid-generation → unparseable → both strikes failed (observed: test_manuel1 RESULTS 118s,
+            # test_manuel3 Experimental Procedure 149s — both completed under the 300s budget but returned
+            # invalid JSON). The 300s timeout was CONFIRMED sufficient; truncation was the limiter.
+            num_ctx=_estimate_num_ctx(section_text, output_ratio=1.0),
+            timeout=_SECTION_TIMEOUT,  # configurable via config.json "ollama_section_timeout" (default 300s,
+            # confirmed sufficient — RESULTS 118s, Experimental Procedure 149s under live run; do NOT raise)
         )
         if raw.startswith("[Ollama error:"):
             raise RuntimeError(raw)                      # Ollama unreachable → abort pipeline
@@ -656,7 +670,13 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
         result = None
 
         for attempt in range(2):
-            raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=120)
+            # Echo-aware sizing: the ref-batch call regenerates all parsed references as JSON output
+            # (≈ input size). Fixed num_ctx=4096 truncated large batches; output_ratio=1.0 allocates
+            # budget for input + equal-size output. timeout=120 is unchanged (ref batches are small;
+            # no timeout observed in live runs).
+            raw = _ollama_extraction_call(prompt, system, schema,
+                                          num_ctx=_estimate_num_ctx(batch_text, output_ratio=1.0),
+                                          timeout=120)
             if raw.startswith("[Ollama error:"):
                 raise RuntimeError(raw)
             if raw.startswith("[Ollama timeout:"):

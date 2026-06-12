@@ -2367,12 +2367,17 @@ def test_estimate_num_ctx_output_ratio():
         f"Expected 65536 for 200000-char default, got {default_large}"
     )
 
-    # Mid-size text: input-only vs echo-aware
-    mid_text = "x" * 60000
+    # Mid-size text: input-only vs echo-aware must land on different rungs.
+    # 48000 chars → 12000 tokens
+    # input-only:  12000 + 2048 = 14048 → rung 16384
+    # echo-aware:  24000 + 2048 = 26048 → rung 32768 (strictly larger)
+    mid_text = "x" * 48000
     input_only = _estimate_num_ctx(mid_text)
     echo_aware = _estimate_num_ctx(mid_text, output_ratio=1.0)
+    assert input_only == 16384, f"Expected input-only=16384 for 48000-char text, got {input_only}"
+    assert echo_aware == 32768, f"Expected echo-aware=32768 for 48000-char text, got {echo_aware}"
     assert echo_aware > input_only, (
-        f"Expected echo-aware ({echo_aware}) > input-only ({input_only}) for 60000-char text"
+        f"Expected echo-aware ({echo_aware}) > input-only ({input_only}) for 48000-char text"
     )
 
     # 2x budget exceeding cap must clamp to cap
@@ -2398,7 +2403,8 @@ def test_fill_section_requests_echo_aware_num_ctx():
     import json as _json
     from scripts.ingest import _fill_section, _estimate_num_ctx
 
-    section_text = "x" * 60000
+    # 48000 chars: input-only→16384, echo-aware→32768 (strictly larger, different rungs)
+    section_text = "x" * 48000
     captured_kwargs = {}
 
     def capture_call(prompt, system, schema, **kwargs):
@@ -2426,8 +2432,9 @@ def test_fill_references_batched_echo_aware_num_ctx():
     import json as _json
     from scripts.ingest import _fill_references_batched, _estimate_num_ctx
 
-    # Large batch to make the dynamic num_ctx exceed 4096
-    raw_refs = [{"raw": "r" * 400} for _ in range(10)]
+    # Large batch: 10 refs with 1200 chars each → batch_text ≈ 12000 chars
+    # 12000 / 4 = 3000 tokens; echo-aware: 6000 + 2048 = 8048 → rung 8192 (> old fixed 4096)
+    raw_refs = [{"raw": "r" * 1200} for _ in range(10)]
     captured_kwargs = {}
 
     def capture_call(prompt, system, schema, **kwargs):
@@ -2443,6 +2450,7 @@ def test_fill_references_batched_echo_aware_num_ctx():
         f"got {captured_kwargs.get('num_ctx')}"
     )
     # Verify it's sized via the sizer with output_ratio=1.0
+    # batch_text is built from the prompt prefix + refs (we compute what the function uses)
     batch_text = "\n".join(ref["raw"] for ref in raw_refs)
     expected = _estimate_num_ctx(batch_text, output_ratio=1.0)
     assert captured_kwargs["num_ctx"] == expected, (
