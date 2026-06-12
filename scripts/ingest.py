@@ -543,8 +543,11 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
     )
     filled: list = []
     failures = 0
+    total_batches = (len(raw_refs) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for i in range(0, len(raw_refs), BATCH_SIZE):
+        batch_no = i // BATCH_SIZE + 1
+        print(f"[ingest] reference batch {batch_no}/{total_batches}", file=sys.stderr)
         batch = raw_refs[i:i + BATCH_SIZE]
         batch_text = "\n".join(
             ref.get("raw", str(ref)) if isinstance(ref, dict) else str(ref)
@@ -1248,6 +1251,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     project_name = config.get("project_name", "")
 
     # Step 2: Run-or-reuse MinerU → find + load content_list.json
+    print("[ingest] mineru extraction starting", file=sys.stderr)
     try:
         _run_mineru(str(pdf), out_dir, mineru_exe, timeout, force_extract)
     except subprocess.TimeoutExpired:
@@ -1256,6 +1260,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
+    print("[ingest] mineru extraction finished", file=sys.stderr)
 
     try:
         cl_path = _find_content_list(out_dir)
@@ -1293,9 +1298,11 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         sys.exit(1)
 
     # Step 5: Warm up Ollama to pin gemma4:e4b in VRAM for the full run (D-00d / Pattern 4)
+    print(f"[ingest] warming up {OLLAMA_MODEL}", file=sys.stderr)
     _warmup_ollama()
 
     # Step 6: DOI probe — cheap first LLM call on first-page + footer blocks (D-03, D-04)
+    print("[ingest] doi probe", file=sys.stderr)
     first_page_text = _extract_first_page_and_footers(blocks)
     try:
         probe = _doi_probe(first_page_text)
@@ -1326,6 +1333,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     failed_count = 0
 
     # Step 10a: Metadata fill (one call post-miss)
+    print("[ingest] metadata fill", file=sys.stderr)
     try:
         metadata = _fill_metadata(first_page_text, probe)
     except RuntimeError as e:
@@ -1334,6 +1342,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     skeleton["extraction"]["metadata"] = metadata.model_dump()
 
     # Step 10b: Per-section fill (one call per section, two-strike, D-01)
+    total = len(skeleton["extraction"]["sections"])
     try:
         for i, section in enumerate(skeleton["extraction"]["sections"]):
             # Derive raw section text from existing block display/plain content
@@ -1343,6 +1352,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
                     raw_parts.append(blk.get("display") or blk.get("plain") or "")
             raw_section_text = "\n".join(raw_parts)
             heading = section.get("heading") or f"Section {i}"
+            print(f"[ingest] section fill {i + 1}/{total}: '{heading}'", file=sys.stderr)
             fill_result = _fill_section(raw_section_text, heading)
             skeleton["extraction"]["sections"][i]["body"] = fill_result.body
             skeleton["extraction"]["sections"][i]["fill_failed"] = fill_result.fill_failed
@@ -1365,9 +1375,11 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     # _build_display / _build_plain already applied during block routing;
     # the section body from LLM fill replaces the concatenated block text.
     # No additional rendition pass is required here — the body IS the cleaned text.
+    print("[ingest] renditions", file=sys.stderr)
 
     # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
     if registry_path:
+        print("[ingest] registry write", file=sys.stderr)
         entry = _registry_entry(skeleton, str(pdf), "", project_name)
         try:
             _write_registry(entry, registry_path, registry_key)
