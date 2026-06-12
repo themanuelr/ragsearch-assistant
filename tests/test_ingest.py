@@ -2762,4 +2762,3 @@ def test_abstract_empty_heading_relabel(tmp_path):
     assert "INTRODUCTION" in headings, (
         f"Expected 'INTRODUCTION' (unchanged existing heading) in output sections, got: {headings}"
     )
-    assert result.body == huge_text

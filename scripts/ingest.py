@@ -137,6 +137,8 @@ class SectionFillResult(BaseModel):
     heading: str
     body: str
     fill_failed: bool = False
+    keep: bool = True  # LLM substantive-content verdict; default True so any parse/fill failure or
+    # missing verdict CONSERVATIVELY RETAINS the section — never silently drop on uncertainty (Plan 08)
 
 
 class RefEntry(BaseModel):
@@ -598,7 +600,22 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
         "Repair encoding artifacts (U+FFFD, ligature runs) and restore correct "
         "hyphenation for compound terms. "
         "Preserve the author's wording exactly — do not rewrite, summarise, or expand. "
-        "Return ONLY valid JSON matching the schema."
+        "Return ONLY valid JSON matching the schema.\n\n"
+        # LLM-judge: fold a substantive-content relevance verdict into the same per-section call
+        # (no extra LLM calls — Plan 08 GAP A). Figures/tables/boxes stay inside parent section
+        # bodies; a caption with descriptive text makes its parent keep=true (deferred: surfacing
+        # each as a separate captioned output entry is a future schema change, out of scope here).
+        "Also judge whether this section is substantive scientific paper content.\n"
+        "Set keep=true when the section is: abstract, introduction, results (and results "
+        "subsections), discussion, conclusions, methods, experimental section, or "
+        "figure/table/box captions that carry descriptive scientific text.\n"
+        "Set keep=false when the section is: author or affiliation lists, acknowledgments, "
+        "funding or grant statements, data-availability statements, conflict-of-interest "
+        "or 'Notes' blurbs, supporting-information pointers, page headers or footers, "
+        "journal banners or advertisements (e.g. promotional taglines), navigation text, "
+        "or tiny fragments with no scientific content.\n"
+        "If a KEPT section has an empty or missing heading and reads as the paper's abstract, "
+        "set heading to 'Abstract'. Do NOT rename any section that already has a heading."
     )
     prompt = (
         f"Clean the following section text from a research paper PDF.\n"
@@ -1465,7 +1482,14 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     skeleton["extraction"]["metadata"] = metadata.model_dump()
 
     # Step 10b: Per-section fill (one call per section, two-strike, D-01)
+    # The same per-section call also judges substantive-vs-non-substantive content (Plan 08 GAP A).
+    # keep=False (successful fill, explicit verdict) → section is dropped.
+    # keep=True OR fill_failed=True → section is retained (conservative default: false-negatives
+    # are recoverable; false-positives silently lose paper content and are not — Plan 08).
     total = len(skeleton["extraction"]["sections"])
+    kept_sections: list[dict] = []
+    kept_count = 0
+    dropped_count = 0
     try:
         for i, section in enumerate(skeleton["extraction"]["sections"]):
             # Derive raw section text from existing block display/plain content
@@ -1477,13 +1501,33 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
             heading = section.get("heading") or f"Section {i}"
             _log(f"section fill {i + 1}/{total}: '{heading}'")
             fill_result = _fill_section(raw_section_text, heading)
-            skeleton["extraction"]["sections"][i]["body"] = fill_result.body
-            skeleton["extraction"]["sections"][i]["fill_failed"] = fill_result.fill_failed
             if fill_result.fill_failed:
+                # fill_failed means no verdict — always retain (conservative: keep=True default)
                 failed_count += 1
+                kept_count += 1
+                kept_sections.append({
+                    "heading": fill_result.heading,
+                    "body": fill_result.body,
+                    "fill_failed": fill_result.fill_failed,
+                    # keep is intentionally NOT persisted; output stays {heading, body, fill_failed}
+                })
+            elif fill_result.keep:
+                # Successful fill with keep=True verdict (or default True) → retain
+                kept_count += 1
+                kept_sections.append({
+                    "heading": fill_result.heading,  # use possibly-relabeled heading (e.g. "Abstract")
+                    "body": fill_result.body,
+                    "fill_failed": fill_result.fill_failed,
+                    # keep is intentionally NOT persisted; output stays {heading, body, fill_failed}
+                })
+            else:
+                # Successful fill with explicit keep=False verdict → drop (non-substantive)
+                dropped_count += 1
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
+    skeleton["extraction"]["sections"] = kept_sections
+    _log(f"section filter: kept {kept_count}, dropped {dropped_count}")
 
     # Step 10c: Ref batch fill (~10 per batch, D-02)
     try:
