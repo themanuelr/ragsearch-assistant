@@ -521,6 +521,100 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
 
 
 # ---------------------------------------------------------------------------
+# Crossref optional same-paper validator (Plan 03)
+# ---------------------------------------------------------------------------
+
+def _crossref_validate(doi: str, title_hint: str | None, config: dict) -> None:
+    """
+    Resolve DOI at Crossref over HTTPS and run a local-LLM same-paper check (D-13..D-16).
+
+    Only called when config["crossref_validate"] is truthy and a syntactically-valid
+    DOI is available. Outbound data: DOI string in URL only — no paper content leaves
+    the machine (V9 privacy constraint).
+
+    Behavior:
+      - Network failure (URLError, JSONDecodeError): print [ingest warning: crossref unreachable
+        ...] to stderr and return (D-16 fail-open).
+      - Crossref returns no title (KeyError/IndexError/TypeError): return (nothing to compare).
+      - title_hint is falsy: return (nothing to compare).
+      - LLM check returns [Ollama error: ...]: print [ingest warning: crossref LLM check
+        unavailable ...] and return (fail-open — LLM check is best-effort).
+      - LLM verdict same_paper is explicitly False: raise RuntimeError([ingest error: ...])
+        naming both titles (D-15 — hard abort before registry write).
+      - Unparseable LLM verdict: return (fail-open).
+
+    Args:
+        doi:        Syntactically-valid DOI string (already validated by _syntactic_doi_valid).
+        title_hint: Title from DOI probe (may be None).
+        config:     Loaded config dict; reads crossref_contact_email for User-Agent (V14).
+    """
+    url = f"https://api.crossref.org/works/{doi}"
+    contact = config.get("crossref_contact_email", "unknown@example.com")
+    req = urllib.request.Request(url, method="GET")
+    req.add_header(
+        "User-Agent",
+        f"ragsearch-assistant/1.3 (mailto:{contact})",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, json.JSONDecodeError):
+        print(
+            "[ingest warning: crossref unreachable — proceeding with syntactic validation only]",
+            file=sys.stderr,
+        )
+        return  # D-16: fail-open on network / parse error
+
+    # Extract Crossref title; missing key means nothing to compare — fail-open
+    try:
+        crossref_title = data["message"]["title"][0]
+    except (KeyError, IndexError, TypeError):
+        return  # no title in Crossref response — proceed
+
+    # Nothing to compare if probe produced no title
+    if not title_hint:
+        return
+
+    # One local-LLM same-paper check (D-14)
+    schema = {
+        "type": "object",
+        "properties": {"same_paper": {"type": "boolean"}},
+        "required": ["same_paper"],
+    }
+    system = "You are a bibliographic metadata checker."
+    prompt = (
+        f"DOI: {doi}\n"
+        f"Title A (from paper): {title_hint}\n"
+        f"Title B (from Crossref): {crossref_title}\n\n"
+        "Do titles A and B refer to the same paper? "
+        "Return JSON with a single boolean field: same_paper."
+    )
+    raw = _ollama_extraction_call(prompt, system, schema, num_ctx=2048, timeout=30)
+    if raw.startswith("[Ollama error:"):
+        # LLM check unavailable — fail-open (best-effort; DOI is already syntactically valid)
+        print(
+            "[ingest warning: crossref LLM check unavailable — proceeding]",
+            file=sys.stderr,
+        )
+        return
+
+    # Parse verdict; fail-open on unparseable response
+    try:
+        verdict = json.loads(raw)
+        same = verdict.get("same_paper")
+    except (json.JSONDecodeError, AttributeError):
+        return  # fail-open on parse error
+
+    if same is False:  # explicitly False — confirmed mismatch
+        raise RuntimeError(
+            f"[ingest error: Crossref DOI {doi!r} resolves to a different paper "
+            f"({crossref_title!r} vs {title_hint!r}). "
+            "Please supply the correct DOI and retry.]"
+        )
+    # same is True or None (None = model returned unexpected shape) — proceed
+
+
+# ---------------------------------------------------------------------------
 # Quality gate
 # ---------------------------------------------------------------------------
 
@@ -1157,8 +1251,8 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         doi = None  # fall back to arXiv ID or title-hash key chain
 
     # Step 8: Crossref validation hook (Plan 03)
-    # if config.get("crossref_validate") and doi:
-    #     _crossref_validate(doi, title_hint, config)  # Plan 03 inserts here
+    if config.get("crossref_validate", False) and doi:
+        _crossref_validate(doi, title_hint, config)
 
     # Step 9: Registry check — HARD GATE (D-00b / REG-02)
     # No fill helpers run if the paper is already in the registry.
