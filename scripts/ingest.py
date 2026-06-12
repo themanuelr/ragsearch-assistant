@@ -126,7 +126,20 @@ def _ollama_extraction_call(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
+    except TimeoutError:
+        # Python 3.10+ raises bare TimeoutError (alias of socket.timeout) when the
+        # read deadline fires during resp.read() while the model is still generating.
+        # Without this branch it escapes to main()'s catch-all and aborts the whole
+        # run with empty stdout and no registry write (observed live-UAT defect, Plan 05).
+        # The prefix MUST be distinct from [Ollama error:] — every two-strike consumer
+        # raises RuntimeError on that exact prefix (D-00d unreachable abort), so reusing
+        # it would still abort; [Ollama timeout:] is what lets two-strike fill_failed
+        # degradation absorb timeouts (D-05/D-06).
+        return f"[Ollama timeout: no response within {timeout}s]"
     except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            # connect-phase timeouts wrapped by urllib are also degradable
+            return f"[Ollama timeout: no response within {timeout}s]"
         return f"[Ollama error: {e}]"
     try:
         return data["message"]["content"]
@@ -189,7 +202,7 @@ def _warmup_ollama(model: str = OLLAMA_MODEL) -> None:
     try:
         with urllib.request.urlopen(req, timeout=30):
             pass
-    except urllib.error.URLError:
+    except (urllib.error.URLError, TimeoutError):
         pass  # warm-up is best-effort
 
 
@@ -348,10 +361,13 @@ def _doi_probe(first_page_text: str) -> "DoiProbeResult | None":
         + first_page_text[:3000]    # cap probe input; first page is sufficient
     )
     raw = _ollama_extraction_call(
-        prompt, system, DoiProbeResult.model_json_schema(), num_ctx=4096, timeout=60
+        prompt, system, DoiProbeResult.model_json_schema(), num_ctx=4096, timeout=120
     )
-    if raw.startswith("[Ollama error:"):
-        raise RuntimeError(raw)     # fail-fast: Ollama unreachable
+    if raw.startswith(("[Ollama error:", "[Ollama timeout:")):
+        # A probe timeout (≤3000-char input, num_ctx 4096, warmed model, 120s budget)
+        # means the server is unhealthy. Proceeding probe-less would derive a
+        # garbage title-hash registry key — abort is the safe disposition (T-01.3-14).
+        raise RuntimeError(raw)
     return _parse_extraction_response(raw, DoiProbeResult)
 
 
@@ -391,16 +407,18 @@ def _fill_metadata(first_page_text: str, probe: "DoiProbeResult | None") -> "Pap
     schema = PaperMetadata.model_json_schema()
 
     for attempt in range(2):
-        raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=60)
+        raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=120)
         if raw.startswith("[Ollama error:"):
             raise RuntimeError(raw)
+        if raw.startswith("[Ollama timeout:"):
+            continue  # timeout is a strike — skip JSON-reminder, go to next attempt
         result = _parse_extraction_response(raw, PaperMetadata)
         if result is not None:
             return result
         if attempt == 0:
             prompt += "\n\nIMPORTANT: Return ONLY raw JSON. Do not wrap in code fences."
 
-    # Both attempts failed — fall back to probe hints rather than crashing
+    # Both attempts failed (parse failures or timeouts) — fall back to probe hints rather than crashing
     print("[ingest warning: metadata fill_failed — using probe hints as fallback]", file=sys.stderr)
     return PaperMetadata(
         title=title_hint or "",
@@ -451,10 +469,12 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
         raw = _ollama_extraction_call(
             prompt, system, schema,
             num_ctx=_estimate_num_ctx(section_text),
-            timeout=120,
+            timeout=180,
         )
         if raw.startswith("[Ollama error:"):
             raise RuntimeError(raw)                      # Ollama unreachable → abort pipeline
+        if raw.startswith("[Ollama timeout:"):
+            continue  # timeout is a strike — skip JSON-reminder, go to next attempt
         result = _parse_extraction_response(raw, SectionFillResult)
         if result is not None:
             return result
@@ -499,9 +519,11 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
         result = None
 
         for attempt in range(2):
-            raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=60)
+            raw = _ollama_extraction_call(prompt, system, schema, num_ctx=4096, timeout=120)
             if raw.startswith("[Ollama error:"):
                 raise RuntimeError(raw)
+            if raw.startswith("[Ollama timeout:"):
+                continue  # timeout is a strike — skip JSON-reminder, go to next attempt
             result = _parse_extraction_response(raw, RefBatchResult)
             if result is not None:
                 break
@@ -558,12 +580,12 @@ def _crossref_validate(doi: str, title_hint: str | None, config: dict) -> None:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         print(
             "[ingest warning: crossref unreachable — proceeding with syntactic validation only]",
             file=sys.stderr,
         )
-        return  # D-16: fail-open on network / parse error
+        return  # D-16: fail-open on network / parse error (includes TimeoutError)
 
     # Extract Crossref title; missing key means nothing to compare — fail-open
     try:
@@ -590,7 +612,7 @@ def _crossref_validate(doi: str, title_hint: str | None, config: dict) -> None:
         "Return JSON with a single boolean field: same_paper."
     )
     raw = _ollama_extraction_call(prompt, system, schema, num_ctx=2048, timeout=30)
-    if raw.startswith("[Ollama error:"):
+    if raw.startswith(("[Ollama error:", "[Ollama timeout:")):
         # LLM check unavailable — fail-open (best-effort; DOI is already syntactically valid)
         print(
             "[ingest warning: crossref LLM check unavailable — proceeding]",
