@@ -2186,3 +2186,161 @@ def test_section_timeout_config_flow(tmp_path):
         )
     finally:
         _ingest_mod._SECTION_TIMEOUT = DEFAULT_SECTION_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 07 (gap closure) Task 1: full-text-only probe + prompt de-dup + extraction-only journal_full
+# ---------------------------------------------------------------------------
+
+def test_doi_probe_single_arg_signature():
+    """_doi_probe signature has exactly ONE parameter named 'full_text' (no 'first_page_text') — GAP A."""
+    import inspect
+    import scripts.ingest as _m
+
+    params = list(inspect.signature(_m._doi_probe).parameters)
+    assert params == ["full_text"], (
+        f"Expected _doi_probe to have exactly ['full_text'], got {params!r}"
+    )
+
+    # Single-arg call still returns DoiProbeResult (backward compat)
+    import json as _json
+    mock_resp = _json.dumps({"doi": "10.1021/jacs.3c10258", "arxiv_id": None, "title": "T"})
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        result = _m._doi_probe("some document text")
+    assert result is not None
+    assert result.doi == "10.1021/jacs.3c10258"
+
+
+def test_doi_probe_prompt_no_duplicated_guidance():
+    """Probe guidance lives in SYSTEM only; USER prompt is minimal + doc text — GAP B."""
+    import json as _json
+
+    captured_prompt = []
+    captured_system = []
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_prompt.append(prompt)
+        captured_system.append(system)
+        return _json.dumps({"doi": "10.1021/jacs.3c10258", "arxiv_id": None, "title": "T"})
+
+    from scripts.ingest import _doi_probe
+    doc = "DOC TEXT 10.1021/jacs.3c10258"
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        _doi_probe(doc)
+
+    assert captured_system, "Expected _ollama_extraction_call to be called"
+    assert captured_prompt, "Expected _ollama_extraction_call to be called"
+
+    sys_prompt = captured_system[0]
+    user_prompt = captured_prompt[0]
+
+    # Guidance must be in SYSTEM
+    assert "Supporting Information" in sys_prompt, (
+        f"Expected 'Supporting Information' in SYSTEM prompt, got: {sys_prompt!r}"
+    )
+    assert "Preserve the DOI exactly" in sys_prompt, (
+        f"Expected 'Preserve the DOI exactly' in SYSTEM prompt, got: {sys_prompt!r}"
+    )
+    # "cover page" or "title" still in SYSTEM
+    assert ("cover page" in sys_prompt.lower() or "title" in sys_prompt.lower()), (
+        f"Expected cover/title guidance in SYSTEM prompt, got: {sys_prompt!r}"
+    )
+
+    # Guidance MUST NOT be duplicated in USER prompt
+    assert "Supporting Information" not in user_prompt, (
+        f"Expected 'Supporting Information' NOT in USER prompt, got: {user_prompt!r}"
+    )
+
+    # USER prompt still contains the document text
+    assert doc in user_prompt, (
+        f"Expected document text in USER prompt, got: {user_prompt!r}"
+    )
+
+
+def test_doi_probe_scans_full_text_no_first_page_kwarg():
+    """_doi_probe(full_text=...) with page-3 DOI: prompt contains DOI; no first_page_text kwarg accepted — GAP A+B."""
+    import scripts.ingest as _m
+    from scripts.ingest import _doi_probe, _estimate_num_ctx
+    import json as _json
+
+    captured_prompt = []
+    captured_kwargs = {}
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_prompt.append(prompt)
+        captured_kwargs.update(kwargs)
+        return _json.dumps({"doi": "10.1021/jacs.3c10258", "arxiv_id": None, "title": "T"})
+
+    full_text = "Cover page text only\n" + "page 3 contains: 10.1021/jacs.3c10258"
+    with mock.patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        # Call with full_text only (no first_page_text)
+        _doi_probe(full_text=full_text)
+
+    assert captured_prompt, "Expected _ollama_extraction_call to be called"
+    assert "10.1021/jacs.3c10258" in captured_prompt[0], (
+        f"Expected full_text (with page-3 DOI) in prompt, got: {captured_prompt[0]!r}"
+    )
+    # num_ctx sized input-only (output_ratio defaults to 0.0)
+    expected_ctx = _estimate_num_ctx(full_text)
+    assert captured_kwargs.get("num_ctx") == expected_ctx, (
+        f"Expected num_ctx={expected_ctx} (input-only sizing), got {captured_kwargs.get('num_ctx')}"
+    )
+
+
+def test_fill_metadata_journal_full_extraction_only():
+    """_fill_metadata SYSTEM prompt instructs verbatim-only journal_full; no expand-from-knowledge — GAP C."""
+    import json as _json
+    from scripts.ingest import _fill_metadata, DoiProbeResult
+
+    captured_system = []
+
+    def capture_call(prompt, system, schema, **kwargs):
+        captured_system.append(system)
+        return "[Ollama error: stop]"  # trigger fallback after capture
+
+    probe = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="T")
+    with patch("scripts.ingest._ollama_extraction_call", side_effect=capture_call):
+        _fill_metadata("Trends Chem. text", probe)  # fallback on error — that's fine
+
+    assert captured_system, "Expected _ollama_extraction_call to be called"
+    sys_prompt = captured_system[0]
+
+    # MUST contain verbatim-extraction instruction
+    assert "verbatim" in sys_prompt, (
+        f"Expected 'verbatim' in _fill_metadata SYSTEM prompt, got: {sys_prompt!r}"
+    )
+    # MUST contain null-when-abbreviation-only instruction
+    assert "null" in sys_prompt.lower(), (
+        f"Expected 'null' instruction in _fill_metadata SYSTEM prompt, got: {sys_prompt!r}"
+    )
+    # MUST NOT contain the old expand-from-knowledge example
+    assert "Journal of the American Chemical Society" not in sys_prompt, (
+        f"Expected expand-from-knowledge example REMOVED from SYSTEM prompt, got: {sys_prompt!r}"
+    )
+
+
+def test_fill_metadata_journal_full_null_when_only_abbreviation():
+    """_fill_metadata returns journal_full=None when LLM returns null (abbreviation-only case) — GAP C regression."""
+    import json as _json
+    from scripts.ingest import _fill_metadata, DoiProbeResult
+
+    probe = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Trends Paper")
+    # Model honors the extraction-only prompt: journal is abbreviation, journal_full is null
+    mock_resp = _json.dumps({
+        "title": "Trends Paper",
+        "authors": [],
+        "journal": "Trends Chem.",
+        "journal_full": None,
+        "year": 2023,
+        "doi": "10.1021/jacs.3c10258",
+        "arxiv_id": None,
+    })
+    with mock.patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        result = _fill_metadata("...Trends Chem. ...", probe)
+
+    assert result.journal_full is None, (
+        f"Expected journal_full=None for abbreviation-only case, got {result.journal_full!r}"
+    )
+    assert result.journal == "Trends Chem.", (
+        f"Expected journal='Trends Chem.' (abbreviation as-is), got {result.journal!r}"
+    )
