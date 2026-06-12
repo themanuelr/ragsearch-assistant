@@ -1044,29 +1044,37 @@ def _registry_entry(
 
 def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     """
-    Run the full MinerU → content_list.json → PaperJSON v2 pipeline for one PDF.
+    Run the Phase 1.3 probe → quality-gate → registry-gate → fill cascade for one PDF.
 
-    Fail-fast preflight (D-10): verifies PDF exists and MinerU resolves before
-    launching the subprocess. Returns the assembled PaperJSON v2 dict on success.
-
-    Registry dedup (REG-02): derives the registry key (DOI → arXiv → title-hash)
-    from parsed metadata and returns the cached entry without running MinerU when
-    the paper is already registered (unless force_extract=True).
+    Ordering (D-12, D-00b, D-03, D-04):
+      1. Preflight: PDF exists + MinerU resolves (fail-fast)
+      2. Run-or-reuse MinerU → find + load content_list.json
+      3. Parse content_list → build provenance → assemble minimal skeleton
+      4. Quality gate on skeleton (D-12: garbage PDFs fail before any LLM call)
+      5. Warm-up Ollama (keep_alive="-1" to pin model in VRAM)
+      6. DOI probe on first-page + footer blocks (cheap pre-gate LLM call)
+      7. Syntactic DOI validation (D-00c)
+      8. Crossref validation hook (Plan 03)
+      9. Registry check — HARD GATE: cache hit returns immediately, no fill calls
+     10. Fill cascade (miss path): metadata → per-section → ref batches
+     11. Renditions on LLM-cleaned text (D-10)
+     12. Registry write (atomic, filelock)
+     13. Warn on partial fill; return skeleton
 
     Args:
         pdf_path:      Absolute or relative path to the input PDF.
         config:        Loaded config.json dict (use _load_config()).
-        force_extract: If True, re-run MinerU and re-register even if cached (D-15).
+        force_extract: If True, re-run MinerU and re-register even if cached.
 
     Returns:
         PaperJSON v2 dict (new ingest) OR cached registry entry dict (cache hit).
 
     Raises:
-        SystemExit: On preflight failure, emits [ingest error: ...] and exits non-zero.
+        SystemExit: On preflight failure or quality-gate failure.
     """
     pdf = pathlib.Path(pdf_path).resolve()
 
-    # D-10: fail-fast preflight
+    # Step 1: Preflight — PDF exists + MinerU resolves
     if not pdf.exists():
         print(f"[ingest error: file not found: {pdf_path}]", file=sys.stderr)
         sys.exit(1)
@@ -1079,49 +1087,21 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         )
         sys.exit(1)
 
-    # D-13: persistent output dir per document stem
     out_dir = str(pathlib.Path(".mineru_output") / pdf.stem)
     timeout = int(config.get("mineru_timeout", DEFAULT_TIMEOUT))
     registry_path = os.path.expanduser(config.get("registry_path", ""))
     project_name = config.get("project_name", "")
 
-    # ---------------------------------------------------------------------------
-    # REG-02 dedup: if existing MinerU output is present and force_extract is off,
-    # parse it first to derive the registry key without re-running the GPU step.
-    # On a cache hit, return the cached entry immediately (skips _run_mineru).
-    # ---------------------------------------------------------------------------
-    if not force_extract:
-        try:
-            existing_cl = _find_content_list(out_dir)
-            # Fast path: parse existing output to derive registry key (no GPU re-run)
-            with open(existing_cl, encoding="utf-8") as f:
-                existing_blocks = json.load(f)
-            fast_parsed = _parse_content_list(existing_blocks)
-            fast_metadata = fast_parsed.get("metadata", {})
-            reg_key = _registry_key(fast_metadata)
-            cached = _check_registry(reg_key, registry_path)
-            if cached is not None:
-                # Cache hit: return the cached registry entry (REG-02 satisfied)
-                return cached
-            # Cache miss: fall through to _run_mineru (which will reuse existing output)
-        except RuntimeError:
-            pass  # No existing output — proceed with _run_mineru (GPU step required)
-        except (OSError, json.JSONDecodeError):
-            pass  # Corrupt output — fall through to full re-run
-    # ---------------------------------------------------------------------------
-
-    # Run or reuse MinerU (GPU step — skipped on cache hit above)
+    # Step 2: Run-or-reuse MinerU → find + load content_list.json
     try:
         _run_mineru(str(pdf), out_dir, mineru_exe, timeout, force_extract)
     except subprocess.TimeoutExpired:
-        # T-01.2-02: emit bracketed error on timeout
         print(f"[ingest error: mineru timed out after {timeout}s]", file=sys.stderr)
         sys.exit(1)
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
 
-    # Find and load content_list.json
     try:
         cl_path = _find_content_list(out_dir)
     except RuntimeError as e:
@@ -1132,47 +1112,118 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         with open(cl_path, encoding="utf-8") as f:
             blocks = json.load(f)
     except (OSError, json.JSONDecodeError) as e:
-        # T-01.2-04: bracketed error on parse failure
         print(f"[ingest error: failed to load content_list.json: {e}]", file=sys.stderr)
         sys.exit(1)
 
-    # Parse and assemble
+    # Step 3: Parse → provenance → minimal skeleton
     parsed = _parse_content_list(blocks)
 
-    # Build provenance
     pdf_sha256 = hashlib.sha256(pdf.read_bytes()).hexdigest()
     provenance = {
         "pdf_sha256": pdf_sha256,
         "source_filename": pdf.name,
-        "mineru_version": None,     # resolved from MinerU output in Plan 02
+        "mineru_version": None,
         "backend": MINERU_BACKEND,
         "extracted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "normalizations_applied": ["ligature_fix", "llm_fill"],
         "schema_version": SCHEMA_VERSION,
     }
 
-    result = _assemble_paperjson(parsed, provenance)
+    skeleton = _assemble_paperjson(parsed, provenance)
 
-    # D-11: INGEST-03 garbage-output quality gate
-    gate_error = _quality_gate(result)
+    # Step 4: Quality gate — runs on MinerU output BEFORE any LLM call (D-12)
+    gate_error = _quality_gate(skeleton)
     if gate_error:
         print(gate_error, file=sys.stderr)
         sys.exit(1)
 
-    # ---------------------------------------------------------------------------
-    # REG-01: write extraction-only registry entry for new (or force-re-ingested) paper
-    # ---------------------------------------------------------------------------
+    # Step 5: Warm up Ollama to pin gemma4:e4b in VRAM for the full run (D-00d / Pattern 4)
+    _warmup_ollama()
+
+    # Step 6: DOI probe — cheap first LLM call on first-page + footer blocks (D-03, D-04)
+    first_page_text = _extract_first_page_and_footers(blocks)
+    try:
+        probe = _doi_probe(first_page_text)
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+
+    doi = probe.doi if probe else None
+    arxiv_id = probe.arxiv_id if probe else None
+    title_hint = probe.title if probe else None
+
+    # Step 7: Syntactic DOI validation — never use a malformed DOI as registry key (D-00c)
+    if doi and not _syntactic_doi_valid(doi):
+        doi = None  # fall back to arXiv ID or title-hash key chain
+
+    # Step 8: Crossref validation hook (Plan 03)
+    # if config.get("crossref_validate") and doi:
+    #     _crossref_validate(doi, title_hint, config)  # Plan 03 inserts here
+
+    # Step 9: Registry check — HARD GATE (D-00b / REG-02)
+    # No fill helpers run if the paper is already in the registry.
+    registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": title_hint})
+    cached = _check_registry(registry_key, registry_path)
+    if cached is not None and not force_extract:
+        return cached  # cache hit: return immediately, zero fill calls
+
+    # Steps 10–12 (miss path): fill → renditions → registry write
+    failed_count = 0
+
+    # Step 10a: Metadata fill (one call post-miss)
+    try:
+        metadata = _fill_metadata(first_page_text, probe)
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+    skeleton["extraction"]["metadata"] = metadata.model_dump()
+
+    # Step 10b: Per-section fill (one call per section, two-strike, D-01)
+    try:
+        for i, section in enumerate(skeleton["extraction"]["sections"]):
+            # Derive raw section text from existing block display/plain content
+            raw_parts = []
+            for blk in section.get("blocks", []):
+                if blk.get("type") == "text":
+                    raw_parts.append(blk.get("display") or blk.get("plain") or "")
+            raw_section_text = "\n".join(raw_parts)
+            heading = section.get("heading") or f"Section {i}"
+            fill_result = _fill_section(raw_section_text, heading)
+            skeleton["extraction"]["sections"][i]["body"] = fill_result.body
+            skeleton["extraction"]["sections"][i]["fill_failed"] = fill_result.fill_failed
+            if fill_result.fill_failed:
+                failed_count += 1
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 10c: Ref batch fill (~10 per batch, D-02)
+    try:
+        refs, ref_failures = _fill_references_batched(parsed.get("references", []))
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+    skeleton["extraction"]["references"] = refs
+    failed_count += ref_failures
+
+    # Step 11: Renditions — run on LLM-cleaned body text (D-10)
+    # _build_display / _build_plain already applied during block routing;
+    # the section body from LLM fill replaces the concatenated block text.
+    # No additional rendition pass is required here — the body IS the cleaned text.
+
+    # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
     if registry_path:
-        meta = result.get("extraction", {}).get("metadata", {})
-        reg_key = _registry_key(meta)
-        entry = _registry_entry(result, str(pdf), "", project_name)
+        entry = _registry_entry(skeleton, str(pdf), "", project_name)
         try:
-            _write_registry(entry, registry_path, reg_key)
+            _write_registry(entry, registry_path, registry_key)
         except Exception as e:
-            # Registry write failure is non-fatal — log and continue
             print(f"[ingest warning: registry write failed: {e}]", file=sys.stderr)
 
-    return result
+    # Step 13: Warn on partial fill, return skeleton
+    if failed_count > 0:
+        print(f"[ingest warning: {failed_count} sections/batches unfilled]", file=sys.stderr)
+
+    return skeleton
 
 
 # ---------------------------------------------------------------------------

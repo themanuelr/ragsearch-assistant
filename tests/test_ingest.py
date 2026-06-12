@@ -486,27 +486,37 @@ def _make_ingest_config(tmp_path, extra=None):
 
 
 def _write_real_content_list(tmp_path):
-    """Write a minimal real content_list.json to tmp_path for tests that need file I/O."""
+    """Write a minimal real content_list.json to tmp_path for tests that need file I/O.
+
+    The content must pass the quality gate (title + text >= 100 chars).
+    """
     cl_path = tmp_path / "content_list.json"
     blocks = [
         {"type": "text", "text": "Paper Title", "text_level": 1, "page_idx": 0},
-        {"type": "text", "text": "X" * 200, "text_level": None, "page_idx": 1},
+        # Ensure enough text to pass the quality gate (threshold=100 chars of plain text)
+        {"type": "text", "text": "X" * 200, "text_level": None, "page_idx": 0},
     ]
     cl_path.write_text(json.dumps(blocks), encoding="utf-8")
     return str(cl_path)
 
 
 def test_dedup_skip_returns_cached(tmp_path):
-    """When key is already in registry, ingest() returns cached entry without calling _run_mineru."""
-    from scripts.ingest import ingest, _write_registry
+    """When DOI probe key is already in registry, ingest() returns cached entry (REG-02).
+
+    Phase 1.3: _run_mineru always runs (MinerU before probe); registry gate is now
+    DOI-probe-gated rather than metadata-parse-gated. Fill helpers must not be called.
+    """
+    from scripts.ingest import ingest, _write_registry, DoiProbeResult
 
     cfg = _make_ingest_config(tmp_path)
     reg_path = cfg["registry_path"]
 
-    # Pre-populate the registry with the paper's DOI key
+    # Pre-populate the registry with the probe-derived DOI key.
+    # Use proper 4+ digit registrant prefix to survive _syntactic_doi_valid and DoiProbeResult validator.
+    doi_key = "10.1000/dedup.test"
     cached = {
         "title": "A Great Paper Title",
-        "doi": "10.1/dedup-test",
+        "doi": doi_key,
         "projects": ["other-project"],
         "summary": None,
         "key_findings": None,
@@ -517,9 +527,8 @@ def test_dedup_skip_returns_cached(tmp_path):
         "source_path": "/old/paper.pdf",
         "paperjson_path": "/old/paper.json",
     }
-    _write_registry(cached, reg_path, "10.1/dedup-test")
+    _write_registry(cached, reg_path, doi_key)
 
-    # Create a fake PDF file (non-empty so file-exists check passes)
     fake_pdf = tmp_path / "paper.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 fake content for hash")
     cl_path = _write_real_content_list(tmp_path)
@@ -528,7 +537,8 @@ def test_dedup_skip_returns_cached(tmp_path):
         "title": "A Great Paper Title",
         "sections": [{"heading": "", "level": 0, "blocks": [
             {"type": "text", "display": "A Great Paper Title", "plain": "A Great Paper Title"},
-            {"type": "text", "display": "DOI 10.1/dedup-test details.", "plain": "DOI 10.1/dedup-test details."},
+            # Enough text to pass quality gate (>= 100 chars total plain text)
+            {"type": "text", "display": "X" * 200, "plain": "X" * 200},
         ]}],
         "references": [],
         "metadata": {
@@ -536,22 +546,29 @@ def test_dedup_skip_returns_cached(tmp_path):
             "authors": None,
             "year": None,
             "journal": None,
-            "doi": "10.1/dedup-test",
+            "doi": doi_key,
             "arxiv_id": None,
             "accession_codes": [],
         },
     }
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id=None, title="A Great Paper Title")
 
-    # _run_mineru raises if called — should NOT be called on cache hit
-    with mock.patch("scripts.ingest._run_mineru", side_effect=AssertionError("_run_mineru called on cache hit")), \
+    # Phase 1.3: _run_mineru runs (MinerU always runs before probe); fill helpers must NOT be called
+    with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata",
+                    side_effect=AssertionError("_fill_metadata must not be called on cache hit")), \
+         mock.patch("scripts.ingest._fill_section",
+                    side_effect=AssertionError("_fill_section must not be called on cache hit")), \
+         mock.patch("scripts.ingest._fill_references_batched",
+                    side_effect=AssertionError("_fill_references_batched must not be called on cache hit")):
         result = ingest(str(fake_pdf), cfg)
 
-    # On cache hit, result should be the cached registry entry (not a full PaperJSON)
     assert result is not None, "Expected a result from ingest() on cache hit"
-    # The result must contain the cached paper's title
     assert result.get("title") == "A Great Paper Title" or (
         result.get("extraction", {}).get("metadata", {}).get("title") == "A Great Paper Title"
     ), f"Expected cached entry returned, got: {result}"
@@ -559,7 +576,7 @@ def test_dedup_skip_returns_cached(tmp_path):
 
 def test_new_paper_writes_entry(tmp_path):
     """Ingesting a not-yet-registered paper calls _write_registry once and the key appears."""
-    from scripts.ingest import ingest, _read_registry
+    from scripts.ingest import ingest, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
 
     cfg = _make_ingest_config(tmp_path)
     reg_path = cfg["registry_path"]
@@ -580,21 +597,29 @@ def test_new_paper_writes_entry(tmp_path):
             "authors": None,
             "year": 2024,
             "journal": None,
-            "doi": "10.1/new-paper",
+            "doi": "10.1000/new.paper",
             "arxiv_id": None,
             "accession_codes": [],
         },
     }
+    probe_result = DoiProbeResult(doi="10.1000/new.paper", arxiv_id=None, title="New Paper")
+    metadata_result = PaperMetadata(title="New Paper", doi="10.1000/new.paper", year=2024)
+    section_fill = SectionFillResult(heading="", body="New Paper " + "A" * 200, fill_failed=False)
 
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
         ingest(str(fake_pdf), cfg)
 
     registry = _read_registry(reg_path)
-    assert "10.1/new-paper" in registry, (
-        f"Expected DOI key '10.1/new-paper' in registry after new ingest, got keys: {list(registry.keys())}"
+    assert "10.1000/new.paper" in registry, (
+        f"Expected DOI key '10.1000/new.paper' in registry after new ingest, got keys: {list(registry.keys())}"
     )
 
 
@@ -608,7 +633,7 @@ def test_force_extract_bypasses_cache(tmp_path):
     # Pre-populate registry
     old_entry = {
         "title": "Old Entry",
-        "doi": "10.1/force-test",
+        "doi": "10.1000/force.test",
         "projects": ["old-project"],
         "summary": None, "key_findings": None,
         "authors": None, "year": 2020, "journal": None,
@@ -616,7 +641,7 @@ def test_force_extract_bypasses_cache(tmp_path):
         "source_path": "/old.pdf",
         "paperjson_path": "/old.json",
     }
-    _write_registry(old_entry, reg_path, "10.1/force-test")
+    _write_registry(old_entry, reg_path, "10.1000/force.test")
 
     fake_pdf = tmp_path / "paper.pdf"
     fake_pdf.write_bytes(b"%PDF-1.4 force extract fake")
@@ -634,11 +659,16 @@ def test_force_extract_bypasses_cache(tmp_path):
             "authors": None,
             "year": 2024,
             "journal": None,
-            "doi": "10.1/force-test",
+            "doi": "10.1000/force.test",
             "arxiv_id": None,
             "accession_codes": [],
         },
     }
+
+    from scripts.ingest import DoiProbeResult, PaperMetadata, SectionFillResult
+    probe_result = DoiProbeResult(doi="10.1000/force.test", arxiv_id=None, title="Updated Paper")
+    metadata_result = PaperMetadata(title="Updated Paper", doi="10.1000/force.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="Updated Paper " + "B" * 200, fill_failed=False)
 
     mineru_called = []
 
@@ -648,7 +678,12 @@ def test_force_extract_bypasses_cache(tmp_path):
     with mock.patch("scripts.ingest._run_mineru", side_effect=fake_mineru), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
         result = ingest(str(fake_pdf), cfg, force_extract=True)
 
     # _run_mineru must have been called (force_extract bypasses cache)
@@ -656,10 +691,10 @@ def test_force_extract_bypasses_cache(tmp_path):
 
     # Registry should be updated with the new entry
     registry = _read_registry(reg_path)
-    assert "10.1/force-test" in registry, "Expected key to exist in registry after force re-ingest"
+    assert "10.1000/force.test" in registry, "Expected key to exist in registry after force re-ingest"
     # The new entry's year should be updated (2024 not 2020)
-    assert registry["10.1/force-test"].get("year") == 2024, (
-        f"Expected updated year 2024 after force re-ingest, got {registry['10.1/force-test'].get('year')}"
+    assert registry["10.1000/force.test"].get("year") == 2024, (
+        f"Expected updated year 2024 after force re-ingest, got {registry['10.1000/force.test'].get('year')}"
     )
 
 
@@ -686,26 +721,37 @@ def test_reg01_entry_written_on_new_ingest(tmp_path):
             "authors": None,
             "year": 2024,
             "journal": "Test Journal",
-            "doi": "10.1/reg01test",
+            "doi": "10.1000/reg01.test",
             "arxiv_id": None,
             "accession_codes": [],
         },
     }
 
+    from scripts.ingest import DoiProbeResult, PaperMetadata, SectionFillResult
+    probe_result = DoiProbeResult(doi="10.1000/reg01.test", arxiv_id=None, title="REG-01 Test Paper")
+    metadata_result = PaperMetadata(title="REG-01 Test Paper", doi="10.1000/reg01.test", year=2024, journal="Test Journal")
+    section_fill = SectionFillResult(heading="", body="REG-01 Test Paper " + "C" * 200, fill_failed=False)
+
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
-         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"):
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
         ingest(str(fake_pdf), cfg)
 
     registry = _read_registry(reg_path)
-    assert "10.1/reg01test" in registry, "Expected registry to contain the new paper's DOI key"
-    entry = registry["10.1/reg01test"]
+    assert "10.1000/reg01.test" in registry, "Expected registry to contain the new paper's DOI key"
+    entry = registry["10.1000/reg01.test"]
+    # title comes from the LLM fill (PaperMetadata), which is written into skeleton metadata
     assert entry.get("title") == "REG-01 Test Paper", (
         f"Expected title 'REG-01 Test Paper', got {entry.get('title')!r}"
     )
-    assert entry.get("doi") == "10.1/reg01test", (
-        f"Expected doi '10.1/reg01test', got {entry.get('doi')!r}"
+    assert entry.get("doi") == "10.1000/reg01.test", (
+        f"Expected doi '10.1000/reg01.test', got {entry.get('doi')!r}"
     )
 
 
@@ -1046,11 +1092,12 @@ def _make_ingest_config_with_probe(tmp_path, extra=None):
 
 
 def _write_content_list_for_probe(tmp_path, title="Paper Title"):
-    """Write a minimal content_list.json with first-page blocks for probe input."""
+    """Write a minimal content_list.json with enough content to pass the quality gate."""
     cl_path = tmp_path / "content_list.json"
     blocks = [
         {"type": "text", "text": title, "text_level": 1, "page_idx": 0},
-        {"type": "text", "text": "X" * 200, "text_level": None, "page_idx": 1},
+        # Enough text on page 0 so quality gate passes (threshold=100 chars plain text)
+        {"type": "text", "text": "X" * 200, "text_level": None, "page_idx": 0},
     ]
     cl_path.write_text(json.dumps(blocks), encoding="utf-8")
     return str(cl_path)
@@ -1063,8 +1110,9 @@ def test_ingest_cache_hit_doi_probe_skips_fill(tmp_path):
     cfg = _make_ingest_config_with_probe(tmp_path)
     reg_path = cfg["registry_path"]
 
-    # Pre-populate registry with the probe-derived key
-    doi_key = "10.1/probe-dedup-test"
+    # Pre-populate registry with the probe-derived key.
+    # DOI must use proper 4+ digit registrant prefix to survive _syntactic_doi_valid.
+    doi_key = "10.1000/probe.dedup.test"
     cached_entry = {
         "title": "Cached Paper Title",
         "doi": doi_key,
@@ -1120,11 +1168,11 @@ def test_ingest_normalizations_applied_llm_fill(tmp_path):
         "metadata": {
             "title": "Norms Paper",
             "authors": None, "year": 2024, "journal": None,
-            "doi": "10.1/norms-paper", "arxiv_id": None, "accession_codes": [],
+            "doi": "10.1000/norms.paper", "arxiv_id": None, "accession_codes": [],
         },
     }
-    probe_result = DoiProbeResult(doi="10.1/norms-paper", arxiv_id=None, title="Norms Paper")
-    metadata_result = PaperMetadata(title="Norms Paper", doi="10.1/norms-paper")
+    probe_result = DoiProbeResult(doi="10.1000/norms.paper", arxiv_id=None, title="Norms Paper")
+    metadata_result = PaperMetadata(title="Norms Paper", doi="10.1000/norms.paper")
     section_fill = SectionFillResult(heading="Abstract", body="Cleaned abstract", fill_failed=False)
 
     with mock.patch("scripts.ingest._run_mineru"), \
