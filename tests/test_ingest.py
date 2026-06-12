@@ -2468,4 +2468,298 @@ def test_fill_section_oversize_guard_echo_aware():
     with patch("scripts.ingest._ollama_extraction_call", side_effect=AssertionError("LLM must not be called")):
         result = _fill_section(huge_text, "Huge Section")
     assert result.fill_failed is True, "Expected fill_failed=True for oversize section"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 08 (gap closure) Task 1: LLM-judge section filtering
+# ---------------------------------------------------------------------------
+
+def _make_two_section_parsed(substantive_heading="INTRODUCTION", noise_heading="ACKNOWLEDGMENTS"):
+    """Build a minimal _parse_content_list result with two sections for filtering tests."""
+    return {
+        "title": "Test Paper Title Long Enough",
+        "sections": [
+            {
+                "heading": substantive_heading,
+                "level": 1,
+                "blocks": [
+                    {"type": "text", "display": "We present results. " * 12, "plain": "We present results. " * 12},
+                ],
+            },
+            {
+                "heading": noise_heading,
+                "level": 1,
+                "blocks": [
+                    {"type": "text", "display": "The authors thank funding agencies.", "plain": "The authors thank funding agencies."},
+                ],
+            },
+        ],
+        "references": [],
+        "metadata": {
+            "title": "Test Paper Title Long Enough",
+            "authors": None, "year": 2024, "journal": None,
+            "doi": "10.1000/filter.test", "arxiv_id": None, "accession_codes": [],
+        },
+    }
+
+
+def test_section_fill_result_keep_defaults_true():
+    """SectionFillResult.keep defaults True; explicit False sets it False (Plan 08 T1)."""
+    from scripts.ingest import SectionFillResult
+    assert SectionFillResult(heading="H", body="b").keep is True, (
+        "Expected keep=True by default (conservative retain)"
+    )
+    assert SectionFillResult(heading="H", body="b", keep=False).keep is False, (
+        "Expected keep=False when explicitly set"
+    )
+
+
+def test_section_keep_true_retained(tmp_path):
+    """A section the mock marks keep=True is present in result extraction sections (Plan 08 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 keep=true retained test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "ACKNOWLEDGMENTS")
+    probe_result = DoiProbeResult(doi="10.1000/filter.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/filter.test", year=2024)
+
+    def fill_side_effect(section_text, heading):
+        return SectionFillResult(heading=heading, body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_side_effect), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "INTRODUCTION" in headings, (
+        f"Expected 'INTRODUCTION' (keep=True) in output sections, got headings: {headings}"
+    )
+    assert "ACKNOWLEDGMENTS" in headings, (
+        f"Expected 'ACKNOWLEDGMENTS' (keep=True) in output sections, got headings: {headings}"
+    )
+
+
+def test_section_keep_false_dropped_from_output(tmp_path):
+    """A section the mock marks keep=False is NOT in result extraction sections (Plan 08 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 keep=false dropped test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "ACKNOWLEDGMENTS")
+    probe_result = DoiProbeResult(doi="10.1000/filter.test2", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/filter.test2", year=2024)
+
+    def fill_side_effect(section_text, heading):
+        keep = heading != "ACKNOWLEDGMENTS"
+        return SectionFillResult(heading=heading, body=section_text + " [cleaned]", fill_failed=False, keep=keep)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_side_effect), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "ACKNOWLEDGMENTS" not in headings, (
+        f"Expected 'ACKNOWLEDGMENTS' (keep=False) dropped from output, got headings: {headings}"
+    )
+    assert "INTRODUCTION" in headings, (
+        f"Expected 'INTRODUCTION' (keep=True) retained in output, got headings: {headings}"
+    )
+
+
+def test_fill_failed_section_always_retained(tmp_path):
+    """A section with fill_failed=True (keep defaults True) is ALWAYS retained in output (Plan 08 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fill_failed always retained test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("RESULTS", "NOISE_SECTION")
+    probe_result = DoiProbeResult(doi="10.1000/filter.test3", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/filter.test3", year=2024)
+
+    def fill_side_effect(section_text, heading):
+        # fill_failed=True means no verdict — keep defaults True → always retain
+        return SectionFillResult(heading=heading, body=section_text, fill_failed=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_side_effect), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "RESULTS" in headings, (
+        f"Expected fill_failed section 'RESULTS' retained in output, got headings: {headings}"
+    )
+    assert "NOISE_SECTION" in headings, (
+        f"Expected fill_failed section 'NOISE_SECTION' retained in output (fill_failed=True always retain), got headings: {headings}"
+    )
+    # Verify fill_failed is carried through
+    for s in result["extraction"]["sections"]:
+        assert s["fill_failed"] is True, (
+            f"Expected fill_failed=True carried in output section {s['heading']!r}"
+        )
+
+
+def test_section_filter_logs_drop_count(tmp_path, capsys):
+    """After an ingest() run that drops >=1 section, stderr has a timestamped section filter summary (Plan 08 T1)."""
+    import re as _re
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 section filter log test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "ACKNOWLEDGMENTS")
+    probe_result = DoiProbeResult(doi="10.1000/filter.log.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/filter.log.test", year=2024)
+
+    def fill_side_effect(section_text, heading):
+        keep = heading != "ACKNOWLEDGMENTS"
+        return SectionFillResult(heading=heading, body=section_text + " [cleaned]", fill_failed=False, keep=keep)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_side_effect), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    captured = capsys.readouterr()
+    assert _re.search(
+        r"\[ingest \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] section filter: kept \d+, dropped \d+",
+        captured.err,
+    ), (
+        f"Expected timestamped 'section filter: kept N, dropped M' in stderr, got: {captured.err!r}"
+    )
+
+
+def test_output_sections_have_no_keep_key(tmp_path):
+    """Every section dict in result extraction has keys exactly {heading, body, fill_failed} — no 'keep' leak (Plan 08 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 no keep key in output test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1000/no.keep.key", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/no.keep.key", year=2024)
+
+    def fill_side_effect(section_text, heading):
+        return SectionFillResult(heading=heading, body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_side_effect), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    for i, section in enumerate(result["extraction"]["sections"]):
+        assert set(section.keys()) == {"heading", "body", "fill_failed"}, (
+            f"Section {i} has unexpected keys: {set(section.keys())} — expected exactly {{heading, body, fill_failed}}"
+        )
+
+
+def test_abstract_empty_heading_relabel(tmp_path):
+    """A kept section with empty heading relabeled to 'Abstract' by the model appears correctly; 'INTRODUCTION' heading is unchanged (Plan 08 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 abstract relabel test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    # Two sections: one with empty heading (abstract), one with existing heading
+    mock_parsed = {
+        "title": "Test Paper Title Long Enough",
+        "sections": [
+            {
+                "heading": "",
+                "level": 0,
+                "blocks": [
+                    {"type": "text", "display": "We present an abstract. " * 10, "plain": "We present an abstract. " * 10},
+                ],
+            },
+            {
+                "heading": "INTRODUCTION",
+                "level": 1,
+                "blocks": [
+                    {"type": "text", "display": "This paper introduces. " * 10, "plain": "This paper introduces. " * 10},
+                ],
+            },
+        ],
+        "references": [],
+        "metadata": {
+            "title": "Test Paper Title Long Enough",
+            "authors": None, "year": 2024, "journal": None,
+            "doi": "10.1000/relabel.test", "arxiv_id": None, "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/relabel.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/relabel.test", year=2024)
+
+    def fill_side_effect(section_text, heading):
+        # Model relabels empty heading to "Abstract"; does NOT rename "INTRODUCTION"
+        if not heading or heading.startswith("Section "):
+            return SectionFillResult(heading="Abstract", body=section_text + " [cleaned]", fill_failed=False, keep=True)
+        return SectionFillResult(heading=heading, body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_side_effect), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "Abstract" in headings, (
+        f"Expected 'Abstract' (relabeled from empty heading) in output sections, got: {headings}"
+    )
+    assert "INTRODUCTION" in headings, (
+        f"Expected 'INTRODUCTION' (unchanged existing heading) in output sections, got: {headings}"
+    )
     assert result.body == huge_text
