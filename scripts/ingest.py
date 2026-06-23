@@ -148,6 +148,9 @@ class RefEntry(BaseModel):
     title: str | None = None
     year: int | None = None
     fill_failed: bool = False
+    is_reference: bool = True  # LLM's "is this a genuine bibliographic reference?" verdict; default True
+    # so any parse/fill failure or missing verdict CONSERVATIVELY RETAINS the entry — never silently
+    # drop a reference on uncertainty (mirrors Plan 08's SectionFillResult.keep default)
 
 
 class RefBatchResult(BaseModel):
@@ -668,10 +671,32 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
         "You are a reference parser for scientific papers. "
         "For each reference string, extract the number, DOI, title, and year if present. "
         "Set fields to null if not found. Do not invent values. "
-        "Return ONLY valid JSON matching the schema."
+        "Return ONLY valid JSON matching the schema.\n\n"
+        # Format-agnostic numbering: the reference ordinal may appear in any of these styles at the
+        # START of the string: (1) parenthesized, 1. period-delimited, [1] bracket, or a bare leading
+        # '1 ' followed by the author. Read whichever leading list marker / ordinal is present and
+        # return that integer in `number`. NEVER use an inline parenthetical number — a publication
+        # year like (2005), a volume/issue like 12 (12), or a page range — as the `number` value.
+        # If no leading ordinal is present at the start of the string, set `number` to null.\n\n
+        # Reference-vs-footnote judgment: also set `is_reference` to decide whether each string is
+        # a genuine bibliographic reference (is_reference=true) or a non-reference footnote that
+        # leaked into the list — an author/affiliation block, a corresponding-author line, an email
+        # address, a lab or department postal address, an ORCID or funding fragment, or any line
+        # that is clearly not a citation (is_reference=false). Set is_reference=true for real
+        # bibliography entries; set is_reference=false for affiliation/footnote lines.
+        "The reference number (`number`) is the ordinal at the START of the string. "
+        "It may be written as (1), 1., [1], or a bare leading '1 '. "
+        "Read the leading list marker and return that integer. "
+        "NEVER use an inline parenthetical — a year like (2005) or volume like 12 (12) — as `number`. "
+        "If no leading ordinal is present, set `number` to null.\n"
+        "Also set `is_reference`: true for genuine bibliography entries; false for "
+        "affiliation/corresponding-author blocks, email lines, lab/department addresses, "
+        "ORCID/funding fragments, or any non-citation line."
     )
     filled: list = []
     failures = 0
+    kept_count = 0
+    dropped_count = 0
     total_batches = (len(raw_refs) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for i in range(0, len(raw_refs), BATCH_SIZE):
@@ -705,14 +730,26 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
                 prompt += "\n\nIMPORTANT: Return ONLY raw JSON. Do not wrap in code fences."
 
         if result is not None:
-            filled.extend(r.model_dump() for r in result.refs)
+            # Filter: drop ONLY entries with an explicit is_reference=False from a SUCCESSFUL parse.
+            # Conservative default (mirrors Plan 08's keep=True): fill_failed/uncertain always retained.
+            # is_reference key MUST NOT reach the output — excluded via model_dump(exclude=...).
+            for r in result.refs:
+                if r.is_reference is False and r.fill_failed is False:
+                    # Explicit is_reference=false from a successful parse → drop (non-reference footnote)
+                    dropped_count += 1
+                else:
+                    # Keep: is_reference=true, or uncertain/missing verdict (defaults True) — always retain
+                    filled.append(r.model_dump(exclude={"is_reference"}))
+                    kept_count += 1
         else:
-            # Both attempts failed — flag each ref in batch as fill_failed
+            # Both attempts failed — flag each ref in batch as fill_failed (no verdict → always retain)
             failures += 1
             for ref in batch:
                 raw_str = ref.get("raw", str(ref)) if isinstance(ref, dict) else str(ref)
-                filled.append(RefEntry(raw=raw_str, fill_failed=True).model_dump())
+                filled.append(RefEntry(raw=raw_str, fill_failed=True).model_dump(exclude={"is_reference"}))
+                kept_count += 1
 
+    _log(f"reference filter: kept {kept_count}, dropped {dropped_count}")
     return filled, failures
 
 
