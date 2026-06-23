@@ -3391,3 +3391,231 @@ def test_ingest_journal_fallback_noop_when_full_also_missing(tmp_path):
     assert meta["journal"] is None, (
         f"Expected journal=None when both journal and journal_full are None, got {meta['journal']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 09 (gap closure) Task 3: section heading recovery (GAP E)
+# ---------------------------------------------------------------------------
+
+def _make_single_section_parsed(heading="", body_text=None):
+    """Build a minimal _parse_content_list result with one section for heading-recovery tests."""
+    if body_text is None:
+        body_text = "This paper presents a systematic study. " * 15
+    return {
+        "title": "Test Paper Title Long Enough",
+        "sections": [
+            {
+                "heading": heading,
+                "level": 0,
+                "blocks": [
+                    {"type": "text", "display": body_text, "plain": body_text},
+                ],
+            },
+        ],
+        "references": [],
+        "metadata": {
+            "title": "Test Paper Title Long Enough",
+            "authors": None, "year": 2024, "journal": None,
+            "doi": "10.1000/heading.test", "arxiv_id": None, "accession_codes": [],
+        },
+    }
+
+
+def test_empty_heading_passed_raw_to_fill_section(tmp_path):
+    """ingest() passes the raw empty string to _fill_section for a missing-heading section (Plan 09 T3)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 raw heading passthrough test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_single_section_parsed(heading="")
+    probe_result = DoiProbeResult(doi="10.1000/heading.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/heading.test", year=2024)
+
+    captured_headings = []
+
+    def fill_spy(section_text, heading):
+        captured_headings.append(heading)
+        return SectionFillResult(heading="Abstract", body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_spy), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    assert len(captured_headings) == 1, f"Expected 1 _fill_section call, got {len(captured_headings)}"
+    assert captured_headings[0] == "", (
+        f"Expected empty string '' passed to _fill_section (not 'Section 0'), "
+        f"got {captured_headings[0]!r}"
+    )
+
+
+def test_empty_heading_last_resort_section_n(tmp_path):
+    """When model returns empty heading from fill, output falls back to 'Section 0' (last-resort) (Plan 09 T3)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 last resort section n test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_single_section_parsed(heading="")
+    probe_result = DoiProbeResult(doi="10.1000/heading.test2", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/heading.test2", year=2024)
+
+    def fill_returns_empty(section_text, heading):
+        # Model gave no relabel — returns empty heading
+        return SectionFillResult(heading="", body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_returns_empty), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert headings == ["Section 0"], (
+        f"Expected ['Section 0'] as last-resort fallback, got {headings!r}"
+    )
+
+
+def test_section_n_log_label_preserved(tmp_path, capsys):
+    """_log progress line for an empty-heading section still shows a non-blank label (Plan 09 T3)."""
+    import re as _re
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 log label test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_single_section_parsed(heading="")
+    probe_result = DoiProbeResult(doi="10.1000/heading.test3", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/heading.test3", year=2024)
+    section_fill = SectionFillResult(heading="Abstract", body="abstract text " * 10, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    captured = capsys.readouterr()
+    # The log label should be "Section 0" (non-blank), not an empty string
+    assert _re.search(
+        r"\[ingest [\d-]+ [\d:]+\] section fill 1/1: 'Section 0'",
+        captured.err,
+    ), (
+        f"Expected log label 'Section 0' (non-blank) for empty-heading section, got: {captured.err!r}"
+    )
+
+
+def test_fill_section_relabels_placeholder_headings(tmp_path):
+    """A section with placeholder heading whose fill returns a real heading is preserved in output (Plan 09 T3)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 placeholder heading relabel test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    # Section heading is "N/A" (placeholder from out2)
+    mock_parsed = _make_single_section_parsed(heading="N/A")
+    probe_result = DoiProbeResult(doi="10.1000/placeholder.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/placeholder.test", year=2024)
+
+    def fill_relabels(section_text, heading):
+        # Model relabels "N/A" to "Introduction" by reading the body
+        return SectionFillResult(heading="Introduction", body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_relabels), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "Introduction" in headings, (
+        f"Expected 'Introduction' (relabeled from 'N/A') in output sections, got {headings!r}"
+    )
+    assert "N/A" not in headings, (
+        f"Expected 'N/A' not in output sections (should be relabeled), got {headings!r}"
+    )
+
+
+def test_fill_section_prompt_widened_relabel():
+    """_fill_section source shows the widened relabel covers placeholder/junk headings (Plan 09 T3)."""
+    import inspect
+    from scripts.ingest import _fill_section
+
+    source = inspect.getsource(_fill_section)
+    # Must mention placeholder/junk headings in the relabel instruction
+    assert "placeholder" in source.lower() or "N/A" in source, (
+        "Expected placeholder or N/A mentioned in _fill_section relabel instruction"
+    )
+    # Must mention Section N style
+    assert "Section" in source, "Expected 'Section' mentioned in relabel instruction"
+    # Must still protect recognizable section names
+    assert "recognizable" in source.lower() or "Introduction" in source, (
+        "Expected recognizable section names protected in relabel instruction"
+    )
+
+
+def test_legit_heading_not_renamed(tmp_path):
+    """A section with a recognizable heading (INTRODUCTION/RESULTS) is NOT renamed (Plan 09 T3)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 legit heading preserved test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1000/legit.heading", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/legit.heading", year=2024)
+
+    def fill_preserves(section_text, heading):
+        # Model does NOT rename recognizable headings
+        return SectionFillResult(heading=heading, body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_preserves), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "INTRODUCTION" in headings, (
+        f"Expected 'INTRODUCTION' (recognizable heading, not renamed) in output, got {headings!r}"
+    )
+    assert "RESULTS" in headings, (
+        f"Expected 'RESULTS' (recognizable heading, not renamed) in output, got {headings!r}"
+    )
