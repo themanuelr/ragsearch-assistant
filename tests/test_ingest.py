@@ -3890,3 +3890,138 @@ def test_no_blanket_ufffd_replacement_outside_ref_path():
     assert not _re2.search(r"re\.sub\(.*fffd", code_only, _re2.IGNORECASE), (
         "Expected no re.sub() with FFFD in _normalize_text executable code"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.3-10 Task 2: GAP E — relax _fill_section relabel clause (Option A)
+# ---------------------------------------------------------------------------
+
+def test_fill_section_prompt_carves_out_article_type_heading():
+    """_fill_section prompt explicitly carves out article-type/title headings from protection (Plan 10 T2)."""
+    import inspect
+    from scripts.ingest import _fill_section
+
+    source = inspect.getsource(_fill_section)
+    # Must mention article-type labels as override targets
+    assert "article-type" in source.lower() or "article category" in source.lower(), (
+        "Expected the prompt to carve out article-type labels from heading protection"
+    )
+    # Must mention title-as-heading as an override target
+    assert "title" in source.lower(), (
+        "Expected the prompt to mention paper title as a non-descriptive heading"
+    )
+    # Must still protect genuine section names
+    assert "Introduction" in source or "introduction" in source, (
+        "Expected genuine section names (e.g. Introduction) still protected"
+    )
+    assert "Results" in source or "results" in source, (
+        "Expected genuine section names (e.g. Results) still protected"
+    )
+
+
+def test_fill_section_no_oneshot_example():
+    """_fill_section source contains no 1-shot example block (prohibition guard, Plan 10 T2)."""
+    import inspect
+    from scripts.ingest import _fill_section
+
+    source = inspect.getsource(_fill_section)
+    # Must NOT contain an example mapping like '"Review" -> "Abstract"' or similar
+    assert '"Review" -> "Abstract"' not in source, (
+        "Expected no 1-shot example mapping junk->real heading in _fill_section"
+    )
+    assert '"Review": "Abstract"' not in source, (
+        "Expected no 1-shot example mapping junk->real heading in _fill_section"
+    )
+    # No "Example:" or "For example:" block with heading mapping
+    import re as _re3
+    assert not _re3.search(r'[Ee]xample:?\s*"[^"]+"\s*(?:->|→|=>|:)\s*"[^"]+"', source), (
+        "Expected no example mapping block in _fill_section source"
+    )
+
+
+def test_no_deterministic_heading_normalization():
+    """ingest() does NOT contain any post-fill junk-set heading rewrite (prohibition guard, Plan 10 T2)."""
+    import inspect
+    from scripts.ingest import ingest
+
+    source = inspect.getsource(ingest)
+    # Must NOT contain a heading normalization mapping (e.g. {"Review": "Abstract"})
+    import re as _re4
+    # No dict/set with known junk headings being mapped to real headings
+    assert not _re4.search(r'heading_map|junk_headings|heading_normalize', source, _re4.IGNORECASE), (
+        "Expected no deterministic heading normalization map in ingest()"
+    )
+    # No explicit 'if heading == "Review": heading = "Abstract"' style rewrites
+    assert not _re4.search(r'heading\s*==?\s*"Review".*=\s*"Abstract"', source), (
+        "Expected no deterministic Review->Abstract rewrite in ingest()"
+    )
+
+
+def test_fill_section_relabels_article_type_heading(tmp_path):
+    """A section with an article-type heading (e.g. 'Review') can be relabeled by _fill_section (Plan 10 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 article type relabel test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    # Section heading is an article-type label ("Review")
+    mock_parsed = _make_single_section_parsed(heading="Review")
+    probe_result = DoiProbeResult(doi="10.1000/gape.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/gape.test", year=2024)
+
+    def fill_relabels(section_text, heading):
+        # Model relabels "Review" to "Abstract" by reading the body
+        return SectionFillResult(heading="Abstract", body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_relabels), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "Abstract" in headings, (
+        f"Expected 'Abstract' (relabeled from article-type 'Review') in output, got {headings!r}"
+    )
+
+
+def test_fill_section_relabels_title_as_heading(tmp_path):
+    """A section whose heading equals the paper title can be relabeled by _fill_section (Plan 10 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 title-as-heading relabel test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    # Section heading equals the paper title
+    mock_parsed = _make_single_section_parsed(heading="Test Paper Title Long Enough")
+    probe_result = DoiProbeResult(doi="10.1000/titlehead.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/titlehead.test", year=2024)
+
+    def fill_relabels(section_text, heading):
+        # Model relabels the title-heading to "Introduction"
+        return SectionFillResult(heading="Introduction", body=section_text + " [cleaned]", fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", side_effect=fill_relabels), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    headings = [s["heading"] for s in result["extraction"]["sections"]]
+    assert "Introduction" in headings, (
+        f"Expected 'Introduction' (relabeled from title-as-heading) in output, got {headings!r}"
+    )
