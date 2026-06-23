@@ -985,20 +985,29 @@ def _quality_gate(paperjson: dict) -> str | None:
             "possible scanned/garbage PDF (no title detected)]"
         )
 
-    # Count total text length across all text blocks
+    # Count total content length across ALL block types (WR-05, Plan 11).
+    # Text blocks: count plain or display.
+    # Table/equation blocks: count plain placeholder (e.g. "[Table: ...]").
+    # Figure blocks: count caption text.
+    # This ensures figure/table-heavy papers are not spuriously rejected.
     total_text_len = 0
     for section in extraction.get("sections", []):
         for block in section.get("blocks", []):
-            if block.get("type") == "text":
+            btype = block.get("type", "")
+            if btype == "text":
                 total_text_len += len(block.get("plain", "") or block.get("display", ""))
+            elif btype in ("table", "equation"):
+                total_text_len += len(block.get("plain", "") or block.get("display", ""))
+            elif btype == "figure":
+                total_text_len += len(block.get("caption", ""))
 
-    # Near-empty threshold: 100 chars of non-noise text is a reasonable minimum
+    # Near-empty threshold: 100 chars of non-noise content is a reasonable minimum
     # for a real paper (even an abstract is ~500 chars)
     NEAR_EMPTY_THRESHOLD = 100
     if total_text_len < NEAR_EMPTY_THRESHOLD:
         return (
             f"[ingest error: extraction produced no usable content — "
-            f"possible scanned/garbage PDF (total text {total_text_len} chars "
+            f"possible scanned/garbage PDF (total content {total_text_len} chars "
             f"below threshold {NEAR_EMPTY_THRESHOLD})]"
         )
 
@@ -1753,6 +1762,33 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: boo
     except RuntimeError as e:
         print(f"[ingest error: {e}]", file=sys.stderr)
         sys.exit(1)
+    # WR-01 body-less-fill floor (Plan 11): if EVERY section was judged non-substantive
+    # (keep=False on all, total > 0), the fill produced no body. Rather than silently
+    # writing a body-less registry entry and exiting 0, retain all sections unfiltered
+    # with a warning. This fail-open approach preserves paper content for later re-review
+    # (better than losing data silently). Choice documented: retain-unfiltered + warn.
+    if total > 0 and not kept_sections:
+        print(
+            f"[ingest warning: all {total} sections judged non-substantive — "
+            f"retaining unfiltered (body-less floor)]",
+            file=sys.stderr,
+        )
+        # Re-run the section loop but retain everything unconditionally
+        kept_sections = []
+        for i, section in enumerate(skeleton["extraction"]["sections"]):
+            raw_parts = []
+            for blk in section.get("blocks", []):
+                if blk.get("type") == "text":
+                    raw_parts.append(blk.get("display") or blk.get("plain") or "")
+            raw_section_text = "\n".join(raw_parts)
+            kept_sections.append({
+                "heading": section.get("heading") or f"Section {i}",
+                "body": raw_section_text,
+                "fill_failed": True,  # mark as unvetted so downstream knows
+            })
+        kept_count = len(kept_sections)
+        dropped_count = 0
+
     skeleton["extraction"]["sections"] = kept_sections
     _log(f"section filter: kept {kept_count}, dropped {dropped_count}")
 
