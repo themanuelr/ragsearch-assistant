@@ -1418,6 +1418,15 @@ def _write_registry(entry: dict, registry_path: str, key: str) -> None:
         # Read current registry (or start empty); _read_registry handles missing/empty files
         registry = _read_registry(registry_path)
 
+        # Union-merge projects[] from existing entry before overwrite (CR-01, REG-04).
+        # A force re-ingest or cross-project re-registration must preserve prior projects.
+        existing = registry.get(key)
+        if existing and isinstance(existing.get("projects"), list):
+            merged = list(dict.fromkeys(
+                existing["projects"] + entry.get("projects", [])
+            ))
+            entry["projects"] = merged
+
         registry[key] = entry
 
         # Write to tmp then atomically replace
@@ -1618,6 +1627,15 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": title_hint})
     cached = _check_registry(registry_key, registry_path)
     if cached is not None and not force_extract:
+        # Cache-hit append: add current project to cached entry if absent (CR-01, REG-02).
+        # Persists via _write_registry (which union-merges) under the lock.
+        if project_name and project_name not in cached.get("projects", []):
+            cached.setdefault("projects", []).append(project_name)
+            if registry_path:
+                try:
+                    _write_registry(cached, registry_path, registry_key)
+                except Exception as e:
+                    _log(f"registry cache-hit update failed: {e}")
         return cached  # cache hit: return immediately, zero fill calls
 
     # Steps 10–12 (miss path): fill → renditions → registry write
