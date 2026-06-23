@@ -535,7 +535,11 @@ def _fill_metadata(first_page_text: str, probe: "DoiProbeResult | None") -> "Pap
         "Return the journal abbreviation in `journal` (exactly as printed, e.g. 'J. Am. Chem. Soc.'). "
         "Set `journal_full` to the full journal name ONLY if it appears verbatim in the text. "
         "If only an abbreviation is present, set `journal_full` to null. "
-        "Never expand or guess the full name from the abbreviation."
+        "Never expand or guess the full name from the abbreviation. "
+        "The DOI is an opaque identifier — NEVER derive the journal name or abbreviation from the "
+        "DOI string or its prefix/suffix (e.g. '10.1016/j.trechm' must NOT produce journal='Trechm'). "
+        "Set `journal` ONLY to the journal abbreviation actually printed on the page; "
+        "if no journal abbreviation is printed, set `journal` to null."
     )
     prompt = (
         "Extract the metadata from the following paper first page.\n"
@@ -1570,6 +1574,14 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         full = _crossref_journal_full(doi, config)
         if full is not None:
             metadata.journal_full = full  # set before model_dump() so it reaches the output
+
+    # Step 10a++: journal-abbreviation fallback (Plan 09 GAP C).
+    # The printed abbreviation is preferred; when absent (None/empty), fall back to the full name
+    # so `journal` holds a real abbreviation or the full name, never a DOI-prefix fragment like
+    # "Trechm" (produced when the model mined "10.1016/j.trechm…"). This copies an already-
+    # extracted/enriched field — extract-never-infer preserved; no inference, no regex.
+    if not metadata.journal and metadata.journal_full:
+        metadata.journal = metadata.journal_full  # copy verbatim; journal_full left unchanged
 
     skeleton["extraction"]["metadata"] = metadata.model_dump()
 
