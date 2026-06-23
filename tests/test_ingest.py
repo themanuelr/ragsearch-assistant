@@ -785,6 +785,37 @@ def test_parse_response_garbage_returns_none():
     assert result is None, "Expected None for garbage input"
 
 
+def test_ollama_extraction_call_payload_think_false():
+    """_ollama_extraction_call sends think=False alongside format in the /api/chat payload.
+
+    Regression test: Ollama 0.30.6 honors think=False + format together (verified 2026-06-23,
+    ~2.6x faster structured calls). Pins the key into the payload so the optimization cannot
+    silently regress. The historical #15260 catch-22 (think=False dropped format) no longer
+    reproduces on 0.30.6; the #15416 fence-stripping fallback in _parse_extraction_response
+    remains as defensive coverage regardless.
+    """
+    import json as _json
+
+    captured = {}
+
+    def fake_urlopen(req, *args, **kwargs):
+        captured["data"] = req.data
+        body = _json.dumps({"message": {"content": "{}"}}).encode()
+        return _FakeHttpResponse(body)
+
+    with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=fake_urlopen):
+        _ollama_extraction_call("p", "s", schema={"type": "object"}, num_ctx=512, timeout=5)
+
+    assert "data" in captured, "Expected urlopen to have been called and req.data captured"
+    payload = _json.loads(captured["data"].decode())
+    assert payload.get("think") is False, (
+        f"Expected think=False in /api/chat payload, got think={payload.get('think')!r}"
+    )
+    assert "format" in payload, (
+        "Expected 'format' key present alongside think=False (Ollama 0.30.6 coexistence)"
+    )
+
+
 def test_doi_probe_full_suffix():
     """DOI extracted byte-for-byte; PNAS full suffix preserved (E1 — guards PNAS truncation defect)."""
     import json as _json
