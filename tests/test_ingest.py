@@ -4505,6 +4505,76 @@ def test_bodyless_fill_floor_blocks_empty_paper(tmp_path, capsys):
             )
 
 
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 11 Task 3: WR-03 Crossref placeholder-email guard
+# ---------------------------------------------------------------------------
+
+def test_crossref_skipped_on_placeholder_email(capsys):
+    """With crossref_validate=true and placeholder email, NO Crossref request is made
+    and a one-line warning is emitted (WR-03, Plan 11 T3)."""
+    from scripts.ingest import _crossref_validate, _crossref_journal_full, _crossref_published_year
+
+    urlopen_calls = []
+
+    def track_urlopen(*args, **kwargs):
+        urlopen_calls.append(True)
+        return _FakeHttpResponse(b'{"message": {"title": ["X"]}}')
+
+    # Test all three Crossref helpers with the placeholder email
+    for helper_name, helper_fn, helper_args in [
+        ("_crossref_validate", _crossref_validate, ("10.1000/test", "Title", {"crossref_contact_email": "your-email@example.com"})),
+        ("_crossref_journal_full", _crossref_journal_full, ("10.1000/test", {"crossref_contact_email": "your-email@example.com"})),
+        ("_crossref_published_year", _crossref_published_year, ("10.1000/test", {"crossref_contact_email": "your-email@example.com"})),
+    ]:
+        urlopen_calls.clear()
+        with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=track_urlopen):
+            result = helper_fn(*helper_args)
+        assert not urlopen_calls, (
+            f"{helper_name}: expected NO urlopen call with placeholder email, "
+            f"but {len(urlopen_calls)} call(s) were made"
+        )
+
+    # Also test with empty/missing email
+    for email_val in ["", None]:
+        cfg = {"crossref_contact_email": email_val} if email_val is not None else {}
+        urlopen_calls.clear()
+        with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=track_urlopen):
+            _crossref_journal_full("10.1000/test", cfg)
+        assert not urlopen_calls, (
+            f"Expected NO urlopen call with email={email_val!r}, "
+            f"but {len(urlopen_calls)} call(s) were made"
+        )
+
+    # Verify warning is emitted
+    captured = capsys.readouterr()
+    assert "crossref skipped" in captured.err.lower() or "placeholder" in captured.err.lower(), (
+        f"Expected a warning about crossref skipped / placeholder email, got stderr: {captured.err!r}"
+    )
+
+
+def test_crossref_proceeds_with_real_email():
+    """With a real (non-placeholder) email, the Crossref calls proceed normally (WR-03, Plan 11 T3)."""
+    import json as _json
+    from scripts.ingest import _crossref_journal_full
+
+    payload = _json.dumps({
+        "message": {"container-title": ["Nature Chemistry"]}
+    }).encode()
+    cfg = {"crossref_contact_email": "researcher@university.edu"}
+
+    urlopen_calls = []
+
+    def track_urlopen(*args, **kwargs):
+        urlopen_calls.append(True)
+        return _FakeHttpResponse(payload)
+
+    with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=track_urlopen):
+        result = _crossref_journal_full("10.1000/test", cfg)
+
+    assert urlopen_calls, "Expected urlopen to be called with a real email"
+    assert result == "Nature Chemistry", f"Expected 'Nature Chemistry', got {result!r}"
+
+
 def test_quality_gate_counts_nontext_blocks():
     """_quality_gate on a skeleton dominated by table/equation/figure blocks (short text)
     PASSES — non-text blocks counted toward the near-empty threshold (WR-05, Plan 11 T2)."""
