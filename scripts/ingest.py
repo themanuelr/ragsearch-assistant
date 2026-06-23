@@ -1492,12 +1492,13 @@ def _registry_entry(
 # Public API
 # ---------------------------------------------------------------------------
 
-def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
+def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: bool = False) -> dict:
     """
     Run the Phase 1.3 probe → quality-gate → registry-gate → fill cascade for one PDF.
 
     Ordering (D-12, D-00b, D-03, D-04):
       1. Preflight: PDF exists + MinerU resolves (fail-fast)
+      1a. Refill guard: if refill=True, verify existing MinerU output (error if absent)
       2. Run-or-reuse MinerU → find + load content_list.json
       3. Parse content_list → build provenance → assemble minimal skeleton
       4. Quality gate on skeleton (D-12: garbage PDFs fail before any LLM call)
@@ -1506,15 +1507,19 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
       7. Syntactic DOI validation (D-00c)
       8. Crossref validation hook (Plan 03)
       9. Registry check — HARD GATE: cache hit returns immediately, no fill calls
+         (BYPASSED when refill=True so the fill re-runs)
      10. Fill cascade (miss path): metadata → per-section → ref batches
      11. Renditions on LLM-cleaned text (D-10)
-     12. Registry write (atomic, filelock)
+     12. Registry write (atomic, filelock) — refill uses merge-write (Plan 10 union-merge)
      13. Warn on partial fill; return skeleton
 
     Args:
         pdf_path:      Absolute or relative path to the input PDF.
         config:        Loaded config.json dict (use _load_config()).
         force_extract: If True, re-run MinerU and re-register even if cached.
+        refill:        If True, re-run LLM fill reusing existing MinerU output.
+                       Errors if no prior content_list.json exists (no silent GPU fallback).
+                       Bypasses registry cache return so fill re-runs. (Plan 11, INGEST-01)
 
     Returns:
         PaperJSON v2 dict (new ingest) OR cached registry entry dict (cache hit).
@@ -1547,10 +1552,25 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
     registry_path = os.path.expanduser(config.get("registry_path", ""))
     project_name = config.get("project_name", "")
 
+    # Step 1a: Refill guard — verify existing MinerU output BEFORE running (Plan 11).
+    # --refill reuses existing content_list.json; if none exists, error clearly
+    # instead of silently falling back to a full MinerU GPU run.
+    if refill:
+        existing_cl = _find_content_list_path(out_dir)
+        if existing_cl is None:
+            print(
+                f"[ingest error: --refill requires existing MinerU output for {pdf.name} "
+                f"— none found at {out_dir}; run without --refill first]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # Step 2: Run-or-reuse MinerU → find + load content_list.json
+    # When refill=True, force_extract is always False (reuse MinerU output, no GPU step).
     _log("mineru extraction starting")
+    effective_force_extract = False if refill else force_extract
     try:
-        _run_mineru(str(pdf), out_dir, mineru_exe, timeout, force_extract)
+        _run_mineru(str(pdf), out_dir, mineru_exe, timeout, effective_force_extract)
     except subprocess.TimeoutExpired:
         print(f"[ingest error: mineru timed out after {timeout}s]", file=sys.stderr)
         sys.exit(1)
@@ -1624,9 +1644,11 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
 
     # Step 9: Registry check — HARD GATE (D-00b / REG-02)
     # No fill helpers run if the paper is already in the registry.
+    # BYPASSED when refill=True — the whole point of --refill is to re-run the fill
+    # even on a cache hit (Plan 11, INGEST-01).
     registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": title_hint})
     cached = _check_registry(registry_key, registry_path)
-    if cached is not None and not force_extract:
+    if cached is not None and not force_extract and not refill:
         # Cache-hit append: add current project to cached entry if absent (CR-01, REG-02).
         # Persists via _write_registry (which union-merges) under the lock.
         if project_name and project_name not in cached.get("projects", []):
@@ -1799,6 +1821,16 @@ if __name__ == "__main__":
             "(José → 'Jos├⌐', U+2019 → 'ΓÇÖ'). Use -o to bypass redirection entirely."
         ),
     )
+    parser.add_argument(
+        "--refill",
+        action="store_true",
+        help=(
+            "Re-run the LLM fill reusing existing MinerU output (no GPU extraction step). "
+            "Errors if no prior content_list.json exists for this PDF — run without --refill first. "
+            "Bypasses the registry cache-hit gate so the fill cascade re-runs. "
+            "Registry write uses merge (Plan 10 union-merge) — does not clobber other projects."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1807,7 +1839,7 @@ if __name__ == "__main__":
         # Allow CLI --timeout to override config
         if args.timeout != DEFAULT_TIMEOUT:
             config["mineru_timeout"] = args.timeout
-        result = ingest(args.pdf, config, force_extract=args.force_extract)
+        result = ingest(args.pdf, config, force_extract=args.force_extract, refill=args.refill)
         _emit_result(result, args.output)
     except SystemExit:
         raise

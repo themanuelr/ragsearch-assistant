@@ -4266,7 +4266,7 @@ def test_refill_reuses_mineru_output(tmp_path):
     mineru_calls = []
 
     def fake_mineru(*args, **kwargs):
-        mineru_calls.append(kwargs)
+        mineru_calls.append(args)
 
     fill_metadata_called = []
     original_fill_metadata = metadata_result
@@ -4276,6 +4276,7 @@ def test_refill_reuses_mineru_output(tmp_path):
         return original_fill_metadata
 
     with mock.patch("scripts.ingest._run_mineru", side_effect=fake_mineru), \
+         mock.patch("scripts.ingest._find_content_list_path", return_value=cl_path), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
          mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
@@ -4286,11 +4287,12 @@ def test_refill_reuses_mineru_output(tmp_path):
          mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
         result = ingest(str(fake_pdf), cfg, refill=True)
 
-    # _run_mineru must have been called with force_extract=False (reuse MinerU output)
+    # _run_mineru is called positionally: (pdf_path, out_dir, mineru_exe, timeout, force_extract)
+    # force_extract is the 5th arg (index 4) and must be False for refill
     assert mineru_calls, "_run_mineru should have been called"
-    assert mineru_calls[0].get("force_extract") is False or (
-        len(mineru_calls[0]) == 0  # positional args — check the call args differently
-    ), "Expected _run_mineru called with force_extract=False for refill"
+    assert mineru_calls[0][4] is False, (
+        f"Expected _run_mineru called with force_extract=False for refill, got {mineru_calls[0][4]!r}"
+    )
 
     # Fill helpers MUST have been called (cache return bypassed)
     assert fill_metadata_called, "_fill_metadata should be called on refill (cache bypass)"
@@ -4339,6 +4341,7 @@ def test_refill_bypasses_cache_return(tmp_path):
         return metadata_result
 
     with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list_path", return_value=cl_path), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
          mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
@@ -4427,6 +4430,7 @@ def test_refill_does_not_clobber_registry_membership(tmp_path):
     section_fill = SectionFillResult(heading="INTRO", body="W" * 200, fill_failed=False, keep=True)
 
     with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list_path", return_value=cl_path), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
          mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
