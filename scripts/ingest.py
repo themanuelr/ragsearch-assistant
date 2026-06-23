@@ -172,8 +172,11 @@ def _ollama_extraction_call(
     POST to /api/chat with format=<json_schema>. Returns raw content string.
 
     Mirrors mcp-ollama/server.py _ollama_chat but adds structured-output params:
-    format, options.temperature=0, options.num_ctx, and CRITICALLY omits think key
-    (Ollama #15260 drops format if think=false).
+    format, options.temperature=0, options.num_ctx, and sets think=false to suppress
+    the reasoning preamble on Ollama 0.30.6 (verified empirically 2026-06-23: think=false
+    + format coexist correctly, ~2.6x faster structured calls). Ollama #15260 was the
+    historical catch-22 (think=false silently dropped format) and no longer reproduces
+    on 0.30.6.
     """
     payload = json.dumps({
         "model": OLLAMA_MODEL,
@@ -183,11 +186,13 @@ def _ollama_extraction_call(
         ],
         "stream": False,
         "format": schema,
+        "think": False,
         "options": {
             "temperature": 0,
             "num_ctx": num_ctx,
         },
-        # CRITICAL: omit "think" key entirely (Ollama #15260 drops format if think=false)
+        # Ollama 0.30.6: think=false + format coexist correctly (verified 2026-06-23).
+        # Historical #15260 catch-22 (think=false dropped format) no longer reproduces.
     }).encode()
     req = urllib.request.Request(
         f"{OLLAMA_BASE}/api/chat",
