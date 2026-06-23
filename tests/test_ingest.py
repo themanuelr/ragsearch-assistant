@@ -4450,3 +4450,95 @@ def test_refill_does_not_clobber_registry_membership(tmp_path):
     assert "project-beta" in entry["projects"], (
         f"Expected 'project-beta' preserved after refill, got {entry['projects']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 11 Task 2: WR-01 body-less-fill floor + WR-05 quality-gate block count
+# ---------------------------------------------------------------------------
+
+def test_bodyless_fill_floor_blocks_empty_paper(tmp_path, capsys):
+    """A fill where every section returns keep=False (body-less) does NOT
+    silently write a registry entry and exit 0 (WR-01, Plan 11 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 bodyless fill floor test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    # Two sections, both will return keep=False (all content judged non-substantive)
+    mock_parsed = _make_two_section_parsed("SECTION_A", "SECTION_B")
+    probe_result = DoiProbeResult(doi="10.1000/bodyless.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(title="Test Paper Title Long Enough", doi="10.1000/bodyless.test", year=2024)
+
+    # Every section gets keep=False (explicit non-substantive verdict)
+    section_fill = SectionFillResult(heading="X", body="short", fill_failed=False, keep=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        # The floor must either exit non-zero or retain all sections with a warning
+        # Either way, it must NOT silently succeed with a body-less paper
+        try:
+            result = ingest(str(fake_pdf), cfg)
+            # If it didn't exit, it must have retained sections (fallback retain behavior)
+            sections = result.get("extraction", {}).get("sections", [])
+            assert len(sections) > 0, (
+                "Body-less floor: expected sections retained (not empty) if ingest() did not exit"
+            )
+            captured = capsys.readouterr()
+            assert "non-substantive" in captured.err.lower() or "body-less" in captured.err.lower() or "all sections" in captured.err.lower(), (
+                f"Expected a warning about body-less/non-substantive fill, got stderr: {captured.err!r}"
+            )
+        except SystemExit as e:
+            # Exit with error is also acceptable (the floor fires)
+            assert e.code != 0, "Expected non-zero exit for body-less fill"
+            captured = capsys.readouterr()
+            assert "non-substantive" in captured.err.lower() or "body-less" in captured.err.lower() or "all sections" in captured.err.lower(), (
+                f"Expected error about body-less/non-substantive fill, got stderr: {captured.err!r}"
+            )
+
+
+def test_quality_gate_counts_nontext_blocks():
+    """_quality_gate on a skeleton dominated by table/equation/figure blocks (short text)
+    PASSES — non-text blocks counted toward the near-empty threshold (WR-05, Plan 11 T2)."""
+    from scripts.ingest import _quality_gate, _assemble_paperjson, MINERU_BACKEND, SCHEMA_VERSION
+
+    # Build a skeleton where text blocks alone have < 100 chars (would fail old gate),
+    # but table/equation/figure blocks carry enough content to push over the threshold.
+    parsed = {
+        "title": "Figure-Heavy Paper Title",
+        "sections": [{
+            "heading": "Results",
+            "level": 1,
+            "blocks": [
+                # Only 30 chars of text (well below the 100-char threshold)
+                {"type": "text", "display": "Short intro text for results.", "plain": "Short intro text for results."},
+                # Table block with substantial plain placeholder (60+ chars)
+                {"type": "table", "display": "<table>data</table>", "plain": "[Table: Comparison of catalytic yields across experiments]"},
+                # Equation block with placeholder (40+ chars)
+                {"type": "equation", "display": "E = mc^2", "plain": "[Equation: energy-mass equivalence formula]"},
+                # Figure block with caption (30+ chars)
+                {"type": "figure", "img_path": "/img/fig1.png", "caption": "Figure 1. SEM images of nanoparticles", "figure_vlm_description": ""},
+            ],
+        }],
+        "references": [],
+        "metadata": {"title": "Figure-Heavy Paper Title"},
+    }
+    provenance = {
+        "pdf_sha256": "abc", "source_filename": "fig_heavy.pdf",
+        "mineru_version": None, "backend": MINERU_BACKEND,
+        "extracted_at": "2026-01-01T00:00:00Z",
+        "normalizations_applied": [], "schema_version": SCHEMA_VERSION,
+    }
+    skeleton = _assemble_paperjson(parsed, provenance)
+    result = _quality_gate(skeleton)
+    assert result is None, (
+        f"Expected quality gate to PASS on figure/table-heavy paper (non-text blocks counted), got: {result!r}"
+    )
