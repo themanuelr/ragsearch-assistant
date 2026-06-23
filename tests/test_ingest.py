@@ -3650,3 +3650,243 @@ def test_legit_heading_not_renamed(tmp_path):
     assert "RESULTS" in headings, (
         f"Expected 'RESULTS' (recognizable heading, not renamed) in output, got {headings!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.3-10 Task 1: year ← Crossref fallback tests (INGEST-01)
+# ---------------------------------------------------------------------------
+
+def test_crossref_published_year_returns_year(capsys):
+    """_crossref_published_year returns published year from Crossref date-parts (Plan 10 T1)."""
+    import json as _json
+    from scripts.ingest import _crossref_published_year
+
+    payload = _json.dumps({
+        "message": {"published": {"date-parts": [[2023, 5, 1]]}}
+    }).encode()
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(payload)):
+        result = _crossref_published_year("10.1021/jacs.3c10258", cfg)
+
+    assert result == 2023, f"Expected 2023, got {result!r}"
+
+
+def test_crossref_published_year_fail_open_on_network_error(capsys):
+    """_crossref_published_year returns None on URLError (fail-open) (Plan 10 T1)."""
+    from scripts.ingest import _crossref_published_year
+
+    cfg = {"crossref_contact_email": "t@e.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    side_effect=_urllib_error.URLError("connection refused")):
+        result = _crossref_published_year("10.1/x", cfg)
+
+    assert result is None, f"Expected None (fail-open), got {result!r}"
+    captured = capsys.readouterr()
+    assert "crossref year lookup unavailable" in captured.err, (
+        f"Expected 'crossref year lookup unavailable' in stderr, got: {captured.err!r}"
+    )
+
+
+def test_crossref_published_year_uses_https():
+    """_crossref_published_year source uses HTTPS and date-parts (Plan 10 T1)."""
+    import inspect
+    from scripts.ingest import _crossref_published_year
+
+    source = inspect.getsource(_crossref_published_year)
+    assert "https://api.crossref.org" in source, (
+        "Expected 'https://api.crossref.org' in source"
+    )
+    assert "http://api.crossref.org" not in source, (
+        "Plain http:// must NOT be used for Crossref"
+    )
+    assert "date-parts" in source, "Expected 'date-parts' in source"
+    assert "crossref_contact_email" in source, (
+        "Expected 'crossref_contact_email' in source"
+    )
+
+
+def test_ingest_year_falls_back_to_crossref_when_null(tmp_path):
+    """ingest() enriches metadata.year from Crossref when fill left it null (Plan 10 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 year crossref fallback test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    # year=None triggers the Crossref year fallback
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=None,
+        journal="J. Am. Chem. Soc.",
+        journal_full="Journal of the American Chemical Society",
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full",
+                    return_value="Journal of the American Chemical Society"), \
+         mock.patch("scripts.ingest._crossref_published_year",
+                    return_value=2023) as mock_year:
+        result = ingest(str(fake_pdf), cfg)
+
+    assert mock_year.called, "Expected _crossref_published_year to be called"
+    assert result["extraction"]["metadata"]["year"] == 2023, (
+        f"Expected year=2023 from Crossref, got {result['extraction']['metadata']['year']!r}"
+    )
+
+
+def test_no_year_lookup_when_already_set(tmp_path):
+    """ingest() does NOT call _crossref_published_year when year is already set (Plan 10 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 year already set test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=2024,  # already set
+        journal="J. Am. Chem. Soc.",
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full", return_value=None), \
+         mock.patch("scripts.ingest._crossref_published_year",
+                    return_value=9999) as mock_year:
+        result = ingest(str(fake_pdf), cfg)
+
+    assert mock_year.call_count == 0, (
+        f"Expected _crossref_published_year NOT called when year already set, got {mock_year.call_count}"
+    )
+    assert result["extraction"]["metadata"]["year"] == 2024, (
+        f"Expected year=2024 (preserved), got {result['extraction']['metadata']['year']!r}"
+    )
+
+
+def test_no_year_lookup_when_crossref_off(tmp_path):
+    """ingest() does NOT call _crossref_published_year when crossref_validate is off (Plan 10 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)  # crossref_validate absent (defaults False)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 year crossref off test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=None,
+        journal=None,
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg)
+
+    assert result["extraction"]["metadata"]["year"] is None, (
+        f"Expected year=None when crossref_validate off, got {result['extraction']['metadata']['year']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.3-10 Task 1: reference-path U+FFFD repair tests (INGEST-01)
+# ---------------------------------------------------------------------------
+
+def test_reference_ufffd_repaired_on_ref_path():
+    """A reference with embedded U+FFFD is repaired on the reference path (Plan 10 T1)."""
+    from scripts.ingest import _fill_references_batched, RefEntry, RefBatchResult
+
+    # A reference with U+FFFD at an em-dash position
+    raw_refs = [{"raw": "Speed without Compromise�A Mixed Precision Approach"}]
+
+    # Mock the LLM call to return the ref as-is (with U+FFFD in raw/title)
+    def fake_extraction(prompt, system, schema, num_ctx=None, timeout=None):
+        import json as _json
+        return _json.dumps({
+            "refs": [{
+                "number": 1,
+                "doi": None,
+                "title": "Speed without Compromise�A Mixed Precision",
+                "year": 2020,
+                "raw": "Speed without Compromise�A Mixed Precision Approach",
+                "fill_failed": False,
+                "is_reference": True,
+            }]
+        })
+
+    with mock.patch("scripts.ingest._ollama_extraction_call", side_effect=fake_extraction):
+        filled, failures = _fill_references_batched(raw_refs)
+
+    assert len(filled) == 1, f"Expected 1 ref, got {len(filled)}"
+    # U+FFFD must be repaired (removed or replaced with em-dash)
+    assert "�" not in filled[0].get("raw", ""), (
+        f"Expected U+FFFD repaired in ref raw, got: {filled[0]['raw']!r}"
+    )
+    assert "�" not in filled[0].get("title", ""), (
+        f"Expected U+FFFD repaired in ref title, got: {filled[0]['title']!r}"
+    )
+
+
+def test_no_blanket_ufffd_replacement_outside_ref_path():
+    """_normalize_text source has no blanket U+FFFD replacement (prohibition guard, Plan 10 T1)."""
+    import inspect, re as _re2
+    from scripts.ingest import _normalize_text
+
+    source = inspect.getsource(_normalize_text)
+    # Must NOT contain U+FFFD character literal in a replacement statement
+    assert "�" not in source, (
+        "Expected no U+FFFD literal in _normalize_text source (prohibition: no blanket replacement)"
+    )
+    # Must NOT contain a .replace() or re.sub() call referencing FFFD/replacement char
+    # (the docstring may mention it descriptively, but no executable replacement line)
+    code_lines = [
+        ln for ln in source.splitlines()
+        if not ln.strip().startswith("#") and not ln.strip().startswith('"""') and not ln.strip().startswith("'")
+    ]
+    code_only = "\n".join(code_lines)
+    assert not _re2.search(r"\.replace\(.*fffd", code_only, _re2.IGNORECASE), (
+        "Expected no .replace() with FFFD in _normalize_text executable code"
+    )
+    assert not _re2.search(r"re\.sub\(.*fffd", code_only, _re2.IGNORECASE), (
+        "Expected no re.sub() with FFFD in _normalize_text executable code"
+    )
