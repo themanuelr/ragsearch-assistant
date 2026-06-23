@@ -4025,3 +4025,209 @@ def test_fill_section_relabels_title_as_heading(tmp_path):
     assert "Introduction" in headings, (
         f"Expected 'Introduction' (relabeled from title-as-heading) in output, got {headings!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 01.3-10 Task 3: CR-01 — registry projects[] union-merge + cache-hit append
+# ---------------------------------------------------------------------------
+
+def test_registry_projects_survive_force_reingest_from_other_project(tmp_path):
+    """Force re-ingest from a different project preserves prior projects[] (CR-01, REG-01, Plan 10 T3)."""
+    from scripts.ingest import ingest, _write_registry, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate registry with an entry from "old-project"
+    old_entry = {
+        "title": "Old Entry",
+        "doi": "10.1000/force.test",
+        "projects": ["old-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2020, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/old.pdf",
+        "paperjson_path": "/old.json",
+    }
+    _write_registry(old_entry, reg_path, "10.1000/force.test")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 force extract CR-01 test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Updated Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "Updated Paper", "plain": "Updated Paper"},
+            {"type": "text", "display": "B" * 200, "plain": "B" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Updated Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/force.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+
+    from scripts.ingest import DoiProbeResult, PaperMetadata, SectionFillResult
+    probe_result = DoiProbeResult(doi="10.1000/force.test", arxiv_id=None, title="Updated Paper")
+    metadata_result = PaperMetadata(title="Updated Paper", doi="10.1000/force.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="Updated Paper " + "B" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg, force_extract=True)
+
+    # Registry must preserve BOTH "old-project" AND "test-project" (the _make_ingest_config default)
+    registry = _read_registry(reg_path)
+    projects = registry["10.1000/force.test"]["projects"]
+    assert "old-project" in projects, (
+        f"Expected 'old-project' preserved in projects[] after force re-ingest, got {projects!r}"
+    )
+    assert "test-project" in projects, (
+        f"Expected 'test-project' added to projects[] after force re-ingest, got {projects!r}"
+    )
+    # No duplicates
+    assert len(projects) == len(set(projects)), (
+        f"Expected no duplicate projects, got {projects!r}"
+    )
+
+
+def test_cache_hit_appends_current_project(tmp_path):
+    """On a cache HIT, ingest() appends the current project and persists (CR-01, REG-02, Plan 10 T3)."""
+    from scripts.ingest import ingest, _write_registry, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate registry with an entry from "other-project" only
+    cached_entry = {
+        "title": "Cached Paper Title Long Enough",
+        "doi": "10.1000/cache.hit",
+        "projects": ["other-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/cached.pdf",
+        "paperjson_path": "/cached.json",
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/cache.hit")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 cache hit append project test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/cache.hit", arxiv_id=None, title="Cached Paper Title Long Enough")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Cached Paper Title Long Enough",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Cached Paper Title Long Enough", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/cache.hit", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result):
+        result = ingest(str(fake_pdf), cfg)  # force_extract=False (default) → cache hit
+
+    # The returned result must include "test-project" in projects
+    assert "test-project" in result.get("projects", []), (
+        f"Expected 'test-project' in returned result projects, got {result.get('projects')!r}"
+    )
+    # The registry on disk must also reflect the addition
+    registry = _read_registry(reg_path)
+    disk_projects = registry["10.1000/cache.hit"]["projects"]
+    assert "other-project" in disk_projects, (
+        f"Expected 'other-project' preserved in registry, got {disk_projects!r}"
+    )
+    assert "test-project" in disk_projects, (
+        f"Expected 'test-project' appended to registry, got {disk_projects!r}"
+    )
+
+
+def test_cache_hit_no_duplicate_when_project_already_present(tmp_path):
+    """Cache hit where current project already in projects[] does not duplicate (CR-01, Plan 10 T3)."""
+    from scripts.ingest import ingest, _write_registry, _read_registry
+
+    cfg = _make_ingest_config(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate with current project already in projects[]
+    cached_entry = {
+        "title": "Already There Paper Title",
+        "doi": "10.1000/nodup.test",
+        "projects": ["test-project"],  # same as _make_ingest_config default
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/cached.pdf",
+        "paperjson_path": "/cached.json",
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/nodup.test")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 no dup project test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/nodup.test", arxiv_id=None, title="Already There Paper Title")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Already There Paper Title",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Already There Paper Title", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/nodup.test", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result):
+        result = ingest(str(fake_pdf), cfg)
+
+    # No duplicates in returned result
+    result_projects = result.get("projects", [])
+    assert result_projects.count("test-project") == 1, (
+        f"Expected exactly one 'test-project' in result (no duplicate), got {result_projects!r}"
+    )
+    # No duplicates on disk
+    registry = _read_registry(reg_path)
+    disk_projects = registry["10.1000/nodup.test"]["projects"]
+    assert disk_projects.count("test-project") == 1, (
+        f"Expected exactly one 'test-project' on disk (no duplicate), got {disk_projects!r}"
+    )
+
+
+def test_write_registry_union_merges_projects():
+    """_write_registry source contains union-merge of projects inside the filelock (Plan 10 T3)."""
+    import inspect
+    from scripts.ingest import _write_registry
+
+    source = inspect.getsource(_write_registry)
+    # Must contain evidence of union-merge (dict.fromkeys or set union or similar)
+    assert "projects" in source, (
+        "Expected 'projects' mentioned in _write_registry (union-merge logic)"
+    )
+    assert "dict.fromkeys" in source or "set(" in source or "union" in source, (
+        "Expected dict.fromkeys/set/union in _write_registry for projects[] merge"
+    )
