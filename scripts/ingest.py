@@ -787,6 +787,35 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
 # Crossref optional same-paper validator (Plan 03)
 # ---------------------------------------------------------------------------
 
+# WR-03 placeholder-email guard (Plan 11): predicate consulted by ALL Crossref
+# helpers to ensure the shipped placeholder mailto is never sent to api.crossref.org.
+_CROSSREF_PLACEHOLDER_EMAILS = {"your-email@example.com", "unknown@example.com"}
+
+# Track whether the placeholder warning has been emitted this process (one per run)
+_crossref_placeholder_warned = False
+
+
+def _crossref_contact_ok(config: dict) -> bool:
+    """Return True if crossref_contact_email is a real (non-placeholder) email.
+
+    When the email is missing, empty, or the shipped placeholder, returns False
+    and emits ONE stderr warning per process. All Crossref helpers consult this
+    before making any HTTPS request so the placeholder mailto is never transmitted.
+    """
+    global _crossref_placeholder_warned
+    email = (config.get("crossref_contact_email") or "").strip()
+    if not email or email in _CROSSREF_PLACEHOLDER_EMAILS:
+        if not _crossref_placeholder_warned:
+            print(
+                "[ingest warning: crossref skipped — set a real crossref_contact_email "
+                "in config.json (placeholder mailto not sent)]",
+                file=sys.stderr,
+            )
+            _crossref_placeholder_warned = True
+        return False
+    return True
+
+
 def _crossref_validate(doi: str, title_hint: str | None, config: dict) -> None:
     """
     Resolve DOI at Crossref over HTTPS and run a local-LLM same-paper check (D-13..D-16).
@@ -811,6 +840,10 @@ def _crossref_validate(doi: str, title_hint: str | None, config: dict) -> None:
         title_hint: Title from DOI probe (may be None).
         config:     Loaded config dict; reads crossref_contact_email for User-Agent (V14).
     """
+    # WR-03: skip when email is placeholder/empty (no bogus mailto sent)
+    if not _crossref_contact_ok(config):
+        return
+
     url = f"https://api.crossref.org/works/{doi}"
     contact = config.get("crossref_contact_email", "unknown@example.com")
     req = urllib.request.Request(url, method="GET")
@@ -896,6 +929,10 @@ def _crossref_journal_full(doi: str, config: dict) -> str | None:
     only the DOI string leaves the machine. CLAUDE.md's offline-by-default line is superseded
     for this DOI-only path but CLAUDE.md is NOT edited here.
     """
+    # WR-03: skip when email is placeholder/empty (no bogus mailto sent)
+    if not _crossref_contact_ok(config):
+        return None
+
     url = f"https://api.crossref.org/works/{doi}"
     contact = config.get("crossref_contact_email", "unknown@example.com")
     req = urllib.request.Request(url, method="GET")
@@ -935,6 +972,10 @@ def _crossref_published_year(doi: str, config: dict) -> int | None:
     Mirrors _crossref_journal_full conventions: HTTPS GET + User-Agent (V14) +
     DOI-only + fail-open. INGEST-01.
     """
+    # WR-03: skip when email is placeholder/empty (no bogus mailto sent)
+    if not _crossref_contact_ok(config):
+        return None
+
     url = f"https://api.crossref.org/works/{doi}"
     contact = config.get("crossref_contact_email", "unknown@example.com")
     req = urllib.request.Request(url, method="GET")

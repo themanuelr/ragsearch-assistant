@@ -4512,7 +4512,11 @@ def test_bodyless_fill_floor_blocks_empty_paper(tmp_path, capsys):
 def test_crossref_skipped_on_placeholder_email(capsys):
     """With crossref_validate=true and placeholder email, NO Crossref request is made
     and a one-line warning is emitted (WR-03, Plan 11 T3)."""
+    import scripts.ingest as _ingest_mod
     from scripts.ingest import _crossref_validate, _crossref_journal_full, _crossref_published_year
+
+    # Reset the per-process warning flag so this test gets the warning
+    _ingest_mod._crossref_placeholder_warned = False
 
     urlopen_calls = []
 
