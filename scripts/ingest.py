@@ -764,6 +764,17 @@ def _fill_references_batched(raw_refs: list) -> "tuple[list, int]":
                 kept_count += 1
 
     _log(f"reference filter: kept {kept_count}, dropped {dropped_count}")
+
+    # Targeted U+FFFD repair on the reference path only (Plan 10 Item 1d, INGEST-01).
+    # Replaces the lone replacement character (observed at em-dash positions in out1 ref45)
+    # with an em-dash. Scoped to ref raw/title strings only — no blanket replacement elsewhere.
+    _UFFFD = "�"
+    for ref in filled:
+        for field in ("raw", "title"):
+            val = ref.get(field)
+            if isinstance(val, str) and _UFFFD in val:
+                ref[field] = val.replace(_UFFFD, "—")  # em-dash at observed position
+
     return filled, failures
 
 
@@ -902,6 +913,47 @@ def _crossref_journal_full(doi: str, config: dict) -> str | None:
     if not full:
         return None
     return full  # verbatim from Crossref — extract-never-infer (Plan 08)
+
+
+def _crossref_published_year(doi: str, config: dict) -> int | None:
+    """
+    Resolve DOI at Crossref over HTTPS and return the published year.
+
+    Returns ``message['published']['date-parts'][0][0]`` verbatim from the Crossref
+    API response, or ``None`` on any network / parse / missing-field error (fail-open
+    contract). Falls back to ``published-print`` or ``published-online`` when the
+    ``published`` key is absent.
+
+    Outbound data: the DOI string in the URL only — no paper content leaves the machine
+    (V9 privacy constraint preserved; identical trust level to _crossref_journal_full).
+
+    Mirrors _crossref_journal_full conventions: HTTPS GET + User-Agent (V14) +
+    DOI-only + fail-open. INGEST-01.
+    """
+    url = f"https://api.crossref.org/works/{doi}"
+    contact = config.get("crossref_contact_email", "unknown@example.com")
+    req = urllib.request.Request(url, method="GET")
+    req.add_header(
+        "User-Agent",
+        f"ragsearch-assistant/1.3 (mailto:{contact})",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        _log("crossref year lookup unavailable")
+        return None  # fail-open — one quiet log line; ingest proceeds
+
+    # Extract published year from date-parts[0][0]; fall back to published-print / published-online
+    msg = data.get("message", {})
+    for field in ("published", "published-print", "published-online"):
+        try:
+            year = msg[field]["date-parts"][0][0]
+            if isinstance(year, int):
+                return year
+        except (KeyError, IndexError, TypeError):
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1585,7 +1637,17 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
         if full is not None:
             metadata.journal_full = full  # set before model_dump() so it reaches the output
 
-    # Step 10a++: journal-abbreviation fallback (Plan 09 GAP C).
+    # Step 10a++: Crossref published-year enrichment (Plan 10 Item 1b, INGEST-01).
+    # Fires when crossref_validate is on AND a syntactically-valid DOI exists AND
+    # metadata.year was not extracted from the PDF (left null by the fill).
+    # Sets year verbatim from Crossref date-parts — extract-never-infer preserved.
+    # An already-extracted year is NEVER overwritten.
+    if config.get("crossref_validate", False) and doi and metadata.year is None:
+        crossref_year = _crossref_published_year(doi, config)
+        if crossref_year is not None:
+            metadata.year = crossref_year  # set before model_dump() so it reaches the output
+
+    # Step 10a+++: journal-abbreviation fallback (Plan 09 GAP C).
     # The printed abbreviation is preferred; when absent (None/empty), fall back to the full name
     # so `journal` holds a real abbreviation or the full name, never a DOI-prefix fragment like
     # "Trechm" (produced when the model mined "10.1016/j.trechm…"). This copies an already-
