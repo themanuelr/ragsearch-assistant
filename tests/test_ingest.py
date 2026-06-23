@@ -3015,3 +3015,230 @@ def test_config_crossref_validate_default_true():
     assert cfg["crossref_validate"] is True, (
         f"Expected crossref_validate=True in config.json (Plan 08 default flip), got {cfg['crossref_validate']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 09 (gap closure) Task 1: unified LLM ref-judge (numbering + footnote filter)
+# ---------------------------------------------------------------------------
+
+def test_ref_entry_is_reference_defaults_true():
+    """RefEntry.is_reference defaults True; explicit False sets it False (Plan 09 T1)."""
+    from scripts.ingest import RefEntry
+    assert RefEntry(raw="x").is_reference is True, (
+        "Expected is_reference=True by default (conservative retain)"
+    )
+    assert RefEntry(raw="x", is_reference=False).is_reference is False, (
+        "Expected is_reference=False when explicitly set"
+    )
+
+
+def test_ref_numbering_format_agnostic():
+    """_fill_references_batched carries number from mock across (1)/1./[1]/bare styles (Plan 09 T1)."""
+    from scripts.ingest import _fill_references_batched
+
+    raw_refs = [
+        {"raw": "(1) Deidda, G. et al. Down Syndrome. J. Am. Chem. Soc. 2023."},
+        {"raw": "1. Gamba, G. (2005) Kidney Int."},
+        {"raw": "[1] Foo B. et al. Cell 2022."},
+        {"raw": "1 Bar C. et al. Nature 2021."},
+    ]
+    mock_resp = _json_mod.dumps({
+        "refs": [
+            {"number": 1, "raw": "(1) Deidda, G. et al. Down Syndrome. J. Am. Chem. Soc. 2023.",
+             "doi": None, "title": "Down Syndrome", "year": 2023, "fill_failed": False,
+             "is_reference": True},
+            {"number": 1, "raw": "1. Gamba, G. (2005) Kidney Int.",
+             "doi": None, "title": "Kidney Int", "year": 2005, "fill_failed": False,
+             "is_reference": True},
+            {"number": 1, "raw": "[1] Foo B. et al. Cell 2022.",
+             "doi": None, "title": "Cell paper", "year": 2022, "fill_failed": False,
+             "is_reference": True},
+            {"number": 1, "raw": "1 Bar C. et al. Nature 2021.",
+             "doi": None, "title": "Nature paper", "year": 2021, "fill_failed": False,
+             "is_reference": True},
+        ]
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        filled, failures = _fill_references_batched(raw_refs)
+
+    assert failures == 0
+    assert len(filled) == 4
+    # All number=1 (as returned by mock — correct wiring)
+    for entry in filled:
+        assert entry["number"] == 1, f"Expected number=1 from mock, got {entry['number']!r}"
+
+
+def test_ref_inline_paren_not_used_as_number():
+    """Mock returns number=5 (not 2003/12) for a period-style ref with inline parens (Plan 09 T1)."""
+    from scripts.ingest import _fill_references_batched
+
+    raw_refs = [
+        {"raw": "5. Starremans, P.G. et al. (2003) J. Am. Chem. Soc. 12 (12), 1206."},
+    ]
+    mock_resp = _json_mod.dumps({
+        "refs": [
+            {"number": 5, "raw": "5. Starremans, P.G. et al. (2003) J. Am. Chem. Soc. 12 (12), 1206.",
+             "doi": None, "title": "JACS paper", "year": 2003, "fill_failed": False,
+             "is_reference": True},
+        ]
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        filled, failures = _fill_references_batched(raw_refs)
+
+    assert failures == 0
+    assert len(filled) == 1
+    assert filled[0]["number"] == 5, (
+        f"Expected number=5 (leading ordinal, not inline year/volume), got {filled[0]['number']!r}"
+    )
+
+
+def test_ref_is_reference_false_dropped():
+    """_fill_references_batched drops is_reference=false (non-fill_failed) entries (Plan 09 T1)."""
+    from scripts.ingest import _fill_references_batched
+
+    raw_refs = [
+        {"raw": "Michele Parrinello − Laboratory of Atomistic Simulations, IIT … michele.parrinello@iit.it"},
+        {"raw": "(1) Deidda, G. et al. Down Syndrome. J. Am. Chem. Soc. 2023."},
+        {"raw": "(2) Smith, J. et al. Nature 2020. DOI:10.1/x"},
+    ]
+    mock_resp = _json_mod.dumps({
+        "refs": [
+            {"number": None, "raw": "Michele Parrinello − Laboratory of Atomistic Simulations, IIT … michele.parrinello@iit.it",
+             "doi": None, "title": None, "year": None, "fill_failed": False,
+             "is_reference": False},
+            {"number": 1, "raw": "(1) Deidda, G. et al. Down Syndrome. J. Am. Chem. Soc. 2023.",
+             "doi": None, "title": "Down Syndrome", "year": 2023, "fill_failed": False,
+             "is_reference": True},
+            {"number": 2, "raw": "(2) Smith, J. et al. Nature 2020. DOI:10.1/x",
+             "doi": "10.1/x", "title": "Nature paper", "year": 2020, "fill_failed": False,
+             "is_reference": True},
+        ]
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        filled, failures = _fill_references_batched(raw_refs)
+
+    assert failures == 0
+    assert len(filled) == 2, (
+        f"Expected 2 real refs (affiliation dropped), got {len(filled)}"
+    )
+    raw_strings = [r["raw"] for r in filled]
+    assert "Michele Parrinello" not in " ".join(raw_strings), (
+        "Expected affiliation/email entry to be dropped from filled refs"
+    )
+    assert any("Deidda" in r["raw"] for r in filled), "Expected ref (1) Deidda in filled"
+    assert any("Smith" in r["raw"] for r in filled), "Expected ref (2) Smith in filled"
+
+
+def test_ref_fill_failed_always_retained():
+    """fill_failed refs are always retained (is_reference defaults True on failure) (Plan 09 T1)."""
+    from scripts.ingest import _fill_references_batched
+
+    raw_refs = [{"raw": "1. Bad ref"}, {"raw": "2. Also bad"}, {"raw": "3. Another bad"}]
+    with patch("scripts.ingest._ollama_extraction_call", return_value="not json"), \
+         patch("scripts.ingest._parse_extraction_response", return_value=None):
+        filled, failures = _fill_references_batched(raw_refs)
+
+    assert failures == 1, f"Expected 1 failed batch, got {failures}"
+    assert len(filled) == len(raw_refs), (
+        f"Expected all {len(raw_refs)} refs retained (fill_failed always retained), got {len(filled)}"
+    )
+    for ref in filled:
+        assert ref.get("fill_failed") is True, (
+            f"Expected fill_failed=True in retained ref, got {ref!r}"
+        )
+
+
+def test_ref_parser_prompt_is_format_agnostic_and_judges():
+    """_fill_references_batched source contains format-agnostic numbering + ref-vs-footnote judgment (Plan 09 T1)."""
+    import inspect
+    from scripts.ingest import _fill_references_batched
+
+    source = inspect.getsource(_fill_references_batched)
+    # Format-agnostic numbering: must mention (1), 1., [1] styles
+    assert "(1)" in source, "Expected '(1)' citation style mentioned in prompt"
+    assert "1." in source, "Expected '1.' citation style mentioned in prompt"
+    assert "[1]" in source, "Expected '[1]' citation style mentioned in prompt"
+    # Must forbid inline year/volume
+    assert "inline" in source.lower() or "year" in source.lower(), (
+        "Expected inline paren / year prohibition in prompt"
+    )
+    # Reference-vs-footnote judgment
+    assert "is_reference" in source, "Expected 'is_reference' mentioned in prompt/source"
+    assert "affiliation" in source.lower() or "footnote" in source.lower(), (
+        "Expected affiliation/footnote judgment in prompt"
+    )
+    # Preservation of contract
+    assert "Return ONLY valid JSON" in source, "Expected 'Return ONLY valid JSON' in prompt"
+    assert "Do not invent" in source, "Expected 'Do not invent values' in prompt"
+
+
+def test_ref_filter_logs_drop_count(capsys):
+    """_fill_references_batched emits a timestamped 'reference filter: kept N, dropped M' log (Plan 09 T1)."""
+    import re as _re
+    from scripts.ingest import _fill_references_batched
+
+    raw_refs = [
+        {"raw": "Affiliation block — email@example.com"},
+        {"raw": "(1) Real, R. et al. Science 2024."},
+    ]
+    mock_resp = _json_mod.dumps({
+        "refs": [
+            {"number": None, "raw": "Affiliation block — email@example.com",
+             "doi": None, "title": None, "year": None, "fill_failed": False,
+             "is_reference": False},
+            {"number": 1, "raw": "(1) Real, R. et al. Science 2024.",
+             "doi": None, "title": "Science paper", "year": 2024, "fill_failed": False,
+             "is_reference": True},
+        ]
+    })
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        _fill_references_batched(raw_refs)
+
+    captured = capsys.readouterr()
+    assert _re.search(
+        r"\[ingest \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] reference filter: kept \d+, dropped \d+",
+        captured.err,
+    ), (
+        f"Expected timestamped 'reference filter: kept N, dropped M' in stderr, got: {captured.err!r}"
+    )
+
+
+def test_output_refs_have_no_is_reference_key():
+    """Returned filled dicts have keys exactly {number, raw, doi, title, year, fill_failed} — no is_reference (Plan 09 T1)."""
+    from scripts.ingest import _fill_references_batched
+
+    # Success path: is_reference present in mock response but must not reach output
+    raw_refs_success = [
+        {"raw": "(1) Smith J. Science 2024."},
+        {"raw": "(2) Jones A. Nature 2023."},
+    ]
+    mock_resp = _json_mod.dumps({
+        "refs": [
+            {"number": 1, "raw": "(1) Smith J. Science 2024.",
+             "doi": None, "title": "Science", "year": 2024, "fill_failed": False,
+             "is_reference": True},
+            {"number": 2, "raw": "(2) Jones A. Nature 2023.",
+             "doi": None, "title": "Nature", "year": 2023, "fill_failed": False,
+             "is_reference": True},
+        ]
+    })
+    expected_keys = {"number", "raw", "doi", "title", "year", "fill_failed"}
+
+    with patch("scripts.ingest._ollama_extraction_call", return_value=mock_resp):
+        filled_success, _ = _fill_references_batched(raw_refs_success)
+
+    for i, ref in enumerate(filled_success):
+        assert set(ref.keys()) == expected_keys, (
+            f"Success-path ref[{i}] has unexpected keys: {set(ref.keys())} — expected {expected_keys}"
+        )
+
+    # Failed-batch path: fill_failed refs must also not have is_reference key
+    raw_refs_failed = [{"raw": "1. Bad ref"}, {"raw": "2. Also bad"}]
+    with patch("scripts.ingest._ollama_extraction_call", return_value="not json"), \
+         patch("scripts.ingest._parse_extraction_response", return_value=None):
+        filled_failed, _ = _fill_references_batched(raw_refs_failed)
+
+    for i, ref in enumerate(filled_failed):
+        assert set(ref.keys()) == expected_keys, (
+            f"Failed-batch ref[{i}] has unexpected keys: {set(ref.keys())} — expected {expected_keys}"
+        )
