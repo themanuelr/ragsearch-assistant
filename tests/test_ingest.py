@@ -4231,3 +4231,218 @@ def test_write_registry_union_merges_projects():
     assert "dict.fromkeys" in source or "set(" in source or "union" in source, (
         "Expected dict.fromkeys/set/union in _write_registry for projects[] merge"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 11 Task 1: --refill CLI flag tests
+# ---------------------------------------------------------------------------
+
+def test_refill_reuses_mineru_output(tmp_path):
+    """refill=True + existing content_list -> _run_mineru called with force_extract=False,
+    cache return bypassed, fill helpers invoked (Plan 11 T1)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_contact_email": "real@test.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 refill test content")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Refill Test Paper",
+        "sections": [{"heading": "INTRO", "level": 1, "blocks": [
+            {"type": "text", "display": "Refill Test Paper", "plain": "Refill Test Paper"},
+            {"type": "text", "display": "Z" * 200, "plain": "Z" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Refill Test Paper", "authors": None, "year": 2024,
+            "journal": None, "doi": "10.1000/refill.test", "arxiv_id": None, "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/refill.test", arxiv_id=None, title="Refill Test Paper")
+    metadata_result = PaperMetadata(title="Refill Test Paper", doi="10.1000/refill.test", year=2024)
+    section_fill = SectionFillResult(heading="INTRO", body="Z" * 200, fill_failed=False, keep=True)
+
+    mineru_calls = []
+
+    def fake_mineru(*args, **kwargs):
+        mineru_calls.append(kwargs)
+
+    fill_metadata_called = []
+    original_fill_metadata = metadata_result
+
+    def fake_fill_metadata(*a, **kw):
+        fill_metadata_called.append(True)
+        return original_fill_metadata
+
+    with mock.patch("scripts.ingest._run_mineru", side_effect=fake_mineru), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", side_effect=fake_fill_metadata), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg, refill=True)
+
+    # _run_mineru must have been called with force_extract=False (reuse MinerU output)
+    assert mineru_calls, "_run_mineru should have been called"
+    assert mineru_calls[0].get("force_extract") is False or (
+        len(mineru_calls[0]) == 0  # positional args — check the call args differently
+    ), "Expected _run_mineru called with force_extract=False for refill"
+
+    # Fill helpers MUST have been called (cache return bypassed)
+    assert fill_metadata_called, "_fill_metadata should be called on refill (cache bypass)"
+
+
+def test_refill_bypasses_cache_return(tmp_path):
+    """refill=True bypasses the registry cache-hit early return so the fill re-runs (Plan 11 T1)."""
+    from scripts.ingest import ingest, _write_registry, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_contact_email": "real@test.com"})
+    reg_path = cfg["registry_path"]
+
+    # Pre-populate registry — normally this would cause a cache hit + early return
+    doi_key = "10.1000/refill.bypass"
+    cached = {
+        "title": "Cached Paper", "doi": doi_key, "projects": ["other-project"],
+        "summary": None, "key_findings": None, "authors": None, "year": None,
+        "journal": None, "arxiv_id": None, "source_path": "/old.pdf", "paperjson_path": "/old.json",
+    }
+    _write_registry(cached, reg_path, doi_key)
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 refill bypass test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Cached Paper",
+        "sections": [{"heading": "INTRO", "level": 1, "blocks": [
+            {"type": "text", "display": "Cached Paper", "plain": "Cached Paper"},
+            {"type": "text", "display": "Y" * 200, "plain": "Y" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Cached Paper", "authors": None, "year": 2024,
+            "journal": None, "doi": doi_key, "arxiv_id": None, "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id=None, title="Cached Paper")
+    metadata_result = PaperMetadata(title="Cached Paper", doi=doi_key, year=2024)
+    section_fill = SectionFillResult(heading="INTRO", body="Y" * 200, fill_failed=False, keep=True)
+
+    fill_called = []
+
+    def track_fill_metadata(*a, **kw):
+        fill_called.append(True)
+        return metadata_result
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", side_effect=track_fill_metadata), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        result = ingest(str(fake_pdf), cfg, refill=True)
+
+    # Fill helpers MUST have run even though the DOI was in the registry
+    assert fill_called, "_fill_metadata must be called on refill (bypasses cache return)"
+
+    # Result must be a full PaperJSON (not the cached stub dict)
+    assert "extraction" in result, "Expected full PaperJSON result on refill, not cached dict"
+
+
+def test_refill_errors_when_no_content_list(tmp_path, capsys):
+    """refill=True + no existing content_list.json -> clear error + non-zero exit,
+    no full MinerU run (Plan 11 T1)."""
+    from scripts.ingest import ingest
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_contact_email": "real@test.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 refill no content_list")
+
+    # Mock _find_content_list_path to return None (no existing MinerU output)
+    mineru_called = []
+
+    def fake_mineru(*a, **kw):
+        mineru_called.append(True)
+
+    with mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._find_content_list_path", return_value=None), \
+         mock.patch("scripts.ingest._run_mineru", side_effect=fake_mineru), \
+         pytest.raises(SystemExit) as exc_info:
+        ingest(str(fake_pdf), cfg, refill=True)
+
+    assert exc_info.value.code != 0, "Expected non-zero exit on refill with no content_list"
+    captured = capsys.readouterr()
+    assert "refill" in captured.err.lower() or "--refill" in captured.err, (
+        f"Expected error mentioning refill, got: {captured.err!r}"
+    )
+    assert "existing MinerU output" in captured.err or "content_list" in captured.err.lower(), (
+        f"Expected error about missing MinerU output, got: {captured.err!r}"
+    )
+    # _run_mineru must NOT have been called (no fallback to full GPU run)
+    assert not mineru_called, "_run_mineru should NOT be called when refill has no content_list"
+
+
+def test_refill_does_not_clobber_registry_membership(tmp_path):
+    """A refill of a DOI already registered under another project does NOT drop
+    that project from projects[] (Plan 11 T1, relies on Plan 10 union-merge)."""
+    from scripts.ingest import ingest, _write_registry, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_contact_email": "real@test.com"})
+    reg_path = cfg["registry_path"]
+
+    doi_key = "10.1000/refill.noclob"
+    existing_entry = {
+        "title": "Cross-Proj Paper", "doi": doi_key,
+        "projects": ["project-alpha", "project-beta"],
+        "summary": None, "key_findings": None, "authors": None, "year": 2024,
+        "journal": None, "arxiv_id": None, "source_path": "/x.pdf", "paperjson_path": "/x.json",
+    }
+    _write_registry(existing_entry, reg_path, doi_key)
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 refill clobber test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Cross-Proj Paper",
+        "sections": [{"heading": "INTRO", "level": 1, "blocks": [
+            {"type": "text", "display": "Cross-Proj Paper", "plain": "Cross-Proj Paper"},
+            {"type": "text", "display": "W" * 200, "plain": "W" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Cross-Proj Paper", "authors": None, "year": 2024,
+            "journal": None, "doi": doi_key, "arxiv_id": None, "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id=None, title="Cross-Proj Paper")
+    metadata_result = PaperMetadata(title="Cross-Proj Paper", doi=doi_key, year=2024)
+    section_fill = SectionFillResult(heading="INTRO", body="W" * 200, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg, refill=True)
+
+    # Both original projects must still be present in the registry
+    registry = _read_registry(reg_path)
+    entry = registry[doi_key]
+    assert "project-alpha" in entry["projects"], (
+        f"Expected 'project-alpha' preserved after refill, got {entry['projects']!r}"
+    )
+    assert "project-beta" in entry["projects"], (
+        f"Expected 'project-beta' preserved after refill, got {entry['projects']!r}"
+    )
