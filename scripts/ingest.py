@@ -621,8 +621,13 @@ def _fill_section(section_text: str, heading: str) -> "SectionFillResult":
         "or 'Notes' blurbs, supporting-information pointers, page headers or footers, "
         "journal banners or advertisements (e.g. promotional taglines), navigation text, "
         "or tiny fragments with no scientific content.\n"
-        "If a KEPT section has an empty or missing heading and reads as the paper's abstract, "
-        "set heading to 'Abstract'. Do NOT rename any section that already has a heading."
+        "If a KEPT section's heading is empty, missing, or an obvious non-descriptive placeholder — "
+        "a bare 'Section N' (where N is a number), 'N/A', an article-type label like 'Review' or "
+        "'Article', or text that is clearly the paper's full title rather than a section name — "
+        "infer the section's true heading from its body text "
+        "(use 'Abstract' or 'Introduction' for the paper's lead block). "
+        "Do NOT rename a section that already has a recognizable section name "
+        "(e.g. Introduction, Results, Methods, Discussion, Conclusions, Abstract)."
     )
     prompt = (
         f"Clean the following section text from a research paper PDF.\n"
@@ -1602,15 +1607,21 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
                 if blk.get("type") == "text":
                     raw_parts.append(blk.get("display") or blk.get("plain") or "")
             raw_section_text = "\n".join(raw_parts)
-            heading = section.get("heading") or f"Section {i}"
-            _log(f"section fill {i + 1}/{total}: '{heading}'")
-            fill_result = _fill_section(raw_section_text, heading)
+            # GAP E fix: pass the RAW heading (possibly empty) to _fill_section so the relabel can fire.
+            # 'Section {i}' is a log label + last-resort fallback only — never pre-assigned to the model.
+            log_label = section.get("heading") or f"Section {i}"   # non-blank label for _log
+            raw_heading = section.get("heading") or ""              # raw (possibly empty) for _fill_section
+            _log(f"section fill {i + 1}/{total}: '{log_label}'")
+            fill_result = _fill_section(raw_section_text, raw_heading)
+            # Last-resort fallback: if model returned an empty heading, use 'Section {i}' so we
+            # never emit a blank heading in the output.
+            out_heading = fill_result.heading or f"Section {i}"
             if fill_result.fill_failed:
                 # fill_failed means no verdict — always retain (conservative: keep=True default)
                 failed_count += 1
                 kept_count += 1
                 kept_sections.append({
-                    "heading": fill_result.heading,
+                    "heading": out_heading,
                     "body": fill_result.body,
                     "fill_failed": fill_result.fill_failed,
                     # keep is intentionally NOT persisted; output stays {heading, body, fill_failed}
@@ -1619,7 +1630,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False) -> dict:
                 # Successful fill with keep=True verdict (or default True) → retain
                 kept_count += 1
                 kept_sections.append({
-                    "heading": fill_result.heading,  # use possibly-relabeled heading (e.g. "Abstract")
+                    "heading": out_heading,  # use possibly-relabeled heading (e.g. "Abstract")
                     "body": fill_result.body,
                     "fill_failed": fill_result.fill_failed,
                     # keep is intentionally NOT persisted; output stays {heading, body, fill_failed}
