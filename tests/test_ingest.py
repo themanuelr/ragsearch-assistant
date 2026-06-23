@@ -3242,3 +3242,152 @@ def test_output_refs_have_no_is_reference_key():
         assert set(ref.keys()) == expected_keys, (
             f"Failed-batch ref[{i}] has unexpected keys: {set(ref.keys())} — expected {expected_keys}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.3 Plan 09 (gap closure) Task 2: journal abbreviation hardening + fallback
+# ---------------------------------------------------------------------------
+
+def test_metadata_prompt_forbids_journal_from_doi():
+    """_fill_metadata source instructs that journal must NOT be derived from the DOI string (Plan 09 T2)."""
+    import inspect
+    from scripts.ingest import _fill_metadata
+
+    source = inspect.getsource(_fill_metadata)
+    # Must mention DOI is opaque and journal must not be derived from it
+    assert "DOI" in source or "doi" in source.lower(), (
+        "Expected DOI mentioned in _fill_metadata source"
+    )
+    assert "opaque" in source.lower() or "identifier" in source.lower(), (
+        "Expected DOI described as opaque identifier in _fill_metadata source"
+    )
+    # Must also preserve existing instructions
+    assert "journal abbreviation" in source.lower() or "journal" in source.lower(), (
+        "Expected journal instruction preserved in _fill_metadata source"
+    )
+
+
+def test_ingest_journal_falls_back_to_full_when_abbrev_missing(tmp_path):
+    """ingest() sets journal=journal_full when journal is None but journal_full is set (Plan 09 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 journal fallback test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1016/j.trechm.2021.05.004", arxiv_id=None, title="Test Paper Title Long Enough")
+    # journal=None simulates model failing to extract printed abbreviation (GAP C scenario)
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1016/j.trechm.2021.05.004",
+        year=2021,
+        journal=None,
+        journal_full=None,  # will be enriched by mock crossref
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full", return_value="Trends in Chemistry"):
+        result = ingest(str(fake_pdf), cfg)
+
+    meta = result["extraction"]["metadata"]
+    assert meta["journal"] == "Trends in Chemistry", (
+        f"Expected journal='Trends in Chemistry' (fell back to journal_full), got {meta['journal']!r}"
+    )
+    assert meta["journal_full"] == "Trends in Chemistry", (
+        f"Expected journal_full='Trends in Chemistry' (unchanged), got {meta['journal_full']!r}"
+    )
+
+
+def test_ingest_journal_abbrev_preserved_when_present(tmp_path):
+    """When journal abbreviation is already set, journal_full does NOT overwrite it (Plan 09 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"crossref_validate": True, "crossref_contact_email": "t@e.com"})
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 journal abbrev preserved test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1021/jacs.3c10258", arxiv_id=None, title="Test Paper Title Long Enough")
+    # journal already has the printed abbreviation
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1021/jacs.3c10258",
+        year=2024,
+        journal="J. Am. Chem. Soc.",
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_validate"), \
+         mock.patch("scripts.ingest._crossref_journal_full",
+                    return_value="Journal of the American Chemical Society"):
+        result = ingest(str(fake_pdf), cfg)
+
+    meta = result["extraction"]["metadata"]
+    assert meta["journal"] == "J. Am. Chem. Soc.", (
+        f"Expected journal='J. Am. Chem. Soc.' (printed abbrev preserved), got {meta['journal']!r}"
+    )
+    assert meta["journal_full"] == "Journal of the American Chemical Society", (
+        f"Expected journal_full enriched by crossref, got {meta['journal_full']!r}"
+    )
+
+
+def test_ingest_journal_fallback_noop_when_full_also_missing(tmp_path):
+    """When both journal and journal_full are None, fallback is a no-op — no crash (Plan 09 T2)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path)
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 journal fallback noop test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = _make_two_section_parsed("INTRODUCTION", "RESULTS")
+    probe_result = DoiProbeResult(doi="10.1000/noop.test", arxiv_id=None, title="Test Paper Title Long Enough")
+    # Both None — no fallback possible
+    metadata_result = PaperMetadata(
+        title="Test Paper Title Long Enough",
+        doi="10.1000/noop.test",
+        year=2024,
+        journal=None,
+        journal_full=None,
+    )
+    section_fill = SectionFillResult(heading="INTRODUCTION", body="body text " * 20, fill_failed=False, keep=True)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest._crossref_journal_full", return_value=None):
+        result = ingest(str(fake_pdf), cfg)
+
+    meta = result["extraction"]["metadata"]
+    assert meta["journal"] is None, (
+        f"Expected journal=None when both journal and journal_full are None, got {meta['journal']!r}"
+    )
