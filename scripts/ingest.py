@@ -1339,6 +1339,7 @@ def _assemble_paperjson(parsed: dict, provenance: dict) -> dict:
         "summary": None,
         "claims": [],
         "methods_overview": None,
+        "results": None,  # D-09: Phase 2 fills Results section
         "limitations": [],
         "open_questions": [],
         "entities": [],
