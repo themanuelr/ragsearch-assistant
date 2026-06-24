@@ -287,3 +287,204 @@ def test_ollama_unreachable_fails_fast(paperjson):
          mock.patch("scripts.note._warmup_ollama"):
         with pytest.raises(RuntimeError, match="Ollama error"):
             _generate_analysis(paperjson)
+
+
+# ---------------------------------------------------------------------------
+# NOTE-02: Frontmatter YAML safety — colon in title round-trips (SC2)
+# ---------------------------------------------------------------------------
+
+def test_frontmatter_yaml_safe():
+    """YAML frontmatter double-quotes string values; colons round-trip safely."""
+    import yaml
+    from scripts.note import _render_frontmatter
+
+    meta = {
+        "title": "Attention: All You Need",
+        "authors": ["Alice O'Brien", "Bob Jones-Smith"],
+        "year": 2025,
+        "journal": "Nature: Methods",
+        "doi": "10.1234/test",
+        "arxiv_id": None,
+    }
+    analysis = {
+        "topics": ["transformers", "attention mechanisms"],
+    }
+
+    fm = _render_frontmatter(meta, analysis)
+
+    # Must start and end with ---
+    assert fm.startswith("---"), "frontmatter must start with ---"
+    assert "---" in fm[3:], "frontmatter must end with ---"
+
+    # Extract YAML content between fences
+    lines = fm.strip().split("\n")
+    assert lines[0] == "---", "first line must be ---"
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i] == "---":
+            end_idx = i
+            break
+    assert end_idx is not None, "closing --- not found"
+    yaml_text = "\n".join(lines[1:end_idx])
+
+    # Must round-trip through yaml.safe_load
+    loaded = yaml.safe_load(yaml_text)
+    assert loaded is not None, "yaml.safe_load returned None"
+    assert loaded["title"] == "Attention: All You Need", (
+        f"title mismatch: {loaded['title']!r}"
+    )
+    assert loaded["year"] == 2025, f"year mismatch: {loaded['year']!r}"
+
+
+# ---------------------------------------------------------------------------
+# Render note: section headers and callouts (NOTE-02 / SC3)
+# ---------------------------------------------------------------------------
+
+def test_render_note_sections_and_callouts():
+    """_render_note contains required sections and exactly one of each callout."""
+    from scripts.note import _render_note
+
+    pj = _make_paperjson()
+    pj["analysis"]["summary"] = "A summary of the paper."
+    pj["analysis"]["claims"] = ["Key contribution 1", "Key contribution 2"]
+    pj["analysis"]["methods_overview"] = "Used attention."
+    pj["analysis"]["results"] = "State of the art."
+    pj["analysis"]["limitations"] = ["English only", "Compute heavy"]
+    pj["analysis"]["topics"] = ["transformers"]
+    pj["analysis"]["open_questions"] = ["Scalability?"]
+    pj["analysis"]["generated_by"] = "gemma4:e4b"
+
+    rendered = _render_note(pj)
+
+    # Required section headers
+    for header in ["## Summary", "## Key Findings", "## Methodology",
+                   "## Results", "## Limitations", "## My Notes"]:
+        assert header in rendered, f"Missing section header: {header}"
+
+    # Exactly one [!important] and one [!warning] callout
+    assert rendered.count("[!important]") == 1, (
+        f"Expected exactly 1 [!important] callout, got {rendered.count('[!important]')}"
+    )
+    assert rendered.count("[!warning]") == 1, (
+        f"Expected exactly 1 [!warning] callout, got {rendered.count('[!warning]')}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sanitize filename — Windows-illegal chars stripped (T-02-03)
+# ---------------------------------------------------------------------------
+
+def test_sanitize_filename():
+    """_sanitize_filename strips all Windows-illegal chars and caps length."""
+    from scripts.note import _sanitize_filename
+
+    result = _sanitize_filename('A/B:C*?"<>|D')
+    illegal = set('/\\:*?"<>|')
+    for ch in result:
+        assert ch not in illegal, f"Illegal char {ch!r} found in sanitized: {result!r}"
+    assert len(result) > 0, "sanitized filename should not be empty"
+
+    # Empty input -> Untitled
+    assert _sanitize_filename("") == "Untitled", "empty title should become Untitled"
+    assert _sanitize_filename("???") == "Untitled", "all-illegal title should become Untitled"
+
+    # Length cap
+    long_title = "A" * 300
+    assert len(_sanitize_filename(long_title)) <= 200, "filename exceeds max_length"
+
+
+# ---------------------------------------------------------------------------
+# generate_note: vault write via obsidian-cli (mocked)
+# ---------------------------------------------------------------------------
+
+def test_generate_note_creates_note():
+    """generate_note calls create_note with correct args on a new note."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    config = {"vault_name": "test-vault"}
+
+    with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
+         mock.patch("scripts.note._render_note", return_value="# Test Note\n") as mock_render, \
+         mock.patch("scripts.obsidian_cli.preflight", return_value=True), \
+         mock.patch("scripts.obsidian_cli.note_exists", return_value=False), \
+         mock.patch("scripts.obsidian_cli.create_note", return_value="Created: Papers/Test Paper A Study.md") as mock_create:
+
+        result = generate_note(pj, config, force=False)
+
+    mock_create.assert_called_once()
+    call_kwargs = mock_create.call_args
+    # path must start with Papers/ and contain no ..
+    path_arg = call_kwargs[1].get("path", call_kwargs[0][0] if call_kwargs[0] else "")
+    assert path_arg.startswith("Papers/"), f"path should start with Papers/, got {path_arg!r}"
+    assert ".." not in path_arg, f"path should not contain '..', got {path_arg!r}"
+    # overwrite should be False (default)
+    overwrite_arg = call_kwargs[1].get("overwrite", call_kwargs[0][3] if len(call_kwargs[0]) > 3 else False)
+    assert overwrite_arg is False, "overwrite should be False when force=False"
+
+
+def test_generate_note_skips_existing():
+    """generate_note skips without calling create_note when note exists and force=False."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    config = {"vault_name": "test-vault"}
+
+    with mock.patch("scripts.note._generate_analysis"), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.obsidian_cli.preflight", return_value=True), \
+         mock.patch("scripts.obsidian_cli.note_exists", return_value=True), \
+         mock.patch("scripts.obsidian_cli.create_note") as mock_create:
+
+        result = generate_note(pj, config, force=False)
+
+    mock_create.assert_not_called()
+
+
+def test_generate_note_force_overwrites():
+    """generate_note calls create_note with overwrite=True when force=True."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    config = {"vault_name": "test-vault"}
+
+    with mock.patch("scripts.note._generate_analysis"), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.obsidian_cli.preflight", return_value=True), \
+         mock.patch("scripts.obsidian_cli.note_exists", return_value=True), \
+         mock.patch("scripts.obsidian_cli.create_note", return_value="Created") as mock_create:
+
+        result = generate_note(pj, config, force=True)
+
+    mock_create.assert_called_once()
+    call_kwargs = mock_create.call_args
+    overwrite_arg = call_kwargs[1].get("overwrite", False)
+    assert overwrite_arg is True, "overwrite should be True when force=True"
+
+
+def test_generate_note_missing_vault_name():
+    """generate_note returns error when vault_name is missing from config."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    config = {}  # no vault_name
+
+    result = generate_note(pj, config)
+    assert result.startswith("[note error:"), (
+        f"Expected [note error: prefix, got {result!r}"
+    )
+
+
+def test_generate_note_preflight_failure():
+    """generate_note returns error when preflight fails."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    config = {"vault_name": "test-vault"}
+
+    with mock.patch("scripts.obsidian_cli.preflight", return_value=False):
+        result = generate_note(pj, config)
+
+    assert result.startswith("[note error:"), (
+        f"Expected [note error: prefix, got {result!r}"
+    )
