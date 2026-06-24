@@ -1486,6 +1486,37 @@ def _write_registry(entry: dict, registry_path: str, key: str) -> None:
         os.replace(tmp_path, registry_path)
 
 
+def _write_paperjson_cache(paperjson: dict, stem: str, cache_dir: str = ".paperjson_cache") -> str:
+    """
+    Write the full PaperJSON to a cache file using atomic os.replace (D-06).
+
+    Mirrors _write_registry's durability pattern: ensure dir exists, write to a
+    temp file, then atomically replace. The cache file survives across runs
+    (not auto-deleted) for crash recovery and Phase 5 consumption.
+
+    Args:
+        paperjson:  Full PaperJSON v2 dict.
+        stem:       PDF filename stem (pathlib.Path(pdf).stem).
+        cache_dir:  Directory for cache files (default: .paperjson_cache).
+
+    Returns:
+        Absolute path to the written cache file.
+    """
+    cache_path = pathlib.Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    target = cache_path / f"{stem}.json"
+    tmp_file = str(target) + ".tmp"
+
+    lock_path = str(target) + ".lock"
+    with filelock.FileLock(lock_path):
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(paperjson, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, str(target))
+
+    return str(target.resolve())
+
+
 def _check_registry(key: str, registry_path: str) -> dict | None:
     """
     Return the cached registry entry for key, or None if not present.
@@ -1849,14 +1880,29 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: boo
     # No additional rendition pass is required here — the body IS the cleaned text.
     _log("renditions")
 
+    # Step 11b: PaperJSON cache write (D-06 — surviving, gitignored)
+    _log("cache write")
+    cache_path = _write_paperjson_cache(skeleton, pathlib.Path(pdf).stem)
+
     # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
     if registry_path:
         _log("registry write")
-        entry = _registry_entry(skeleton, str(pdf), "", project_name)
+        entry = _registry_entry(skeleton, str(pdf), cache_path, project_name)
         try:
             _write_registry(entry, registry_path, registry_key)
         except Exception as e:
             print(f"[ingest warning: registry write failed: {e}]", file=sys.stderr)
+
+    # Step 12b: Auto-invoke note generation (D-05/D-07 — best-effort)
+    try:
+        from scripts import note as note
+        note_result = note.generate_note(skeleton, config)
+        if isinstance(note_result, str) and (
+            note_result.startswith("[note error:") or note_result.startswith("[note warning:")
+        ):
+            _log(f"note generation failed: {note_result}")
+    except Exception as e:
+        print(f"[ingest warning: note generation failed: {e}]", file=sys.stderr)
 
     # Step 13: Warn on partial fill, return skeleton
     if failed_count > 0:

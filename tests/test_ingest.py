@@ -4664,7 +4664,7 @@ def test_cache_written_after_ingest(tmp_path):
          mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
          mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
          mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
-         mock.patch("scripts.ingest.note.generate_note", return_value="Papers/Cache Test Paper.md"), \
+         mock.patch("scripts.note.generate_note", return_value="Papers/Cache Test Paper.md"), \
          mock.patch.dict(os.environ, {}, clear=False):
         result = ingest(str(fake_pdf), cfg)
 
@@ -4727,7 +4727,7 @@ def test_registry_paperjson_path_populated(tmp_path):
          mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
          mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
          mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
-         mock.patch("scripts.ingest.note.generate_note", return_value="Papers/RegPath Test Paper.md"):
+         mock.patch("scripts.note.generate_note", return_value="Papers/RegPath Test Paper.md"):
         ingest(str(fake_pdf), cfg)
 
     registry = _read_registry(reg_path)
@@ -4788,7 +4788,7 @@ def test_generate_note_auto_invoked(tmp_path):
          mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
          mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
          mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
-         mock.patch("scripts.ingest.note.generate_note", mock_gen_note):
+         mock.patch("scripts.note.generate_note", mock_gen_note):
         ingest(str(fake_pdf), cfg)
 
     mock_gen_note.assert_called_once()
@@ -4849,7 +4849,7 @@ def test_generate_note_failure_does_not_fail_ingest(tmp_path):
          mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
          mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
          mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
-         mock.patch("scripts.ingest.note.generate_note", side_effect=note_explodes):
+         mock.patch("scripts.note.generate_note", side_effect=note_explodes):
         # Must NOT raise — note failure is best-effort
         result = ingest(str(fake_pdf), cfg)
 
@@ -4903,7 +4903,7 @@ def test_generate_note_error_string_logged(tmp_path):
          mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
          mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
          mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
-         mock.patch("scripts.ingest.note.generate_note", return_value="[note error: vault unreachable]"):
+         mock.patch("scripts.note.generate_note", return_value="[note error: vault unreachable]"):
         result = ingest(str(fake_pdf), cfg)
 
     # Must still return successfully

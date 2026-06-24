@@ -460,6 +460,24 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Standalone cache resolution (D-07)
+# ---------------------------------------------------------------------------
+
+def _resolve_paperjson_path(stem: str, cache_dir: str = ".paperjson_cache") -> str:
+    """Resolve the default PaperJSON cache file path from a PDF stem.
+
+    Args:
+        stem:       PDF filename stem (e.g. ``my_paper``).
+        cache_dir:  Directory containing cached PaperJSON files.
+
+    Returns:
+        Absolute path to ``<cache_dir>/<stem>.json``.
+    """
+    import pathlib as _pathlib
+    return str((_pathlib.Path(cache_dir) / f"{stem}.json").resolve())
+
+
+# ---------------------------------------------------------------------------
 # Standalone CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -472,8 +490,12 @@ if __name__ == "__main__":
         description="Generate an Obsidian note from a PaperJSON v2 cache file."
     )
     parser.add_argument(
-        "--paperjson", required=True,
-        help="Path to the PaperJSON v2 cache file (JSON).",
+        "--paperjson", default=None,
+        help="Path to the PaperJSON v2 cache file (JSON). When omitted, resolves .paperjson_cache/<stem>.json.",
+    )
+    parser.add_argument(
+        "--stem", default=None,
+        help="PDF filename stem (without extension). Used to resolve cache when --paperjson is omitted.",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -483,7 +505,16 @@ if __name__ == "__main__":
 
     try:
         config = _load_config()
-        with open(args.paperjson, encoding="utf-8") as f:
+
+        # Resolve PaperJSON path: explicit --paperjson, or default from --stem
+        if args.paperjson:
+            pj_path = args.paperjson
+        elif args.stem:
+            pj_path = _resolve_paperjson_path(args.stem)
+        else:
+            parser.error("either --paperjson or --stem is required")
+
+        with open(pj_path, encoding="utf-8") as f:
             paperjson = json.load(f)
         result = generate_note(paperjson, config, force=args.force)
         print(result)
