@@ -8,6 +8,7 @@ Run with:  python -m pytest tests/test_ingest.py -x
 """
 
 import json
+import os
 import pathlib
 import pytest
 
@@ -4616,3 +4617,300 @@ def test_quality_gate_counts_nontext_blocks():
     assert result is None, (
         f"Expected quality gate to PASS on figure/table-heavy paper (non-text blocks counted), got: {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 03 Task 1: PaperJSON cache write + registry paperjson_path + auto-invoke
+# ---------------------------------------------------------------------------
+
+
+def test_cache_written_after_ingest(tmp_path):
+    """After ingest(), .paperjson_cache/<stem>.json exists with extraction + analysis keys."""
+    from scripts.ingest import ingest, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+
+    fake_pdf = tmp_path / "my_paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for cache test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Cache Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "Cache Test Paper", "plain": "Cache Test Paper"},
+            {"type": "text", "display": "D" * 200, "plain": "D" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Cache Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/cache.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/cache.test", arxiv_id=None, title="Cache Test Paper")
+    metadata_result = PaperMetadata(title="Cache Test Paper", doi="10.1000/cache.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="Cache Test Paper " + "D" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest.note.generate_note", return_value="Papers/Cache Test Paper.md"), \
+         mock.patch.dict(os.environ, {}, clear=False):
+        result = ingest(str(fake_pdf), cfg)
+
+    # Cache file must exist under .paperjson_cache/<stem>.json
+    cache_file = pathlib.Path(".paperjson_cache") / "my_paper.json"
+    assert cache_file.exists(), (
+        f"Expected cache file at {cache_file}, but it does not exist"
+    )
+
+    # Cache must contain extraction + analysis keys
+    with open(cache_file, encoding="utf-8") as f:
+        cached = json.load(f)
+    assert "extraction" in cached, "Cache file missing 'extraction' key"
+    assert "analysis" in cached, "Cache file missing 'analysis' key"
+
+    # Cleanup
+    import shutil
+    if pathlib.Path(".paperjson_cache").exists():
+        shutil.rmtree(".paperjson_cache")
+
+
+def test_registry_paperjson_path_populated(tmp_path):
+    """After ingest(), registry entry's paperjson_path equals the cache file path (not '')."""
+    from scripts.ingest import ingest, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+    reg_path = cfg["registry_path"]
+
+    fake_pdf = tmp_path / "reg_path_paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for reg path test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "RegPath Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "RegPath Test Paper", "plain": "RegPath Test Paper"},
+            {"type": "text", "display": "E" * 200, "plain": "E" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "RegPath Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/regpath.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/regpath.test", arxiv_id=None, title="RegPath Test Paper")
+    metadata_result = PaperMetadata(title="RegPath Test Paper", doi="10.1000/regpath.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="RegPath Test Paper " + "E" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest.note.generate_note", return_value="Papers/RegPath Test Paper.md"):
+        ingest(str(fake_pdf), cfg)
+
+    registry = _read_registry(reg_path)
+    entry = registry.get("10.1000/regpath.test")
+    assert entry is not None, "Expected registry entry for the test paper"
+    assert entry["paperjson_path"] != "", (
+        f"Expected paperjson_path to be populated, got empty string"
+    )
+    assert "reg_path_paper.json" in entry["paperjson_path"], (
+        f"Expected paperjson_path to contain stem-based filename, got: {entry['paperjson_path']!r}"
+    )
+
+    # Cleanup
+    import shutil
+    if pathlib.Path(".paperjson_cache").exists():
+        shutil.rmtree(".paperjson_cache")
+
+
+def test_generate_note_auto_invoked(tmp_path):
+    """ingest() calls note.generate_note once with the in-memory PaperJSON dict (D-07)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+
+    fake_pdf = tmp_path / "autoinvoke.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for auto-invoke test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "AutoInvoke Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "AutoInvoke Test Paper", "plain": "AutoInvoke Test Paper"},
+            {"type": "text", "display": "F" * 200, "plain": "F" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "AutoInvoke Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/autoinvoke.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/autoinvoke.test", arxiv_id=None, title="AutoInvoke Test Paper")
+    metadata_result = PaperMetadata(title="AutoInvoke Test Paper", doi="10.1000/autoinvoke.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="AutoInvoke Test Paper " + "F" * 200, fill_failed=False)
+
+    mock_gen_note = mock.MagicMock(return_value="Papers/AutoInvoke Test Paper.md")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest.note.generate_note", mock_gen_note):
+        ingest(str(fake_pdf), cfg)
+
+    mock_gen_note.assert_called_once()
+    # The first positional arg should be the PaperJSON dict (in-memory, not re-read)
+    call_args = mock_gen_note.call_args
+    pj_arg = call_args[0][0]
+    assert isinstance(pj_arg, dict), "generate_note should receive a dict (PaperJSON)"
+    assert "extraction" in pj_arg, "PaperJSON arg should have 'extraction' key"
+    assert "analysis" in pj_arg, "PaperJSON arg should have 'analysis' key"
+
+    # Cleanup
+    import shutil
+    if pathlib.Path(".paperjson_cache").exists():
+        shutil.rmtree(".paperjson_cache")
+
+
+def test_generate_note_failure_does_not_fail_ingest(tmp_path):
+    """When generate_note raises, ingest() does NOT propagate — best-effort (D-05)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+
+    fake_pdf = tmp_path / "notefail.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for note-fail test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "NoteFail Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "NoteFail Test Paper", "plain": "NoteFail Test Paper"},
+            {"type": "text", "display": "G" * 200, "plain": "G" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "NoteFail Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/notefail.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/notefail.test", arxiv_id=None, title="NoteFail Test Paper")
+    metadata_result = PaperMetadata(title="NoteFail Test Paper", doi="10.1000/notefail.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="NoteFail Test Paper " + "G" * 200, fill_failed=False)
+
+    # generate_note raises an exception
+    def note_explodes(*args, **kwargs):
+        raise RuntimeError("Obsidian crashed!")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest.note.generate_note", side_effect=note_explodes):
+        # Must NOT raise — note failure is best-effort
+        result = ingest(str(fake_pdf), cfg)
+
+    # ingest should return the PaperJSON dict successfully
+    assert isinstance(result, dict), "ingest() should return PaperJSON dict even when note fails"
+    assert "extraction" in result, "Returned dict should have 'extraction' key"
+
+    # Cleanup
+    import shutil
+    if pathlib.Path(".paperjson_cache").exists():
+        shutil.rmtree(".paperjson_cache")
+
+
+def test_generate_note_error_string_logged(tmp_path):
+    """When generate_note returns '[note error: ...]', ingest logs a warning but does not fail."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+
+    fake_pdf = tmp_path / "noteerr.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for note-error test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "NoteErr Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "NoteErr Test Paper", "plain": "NoteErr Test Paper"},
+            {"type": "text", "display": "H" * 200, "plain": "H" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "NoteErr Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/noteerr.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/noteerr.test", arxiv_id=None, title="NoteErr Test Paper")
+    metadata_result = PaperMetadata(title="NoteErr Test Paper", doi="10.1000/noteerr.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="NoteErr Test Paper " + "H" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.ingest.note.generate_note", return_value="[note error: vault unreachable]"):
+        result = ingest(str(fake_pdf), cfg)
+
+    # Must still return successfully
+    assert isinstance(result, dict), "ingest() should return PaperJSON dict even on note error string"
+    assert "extraction" in result, "Returned dict should have 'extraction' key"
+
+    # Cleanup
+    import shutil
+    if pathlib.Path(".paperjson_cache").exists():
+        shutil.rmtree(".paperjson_cache")

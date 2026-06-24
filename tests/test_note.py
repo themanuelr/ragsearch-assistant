@@ -488,3 +488,28 @@ def test_generate_note_preflight_failure():
     assert result.startswith("[note error:"), (
         f"Expected [note error: prefix, got {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 03: Standalone note.py default cache resolution (D-07)
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_default_cache_resolution(tmp_path):
+    """When --paperjson is omitted and --stem is given, note.py resolves .paperjson_cache/<stem>.json."""
+    import pathlib
+
+    # Create a cache file at .paperjson_cache/<stem>.json
+    cache_dir = tmp_path / ".paperjson_cache"
+    cache_dir.mkdir()
+    pj = _make_paperjson()
+    cache_file = cache_dir / "my_paper.json"
+    cache_file.write_text(json.dumps(pj), encoding="utf-8")
+
+    # Import _resolve_paperjson_path (to be added in GREEN phase)
+    from scripts.note import _resolve_paperjson_path
+
+    resolved = _resolve_paperjson_path(stem="my_paper", cache_dir=str(cache_dir))
+    assert resolved == str(cache_file), (
+        f"Expected resolved path to be {cache_file}, got {resolved!r}"
+    )
