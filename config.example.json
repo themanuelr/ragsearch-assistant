@@ -1,7 +1,9 @@
 {
   "registry_path": "~/research/papers_registry.json",
   "vault_path": "~/vault/MyProject",
+  "vault_name": "ragsearch-assistant",
   "project_name": "my-project",
   "mineru_path": "",
-  "mineru_timeout": 1800
+  "mineru_timeout": 1800,
+  "obsidian_exe": ""
 }

@@ -57,6 +57,9 @@ STARTING_POINT.md
 
 # MinerU output artifacts (persistent, git-ignored per D-16)
 .mineru_output/
+
+# PaperJSON cache (regenerable crash-safety tier, git-ignored per D-06)
+.paperjson_cache/
 # Local UAT / debug outputs at repo root (e.g. ingest.py -o out1.json, transcripts)
 /out*.json
 /*.log
