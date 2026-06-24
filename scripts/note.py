@@ -10,6 +10,7 @@ chokepoint.
 Run standalone:  python scripts/note.py --paperjson <cache>.json [--force]
 """
 
+import argparse
 import datetime
 import json
 import re
@@ -25,12 +26,14 @@ from scripts.ingest import (
     _load_config,
     OLLAMA_MODEL,
 )
+from scripts.obsidian_cli import preflight, note_exists, create_note
 
 # ---------------------------------------------------------------------------
 # Module constants
 # ---------------------------------------------------------------------------
 
 _SECTION_TIMEOUT = 300  # seconds per analysis call (configurable via config.json)
+_WINDOWS_ILLEGAL = re.compile(r'[/\\:*?"<>|]')
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -256,3 +259,236 @@ def _generate_analysis(paperjson: dict) -> None:
         analysis["limitations"] = ["(generation failed -- see raw extract)"]
 
     analysis["generated_by"] = OLLAMA_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Filename sanitization (T-02-03, D-17)
+# ---------------------------------------------------------------------------
+
+def _sanitize_filename(title: str, max_length: int = 200) -> str:
+    """Sanitize a paper title for use as a Windows-safe filename.
+
+    Strips all Windows-illegal characters (``/ \\ : * ? " < > |``), collapses
+    whitespace, and caps length.  Returns ``Untitled`` when the result is empty.
+    """
+    sanitized = _WINDOWS_ILLEGAL.sub("", title)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length].rstrip()
+    if not sanitized:
+        sanitized = "Untitled"
+    return sanitized
+
+
+# ---------------------------------------------------------------------------
+# YAML frontmatter rendering (D-17, D-18, SC2, Pitfall 6)
+# ---------------------------------------------------------------------------
+
+def _render_frontmatter(meta: dict, analysis: dict) -> str:
+    """Render YAML frontmatter between ``---`` fences.
+
+    Every string value is double-quoted with internal ``"`` escaped, so
+    ``yaml.safe_load()`` survives colons and special characters (SC2, Pitfall 6).
+    Nullable doi/arxiv_id are omitted when None (Discretion).
+    """
+    title = meta.get("title", "Untitled").replace('"', '\\"')
+    lines = ["---"]
+    lines.append(f'title: "{title}"')
+
+    # Authors as YAML list, each double-quoted (Pitfall 6)
+    authors = meta.get("authors") or []
+    if authors:
+        lines.append("authors:")
+        for a in authors:
+            escaped = str(a).replace('"', '\\"')
+            lines.append(f'  - "{escaped}"')
+
+    # Simple scalar fields
+    year = meta.get("year")
+    if year is not None:
+        lines.append(f"year: {year}")
+
+    journal = meta.get("journal")
+    if journal:
+        escaped = str(journal).replace('"', '\\"')
+        lines.append(f'journal: "{escaped}"')
+
+    # Nullable fields — omit when None (Discretion)
+    doi = meta.get("doi")
+    if doi:
+        lines.append(f'doi: "{doi}"')
+
+    arxiv_id = meta.get("arxiv_id")
+    if arxiv_id:
+        lines.append(f'arxiv_id: "{arxiv_id}"')
+
+    # Tags from analysis.topics (D-11) — slugified lower-kebab
+    topics = analysis.get("topics") or []
+    if topics:
+        lines.append("tags:")
+        for t in topics:
+            slug = str(t).lower().replace(" ", "-")
+            lines.append(f"  - {slug}")
+
+    lines.append("status: ingested")
+    lines.append(f"date_ingested: {datetime.date.today().isoformat()}")
+    lines.append("---")
+    lines.append("")  # blank line after frontmatter
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic note rendering (Pattern 3, D-08, D-14, D-15)
+# ---------------------------------------------------------------------------
+
+def _render_note(paperjson: dict) -> str:
+    """Render a complete Obsidian note from PaperJSON v2.
+
+    Deterministic assembly from structured analysis + extraction data.
+    No LLM call here — callouts are derived from claims[0] / limitations[0].
+    """
+    meta = paperjson["extraction"]["metadata"]
+    analysis = paperjson["analysis"]
+
+    # YAML frontmatter
+    frontmatter = _render_frontmatter(meta, analysis)
+
+    parts = []
+    parts.append(f"# {meta.get('title', 'Untitled')}")
+    parts.append("")
+
+    # Summary section
+    summary = analysis.get("summary") or "(generation failed -- raw extract below)"
+    parts.append("## Summary")
+    parts.append("")
+    parts.append(summary)
+    parts.append("")
+
+    # [!important] callout after Summary (D-15)
+    claims = analysis.get("claims") or []
+    if claims:
+        parts.append(f"> [!important] Key Contribution")
+        parts.append(f"> {claims[0]}")
+        parts.append("")
+
+    # Key Findings section — bullet list of all claims
+    parts.append("## Key Findings")
+    parts.append("")
+    for claim in claims:
+        parts.append(f"- {claim}")
+    parts.append("")
+
+    # Methodology
+    methods = analysis.get("methods_overview") or "(generation failed)"
+    parts.append("## Methodology")
+    parts.append("")
+    parts.append(methods)
+    parts.append("")
+
+    # Results
+    results = analysis.get("results") or "(generation failed)"
+    parts.append("## Results")
+    parts.append("")
+    parts.append(results)
+    parts.append("")
+
+    # Limitations section with [!warning] callout (D-15)
+    parts.append("## Limitations")
+    parts.append("")
+    limitations = analysis.get("limitations") or []
+    if limitations:
+        parts.append(f"> [!warning] Limitation")
+        parts.append(f"> {limitations[0]}")
+        parts.append("")
+    for lim in limitations:
+        parts.append(f"- {lim}")
+    parts.append("")
+
+    # My Notes section (user-owned, protected by skip-by-default)
+    parts.append("## My Notes")
+    parts.append("")
+
+    return frontmatter + "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: analysis -> render -> vault write
+# ---------------------------------------------------------------------------
+
+def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
+    """Generate a note from PaperJSON and write it to the vault.
+
+    Orchestrates: preflight -> analysis -> render -> vault write.
+
+    Returns the vault path on success, or a ``[note error: ...]`` string on failure.
+    On an existing note with ``force=False``, skips (D-16) and returns a skip notice.
+    """
+    # Fail-fast: vault_name required
+    vault_name = config.get("vault_name")
+    if not vault_name:
+        return "[note error: vault_name not set in config.json]"
+
+    # Preflight: Obsidian running + vault reachable
+    if not preflight(vault_name):
+        return "[note error: Obsidian not running / vault unreachable]"
+
+    # Run analysis generation (7 LLM calls)
+    _generate_analysis(paperjson)
+
+    # Determine filename and path
+    meta = paperjson["extraction"]["metadata"]
+    title = meta.get("title", "Untitled")
+    filename = _sanitize_filename(title)
+    path = f"Papers/{filename}.md"
+
+    # Security: reject path traversal (T-02-03)
+    if ".." in path or path.startswith("/") or path.startswith("\\"):
+        return f"[note error: invalid path '{path}' -- path traversal rejected]"
+
+    # Skip-by-default (D-16): existing note + no force -> skip
+    if note_exists(path, vault_name) and not force:
+        _log(f"note already exists at {path} -- skipping (use --force to overwrite)")
+        return path
+
+    # Render the note
+    rendered = _render_note(paperjson)
+
+    # Write to vault via obsidian-cli chokepoint
+    create_note(path=path, content=rendered, vault_name=vault_name, overwrite=force)
+    _log(f"wrote note to {path}")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Windows cp1252 guard: wrap stdout in UTF-8 before any print (D-PATTERNS)
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(
+        description="Generate an Obsidian note from a PaperJSON v2 cache file."
+    )
+    parser.add_argument(
+        "--paperjson", required=True,
+        help="Path to the PaperJSON v2 cache file (JSON).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing note instead of skipping (D-16).",
+    )
+    args = parser.parse_args()
+
+    try:
+        config = _load_config()
+        with open(args.paperjson, encoding="utf-8") as f:
+            paperjson = json.load(f)
+        result = generate_note(paperjson, config, force=args.force)
+        print(result)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[note error: {e}]", file=sys.stderr)
+        sys.exit(1)

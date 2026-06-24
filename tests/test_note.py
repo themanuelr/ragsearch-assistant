@@ -406,9 +406,9 @@ def test_generate_note_creates_note():
 
     with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
          mock.patch("scripts.note._render_note", return_value="# Test Note\n") as mock_render, \
-         mock.patch("scripts.obsidian_cli.preflight", return_value=True), \
-         mock.patch("scripts.obsidian_cli.note_exists", return_value=False), \
-         mock.patch("scripts.obsidian_cli.create_note", return_value="Created: Papers/Test Paper A Study.md") as mock_create:
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created: Papers/Test Paper A Study.md") as mock_create:
 
         result = generate_note(pj, config, force=False)
 
@@ -432,9 +432,9 @@ def test_generate_note_skips_existing():
 
     with mock.patch("scripts.note._generate_analysis"), \
          mock.patch("scripts.note._render_note", return_value="# Test\n"), \
-         mock.patch("scripts.obsidian_cli.preflight", return_value=True), \
-         mock.patch("scripts.obsidian_cli.note_exists", return_value=True), \
-         mock.patch("scripts.obsidian_cli.create_note") as mock_create:
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=True), \
+         mock.patch("scripts.note.create_note") as mock_create:
 
         result = generate_note(pj, config, force=False)
 
@@ -450,9 +450,9 @@ def test_generate_note_force_overwrites():
 
     with mock.patch("scripts.note._generate_analysis"), \
          mock.patch("scripts.note._render_note", return_value="# Test\n"), \
-         mock.patch("scripts.obsidian_cli.preflight", return_value=True), \
-         mock.patch("scripts.obsidian_cli.note_exists", return_value=True), \
-         mock.patch("scripts.obsidian_cli.create_note", return_value="Created") as mock_create:
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=True), \
+         mock.patch("scripts.note.create_note", return_value="Created") as mock_create:
 
         result = generate_note(pj, config, force=True)
 
@@ -482,7 +482,7 @@ def test_generate_note_preflight_failure():
     pj = _make_paperjson()
     config = {"vault_name": "test-vault"}
 
-    with mock.patch("scripts.obsidian_cli.preflight", return_value=False):
+    with mock.patch("scripts.note.preflight", return_value=False):
         result = generate_note(pj, config)
 
     assert result.startswith("[note error:"), (
