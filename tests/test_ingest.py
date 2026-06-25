@@ -4624,7 +4624,7 @@ def test_quality_gate_counts_nontext_blocks():
 # ---------------------------------------------------------------------------
 
 
-def test_cache_written_after_ingest(tmp_path):
+def test_cache_written_after_ingest(tmp_path, monkeypatch):
     """After ingest(), .paperjson_cache/<stem>.json exists with extraction + analysis keys."""
     from scripts.ingest import ingest, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
 
@@ -4655,6 +4655,8 @@ def test_cache_written_after_ingest(tmp_path):
     metadata_result = PaperMetadata(title="Cache Test Paper", doi="10.1000/cache.test", year=2024)
     section_fill = SectionFillResult(heading="", body="Cache Test Paper " + "D" * 200, fill_failed=False)
 
+    monkeypatch.chdir(tmp_path)
+
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
@@ -4668,8 +4670,8 @@ def test_cache_written_after_ingest(tmp_path):
          mock.patch.dict(os.environ, {}, clear=False):
         result = ingest(str(fake_pdf), cfg)
 
-    # Cache file must exist under .paperjson_cache/<stem>.json
-    cache_file = pathlib.Path(".paperjson_cache") / "my_paper.json"
+    # Cache file must exist under .paperjson_cache/<stem>.json (under tmp_path via chdir)
+    cache_file = tmp_path / ".paperjson_cache" / "my_paper.json"
     assert cache_file.exists(), (
         f"Expected cache file at {cache_file}, but it does not exist"
     )
@@ -4680,13 +4682,8 @@ def test_cache_written_after_ingest(tmp_path):
     assert "extraction" in cached, "Cache file missing 'extraction' key"
     assert "analysis" in cached, "Cache file missing 'analysis' key"
 
-    # Cleanup
-    import shutil
-    if pathlib.Path(".paperjson_cache").exists():
-        shutil.rmtree(".paperjson_cache")
 
-
-def test_registry_paperjson_path_populated(tmp_path):
+def test_registry_paperjson_path_populated(tmp_path, monkeypatch):
     """After ingest(), registry entry's paperjson_path equals the cache file path (not '')."""
     from scripts.ingest import ingest, _read_registry, DoiProbeResult, PaperMetadata, SectionFillResult
 
@@ -4718,6 +4715,8 @@ def test_registry_paperjson_path_populated(tmp_path):
     metadata_result = PaperMetadata(title="RegPath Test Paper", doi="10.1000/regpath.test", year=2024)
     section_fill = SectionFillResult(heading="", body="RegPath Test Paper " + "E" * 200, fill_failed=False)
 
+    monkeypatch.chdir(tmp_path)
+
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
@@ -4740,13 +4739,8 @@ def test_registry_paperjson_path_populated(tmp_path):
         f"Expected paperjson_path to contain stem-based filename, got: {entry['paperjson_path']!r}"
     )
 
-    # Cleanup
-    import shutil
-    if pathlib.Path(".paperjson_cache").exists():
-        shutil.rmtree(".paperjson_cache")
 
-
-def test_generate_note_auto_invoked(tmp_path):
+def test_generate_note_auto_invoked(tmp_path, monkeypatch):
     """ingest() calls note.generate_note once with the in-memory PaperJSON dict (D-07)."""
     from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
 
@@ -4779,6 +4773,8 @@ def test_generate_note_auto_invoked(tmp_path):
 
     mock_gen_note = mock.MagicMock(return_value="Papers/AutoInvoke Test Paper.md")
 
+    monkeypatch.chdir(tmp_path)
+
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
@@ -4799,13 +4795,8 @@ def test_generate_note_auto_invoked(tmp_path):
     assert "extraction" in pj_arg, "PaperJSON arg should have 'extraction' key"
     assert "analysis" in pj_arg, "PaperJSON arg should have 'analysis' key"
 
-    # Cleanup
-    import shutil
-    if pathlib.Path(".paperjson_cache").exists():
-        shutil.rmtree(".paperjson_cache")
 
-
-def test_generate_note_failure_does_not_fail_ingest(tmp_path):
+def test_generate_note_failure_does_not_fail_ingest(tmp_path, monkeypatch):
     """When generate_note raises, ingest() does NOT propagate — best-effort (D-05)."""
     from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
 
@@ -4840,6 +4831,8 @@ def test_generate_note_failure_does_not_fail_ingest(tmp_path):
     def note_explodes(*args, **kwargs):
         raise RuntimeError("Obsidian crashed!")
 
+    monkeypatch.chdir(tmp_path)
+
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
@@ -4857,13 +4850,8 @@ def test_generate_note_failure_does_not_fail_ingest(tmp_path):
     assert isinstance(result, dict), "ingest() should return PaperJSON dict even when note fails"
     assert "extraction" in result, "Returned dict should have 'extraction' key"
 
-    # Cleanup
-    import shutil
-    if pathlib.Path(".paperjson_cache").exists():
-        shutil.rmtree(".paperjson_cache")
 
-
-def test_generate_note_error_string_logged(tmp_path):
+def test_generate_note_error_string_logged(tmp_path, monkeypatch):
     """When generate_note returns '[note error: ...]', ingest logs a warning but does not fail."""
     from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
 
@@ -4894,6 +4882,8 @@ def test_generate_note_error_string_logged(tmp_path):
     metadata_result = PaperMetadata(title="NoteErr Test Paper", doi="10.1000/noteerr.test", year=2024)
     section_fill = SectionFillResult(heading="", body="NoteErr Test Paper " + "H" * 200, fill_failed=False)
 
+    monkeypatch.chdir(tmp_path)
+
     with mock.patch("scripts.ingest._run_mineru"), \
          mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
          mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
@@ -4909,11 +4899,6 @@ def test_generate_note_error_string_logged(tmp_path):
     # Must still return successfully
     assert isinstance(result, dict), "ingest() should return PaperJSON dict even on note error string"
     assert "extraction" in result, "Returned dict should have 'extraction' key"
-
-    # Cleanup
-    import shutil
-    if pathlib.Path(".paperjson_cache").exists():
-        shutil.rmtree(".paperjson_cache")
 
 
 # ---------------------------------------------------------------------------
