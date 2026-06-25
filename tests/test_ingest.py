@@ -4914,3 +4914,209 @@ def test_generate_note_error_string_logged(tmp_path):
     import shutil
     if pathlib.Path(".paperjson_cache").exists():
         shutil.rmtree(".paperjson_cache")
+
+
+# ---------------------------------------------------------------------------
+# Plan 04 (gap-closure): Note-aware Step 9 registry gate
+# generate-note-from-cache-if-missing on a registry hit
+# ---------------------------------------------------------------------------
+
+
+def test_registry_hit_generates_note_from_cache(tmp_path):
+    """On cache HIT with a valid paperjson_path, ingest() calls generate_note and returns cached entry."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+    reg_path = cfg["registry_path"]
+
+    # Write a real PaperJSON cache file on disk
+    cache_file = tmp_path / "cached_paper.json"
+    cached_paperjson = {
+        "extraction": {
+            "metadata": {"title": "Cached Paper For Note Gen", "authors": [], "year": 2024,
+                          "journal": None, "doi": "10.1000/note.gate", "arxiv_id": None,
+                          "accession_codes": []},
+            "sections": [],
+            "references": [],
+        },
+        "analysis": {"generated_by": None},
+        "provenance": {"schema_version": 2},
+    }
+    cache_file.write_text(json.dumps(cached_paperjson), encoding="utf-8")
+
+    # Pre-populate registry with paperjson_path pointing at the real cache file
+    cached_entry = {
+        "title": "Cached Paper For Note Gen",
+        "doi": "10.1000/note.gate",
+        "projects": ["other-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/cached.pdf",
+        "paperjson_path": str(cache_file),
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/note.gate")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 note gate test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/note.gate", arxiv_id=None, title="Cached Paper For Note Gen")
+
+    mock_gen_note = mock.MagicMock(return_value="Papers/Cached Paper For Note Gen.md")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Cached Paper For Note Gen",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Cached Paper For Note Gen", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/note.gate", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note.generate_note", mock_gen_note):
+        result = ingest(str(fake_pdf), cfg)
+
+    # generate_note must have been called once with the loaded PaperJSON dict
+    mock_gen_note.assert_called_once()
+    call_args = mock_gen_note.call_args
+    pj_arg = call_args[0][0]
+    assert isinstance(pj_arg, dict), "generate_note should receive a dict (loaded PaperJSON)"
+    assert pj_arg == cached_paperjson, "generate_note should receive the cache-file PaperJSON, not in-memory"
+
+    # Second arg should be config
+    cfg_arg = call_args[0][1]
+    assert isinstance(cfg_arg, dict), "generate_note should receive config as second arg"
+
+    # ingest() must return the cached entry (not a full PaperJSON)
+    assert result.get("title") == "Cached Paper For Note Gen", (
+        f"Expected cached entry returned, got: {result}"
+    )
+    assert result.get("doi") == "10.1000/note.gate"
+
+
+def test_registry_hit_note_failure_does_not_propagate(tmp_path):
+    """When generate_note raises on registry-hit path, ingest() still returns cached entry (D-05)."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+    reg_path = cfg["registry_path"]
+
+    # Write a real PaperJSON cache file
+    cache_file = tmp_path / "fail_paper.json"
+    cache_file.write_text(json.dumps({
+        "extraction": {"metadata": {"title": "Fail Paper"}, "sections": [], "references": []},
+        "analysis": {"generated_by": None},
+        "provenance": {"schema_version": 2},
+    }), encoding="utf-8")
+
+    cached_entry = {
+        "title": "Fail Paper",
+        "doi": "10.1000/note.fail",
+        "projects": ["test-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/fail.pdf",
+        "paperjson_path": str(cache_file),
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/note.fail")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 note fail test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/note.fail", arxiv_id=None, title="Fail Paper")
+
+    def note_explodes(*args, **kwargs):
+        raise RuntimeError("Obsidian crashed on registry-hit path!")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Fail Paper",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Fail Paper", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/note.fail", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note.generate_note", side_effect=note_explodes):
+        # Must NOT raise — note failure is best-effort on registry-hit path
+        result = ingest(str(fake_pdf), cfg)
+
+    # Must return the cached entry
+    assert result.get("title") == "Fail Paper", (
+        f"Expected cached entry returned even on note failure, got: {result}"
+    )
+    assert result.get("doi") == "10.1000/note.fail"
+
+
+def test_registry_hit_no_note_gen_when_paperjson_path_missing(tmp_path):
+    """Cache HIT with empty paperjson_path -> generate_note NOT called; returns cached entry."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+    reg_path = cfg["registry_path"]
+
+    # Two sub-cases: empty string and nonexistent path
+    for label, pj_path in [("empty", ""), ("nonexistent", str(tmp_path / "nonexistent.json"))]:
+        cached_entry = {
+            "title": f"No Note Gen {label}",
+            "doi": f"10.1000/nonote.{label}",
+            "projects": ["test-project"],
+            "summary": None, "key_findings": None,
+            "authors": None, "year": 2024, "journal": None,
+            "arxiv_id": None,
+            "source_path": "/nogen.pdf",
+            "paperjson_path": pj_path,
+        }
+        _write_registry(cached_entry, reg_path, f"10.1000/nonote.{label}")
+
+        fake_pdf = tmp_path / f"paper_{label}.pdf"
+        fake_pdf.write_bytes(b"%PDF-1.4 no note gen test")
+        cl_path = _write_real_content_list(tmp_path)
+
+        from scripts.ingest import DoiProbeResult
+        probe_result = DoiProbeResult(doi=f"10.1000/nonote.{label}", arxiv_id=None, title=f"No Note Gen {label}")
+
+        mock_gen_note = mock.MagicMock(
+            side_effect=AssertionError("generate_note must NOT be called when paperjson_path is empty/missing")
+        )
+
+        with mock.patch("scripts.ingest._run_mineru"), \
+             mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+             mock.patch("scripts.ingest._parse_content_list", return_value={
+                 "title": f"No Note Gen {label}",
+                 "sections": [{"heading": "", "level": 0, "blocks": [
+                     {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+                 ]}],
+                 "references": [],
+                 "metadata": {"title": f"No Note Gen {label}", "authors": None, "year": 2024,
+                               "journal": None, "doi": f"10.1000/nonote.{label}", "arxiv_id": None,
+                               "accession_codes": []},
+             }), \
+             mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+             mock.patch("scripts.ingest._warmup_ollama"), \
+             mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+             mock.patch("scripts.note.generate_note", mock_gen_note):
+            result = ingest(str(fake_pdf), cfg)
+
+        # generate_note must NOT have been called
+        mock_gen_note.assert_not_called()
+
+        # Must return the cached entry
+        assert result.get("title") == f"No Note Gen {label}", (
+            f"Expected cached entry for {label} case, got: {result}"
+        )
