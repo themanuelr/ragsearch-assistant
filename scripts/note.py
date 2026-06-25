@@ -13,8 +13,13 @@ Run standalone:  python scripts/note.py --paperjson <cache>.json [--force]
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from pydantic import BaseModel, Field
 
