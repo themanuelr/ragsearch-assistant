@@ -1740,6 +1740,21 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: boo
                     _write_registry(cached, registry_path, registry_key)
                 except Exception as e:
                     _log(f"registry cache-hit update failed: {e}")
+        # GAP-CLOSURE (02-04): note-aware registry hit. If a surviving PaperJSON cache
+        # exists for this already-ingested paper, generate the note from it best-effort.
+        # generate_note self-skips when the note already exists (force=False, D-16), so this
+        # is idempotent and runs zero LLM fill calls. A note failure never fails the ingest.
+        pj_path = cached.get("paperjson_path") or ""
+        if pj_path and pathlib.Path(pj_path).exists():
+            try:
+                from scripts import note as note
+                with open(pj_path, "r", encoding="utf-8") as _pjf:
+                    _cached_paperjson = json.load(_pjf)
+                _note_result = note.generate_note(_cached_paperjson, config)
+                if isinstance(_note_result, str) and _note_result.startswith("[note error:"):
+                    _log(f"registry-hit note generation failed: {_note_result}")
+            except Exception as e:
+                print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
         return cached  # cache hit: return immediately, zero fill calls
 
     # Steps 10–12 (miss path): fill → renditions → registry write
