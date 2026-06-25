@@ -432,10 +432,7 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     if not preflight(vault_name):
         return "[note error: Obsidian not running / vault unreachable]"
 
-    # Run analysis generation (7 LLM calls)
-    _generate_analysis(paperjson)
-
-    # Determine filename and path
+    # Determine filename and path (uses extraction metadata only — no LLM)
     meta = paperjson["extraction"]["metadata"]
     title = meta.get("title", "Untitled")
     filename = _sanitize_filename(title)
@@ -445,10 +442,13 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     if ".." in path or path.startswith("/") or path.startswith("\\"):
         return f"[note error: invalid path '{path}' -- path traversal rejected]"
 
-    # Skip-by-default (D-16): existing note + no force -> skip
+    # Skip-by-default (D-16): existing note + no force -> skip (zero LLM calls)
     if note_exists(path, vault_name) and not force:
         _log(f"note already exists at {path} -- skipping (use --force to overwrite)")
         return path
+
+    # Run analysis generation (7 LLM calls)
+    _generate_analysis(paperjson)
 
     # Render the note
     rendered = _render_note(paperjson)
