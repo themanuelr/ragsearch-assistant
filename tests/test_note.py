@@ -424,13 +424,14 @@ def test_generate_note_creates_note():
 
 
 def test_generate_note_skips_existing():
-    """generate_note skips without calling create_note when note exists and force=False."""
+    """generate_note skips without calling create_note or _generate_analysis
+    when note exists and force=False (zero LLM calls on existing note)."""
     from scripts.note import generate_note
 
     pj = _make_paperjson()
     config = {"vault_name": "test-vault"}
 
-    with mock.patch("scripts.note._generate_analysis"), \
+    with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
          mock.patch("scripts.note._render_note", return_value="# Test\n"), \
          mock.patch("scripts.note.preflight", return_value=True), \
          mock.patch("scripts.note.note_exists", return_value=True), \
@@ -439,6 +440,11 @@ def test_generate_note_skips_existing():
         result = generate_note(pj, config, force=False)
 
     mock_create.assert_not_called()
+    mock_analysis.assert_not_called()
+    # Must return the path, not an error
+    assert result.startswith("Papers/"), (
+        f"Expected path starting with Papers/, got {result!r}"
+    )
 
 
 def test_generate_note_force_overwrites():
