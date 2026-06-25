@@ -519,3 +519,32 @@ def test_standalone_default_cache_resolution(tmp_path):
     assert resolved == str(cache_file), (
         f"Expected resolved path to be {cache_file}, got {resolved!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan 05: Subprocess regression test — direct `python scripts/note.py` import
+# ---------------------------------------------------------------------------
+
+
+def test_direct_invocation_import_resolves():
+    """Running `python scripts/note.py --help` must exit 0 with no ImportError (Defect 1 guard)."""
+    import pathlib
+    import subprocess
+    import sys
+
+    repo_root = str(pathlib.Path(__file__).resolve().parents[1])
+    result = subprocess.run(
+        [sys.executable, "scripts/note.py", "--help"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"scripts/note.py --help exited {result.returncode}; stderr:\n{result.stderr}"
+    )
+    assert "ImportError" not in result.stderr, (
+        f"ImportError in stderr:\n{result.stderr}"
+    )
+    assert "cannot import name" not in result.stderr, (
+        f"'cannot import name' in stderr:\n{result.stderr}"
+    )
