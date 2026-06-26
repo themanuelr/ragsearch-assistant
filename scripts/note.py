@@ -31,7 +31,7 @@ from scripts.ingest import (
     _load_config,
     OLLAMA_MODEL,
 )
-from scripts.obsidian_cli import preflight, note_exists, create_note
+from scripts.obsidian_cli import preflight, note_exists, create_note, _validate_vault_path
 
 # ---------------------------------------------------------------------------
 # Module constants
@@ -517,12 +517,15 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     filename = _sanitize_filename(title)
     path = f"Papers/{filename}.md"
 
-    # Security: reject path traversal (T-02-03) — check path *components*, not a
-    # raw substring, so legitimate titles containing ".." (e.g. an ellipsis run
-    # like "Deep Learning... A Survey") are not falsely rejected.
-    from pathlib import PurePosixPath
-    if ".." in PurePosixPath(path).parts or path.startswith("/") or path.startswith("\\"):
-        return f"[note error: invalid path '{path}' -- path traversal rejected]"
+    # Security: validate through the single chokepoint guard (WR-03) — fail fast
+    # before any LLM analysis runs.  create_note re-validates at write time, but
+    # checking here avoids 7 wasted analysis calls on a rejected path.  The shared
+    # guard checks path *components* (not a raw substring), so legitimate titles
+    # containing ".." (e.g. "Deep Learning... A Survey") are not falsely rejected.
+    try:
+        _validate_vault_path(path, config)
+    except ValueError as e:
+        return f"[note error: {e}]"
 
     # Skip-by-default (D-16): existing note + no force -> skip (zero LLM calls)
     if note_exists(path, config) and not force:

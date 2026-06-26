@@ -58,6 +58,31 @@ def _vault_root(config: dict) -> pathlib.Path:
     return p.resolve()
 
 
+def _validate_vault_path(path: str, config: dict) -> pathlib.Path:
+    """Single authoritative path-traversal guard for the chokepoint (WR-03).
+
+    Validates a vault-relative ``path`` and returns its resolved absolute target.
+    Rejects ``..`` segments, a leading ``/`` or ``\\``, and drive-absolute /
+    anchored paths that would escape the resolved vault_root (the latter because
+    ``root / "C:/x"`` discards ``root`` under pathlib semantics).  Raises
+    ValueError (message contains "path traversal") on any escape; otherwise
+    returns the resolved target Path so callers share one containment-verified
+    check instead of duplicating substring heuristics.
+    """
+    path_obj = pathlib.Path(path)
+    if ".." in path_obj.parts or path.startswith("/") or path.startswith("\\"):
+        raise ValueError(
+            f"[obsidian_cli error: invalid path '{path}' -- path traversal rejected]"
+        )
+    root = _vault_root(config)
+    target = (root / path).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(
+            f"[obsidian_cli error: invalid path '{path}' -- path traversal rejected (escapes vault_root)]"
+        )
+    return target
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -129,24 +154,9 @@ def create_note(
     Raises:
         ValueError: When path contains traversal sequences.
     """
-    # Security: path-traversal guard (T-02-03, T-02-06a)
-    path_obj = pathlib.Path(path)
-    if ".." in path_obj.parts or path.startswith("/") or path.startswith("\\"):
-        raise ValueError(
-            f"[obsidian_cli error: invalid path '{path}' -- path traversal rejected]"
-        )
-
-    root = _vault_root(config)
-    # Containment check: resolve the final target and assert it stays under the
-    # resolved vault_root.  A Windows drive-absolute path (e.g. "C:/Windows/x.md")
-    # has no ".." segment and no leading slash, yet ``root / path`` discards root
-    # entirely (pathlib: a right-hand operand with a drive/anchor wins).  Asserting
-    # containment closes that escape (T-02-03, T-02-06a).
-    target = (root / path).resolve()
-    if target != root and root not in target.parents:
-        raise ValueError(
-            f"[obsidian_cli error: invalid path '{path}' -- path traversal rejected (escapes vault_root)]"
-        )
+    # Security: single authoritative path-traversal guard (T-02-03, T-02-06a,
+    # WR-03).  Returns the resolved, containment-verified target under vault_root.
+    target = _validate_vault_path(path, config)
 
     # Honour overwrite=False: skip without clobbering
     if target.exists() and not overwrite:
