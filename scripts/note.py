@@ -43,6 +43,15 @@ DEFAULT_SECTION_TIMEOUT = 300  # seconds per analysis call
 _SECTION_TIMEOUT: int = DEFAULT_SECTION_TIMEOUT
 _WINDOWS_ILLEGAL = re.compile(r'[/\\:*?"<>|]')
 
+# Windows reserved device names — illegal as a file's base name regardless of
+# extension or parent directory.  A paper titled "NUL"/"Aux"/"COM1" would target
+# the device, not a file, so the note write is silently lost or errors (WR-04).
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 # Math-span regex: matches $$...$$ (display) and $...$ (inline) spans, including
 # multi-line content (re.S so . and [^$] span newlines).  Used by the LaTeX
 # escape repair to scope substitutions to math only (Task 2b).
@@ -345,6 +354,11 @@ def _sanitize_filename(title: str, max_length: int = 200) -> str:
         sanitized = sanitized[:max_length].rstrip()
     if not sanitized:
         sanitized = "Untitled"
+    # Windows reserved device-name guard (WR-04): the base name before the first
+    # dot is what Windows resolves, so "NUL", "Aux", and even "NUL.foo" collide
+    # with a device.  Prefix an underscore to disarm the collision.
+    if sanitized.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
+        sanitized = "_" + sanitized
     return sanitized
 
 
