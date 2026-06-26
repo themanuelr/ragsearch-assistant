@@ -5105,3 +5105,85 @@ def test_registry_hit_no_note_gen_when_paperjson_path_missing(tmp_path):
         assert result.get("title") == f"No Note Gen {label}", (
             f"Expected cached entry for {label} case, got: {result}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Plan 08 (GAP-2): _emit_result stdout-suppression + --print flag
+# ---------------------------------------------------------------------------
+
+_SAMPLE_PAPERJSON = {
+    "extraction": {
+        "metadata": {
+            "title": "A Test Paper",
+            "authors": [],
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/test.emit",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+        "sections": [],
+        "references": [],
+    },
+    "analysis": {"generated_by": None},
+    "provenance": {"schema_version": 2},
+}
+
+
+def test_emit_result_default_prints_confirmation(capsys):
+    """Default mode suppresses JSON body; only the short confirmation appears on stdout."""
+    from scripts.ingest import _emit_result
+
+    confirmation = "Cache: /tmp/test.json\nNote: Papers/A Test Paper.md"
+    _emit_result(_SAMPLE_PAPERJSON, None, print_json=False, confirmation=confirmation)
+
+    captured = capsys.readouterr()
+    # Sentinel key from PaperJSON must NOT appear (JSON body suppressed)
+    assert "schema_version" not in captured.out, (
+        "Expected JSON body (schema_version) to be absent from stdout in default mode; "
+        f"got: {captured.out[:200]!r}"
+    )
+    # The confirmation text must appear
+    assert "Cache:" in captured.out, (
+        f"Expected 'Cache:' in stdout confirmation; got: {captured.out!r}"
+    )
+    assert "Note:" in captured.out, (
+        f"Expected 'Note:' in stdout confirmation; got: {captured.out!r}"
+    )
+
+
+def test_emit_result_print_json_prints_full_json(capsys):
+    """With print_json=True, the full PaperJSON body is printed to stdout."""
+    from scripts.ingest import _emit_result
+
+    _emit_result(_SAMPLE_PAPERJSON, None, print_json=True, confirmation=None)
+
+    captured = capsys.readouterr()
+    # Sentinel key must be present (full JSON dump)
+    assert "schema_version" in captured.out, (
+        "Expected full JSON body (schema_version) on stdout when print_json=True; "
+        f"got: {captured.out[:200]!r}"
+    )
+    # Must be parseable JSON
+    import json as _json
+    parsed = _json.loads(captured.out)
+    assert parsed["provenance"]["schema_version"] == 2
+
+
+def test_emit_result_output_path_writes_file_not_stdout(capsys, tmp_path):
+    """output_path writes the file; nothing is printed to stdout."""
+    from scripts.ingest import _emit_result
+    import json as _json
+
+    out_file = tmp_path / "out.json"
+    _emit_result(_SAMPLE_PAPERJSON, str(out_file), print_json=False, confirmation=None)
+
+    captured = capsys.readouterr()
+    # stdout must be empty (file write path; no stdout dump)
+    assert captured.out.strip() == "", (
+        f"Expected empty stdout when output_path given; got: {captured.out[:200]!r}"
+    )
+    # File must exist and contain valid JSON with schema_version=2
+    assert out_file.exists(), "Expected output file to have been created"
+    data = _json.loads(out_file.read_text(encoding="utf-8"))
+    assert data["provenance"]["schema_version"] == 2
