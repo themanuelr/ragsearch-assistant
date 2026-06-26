@@ -504,8 +504,11 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     filename = _sanitize_filename(title)
     path = f"Papers/{filename}.md"
 
-    # Security: reject path traversal (T-02-03)
-    if ".." in path or path.startswith("/") or path.startswith("\\"):
+    # Security: reject path traversal (T-02-03) — check path *components*, not a
+    # raw substring, so legitimate titles containing ".." (e.g. an ellipsis run
+    # like "Deep Learning... A Survey") are not falsely rejected.
+    from pathlib import PurePosixPath
+    if ".." in PurePosixPath(path).parts or path.startswith("/") or path.startswith("\\"):
         return f"[note error: invalid path '{path}' -- path traversal rejected]"
 
     # Skip-by-default (D-16): existing note + no force -> skip (zero LLM calls)
