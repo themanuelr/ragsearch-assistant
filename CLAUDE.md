@@ -13,7 +13,7 @@ A local-first, AI-powered research management system that ingests scientific pap
 - **Hardware**: RTX 4060, 8GB VRAM — no models larger than gemma4:e4b
 - **Cost**: Zero per-query API cost for document processing — all LLM calls go to local Ollama
 - **Privacy**: All paper content stays local — nothing sent to external APIs
-- **Vault I/O**: Always go through obsidian-cli, never write vault files directly
+- **Vault I/O**: All vault writes go through `scripts/obsidian_cli.py` — the single sanctioned I/O chokepoint; it writes `.md` files atomically under `vault_path` (Obsidian's file watcher indexes them automatically)
 - **Portability**: config.json is the only per-clone file that differs — all scripts read from it
 
 <!-- GSD:project-end -->
@@ -174,7 +174,7 @@ A local-first, AI-powered research management system that ingests scientific pap
 - **One section, one prompt** — when summarizing, send sections separately to local LLM
 - **JSON as handoff format** — future scripts pass structured JSON between stages
 - **Stateless tools** — each MCP tool reads what it needs, does one thing, writes output, exits
-- **obsidian-cli for all vault I/O** — never write vault files directly; use CLI so Obsidian tracks changes
+- **All vault I/O through `scripts/obsidian_cli.py`** — the single sanctioned chokepoint; it writes `.md` files directly and atomically under `vault_path` (Obsidian's file watcher indexes them automatically; no running-instance dependency for the write itself)
 - Scripts in `scripts/` directory: `setup.py`, `ingest.py`, `embed.py`, `link.py`, `biblio.py` (from STARTING_POINT.md)
 - All use lowercase snake_case filenames
 - All accept command-line arguments for configuration
@@ -314,7 +314,7 @@ A local-first, AI-powered research management system that ingests scientific pap
 - **Missing dependencies:** Print installation command (see `server.py` line 80: `pip install ddgs`)
 - **Ollama unreachable:** Timeout at 120-180s, return error message; Claude can retry or suggest checking server (see `server.py` lines 40-44)
 - **Registry lookups:** Return null if not found; trigger full ingest pipeline
-- **Vault write failures:** obsidian-cli will error; treat as fatal and ask user to verify vault path in `config.json`
+- **Vault write failures:** `scripts/obsidian_cli.py` raises on filesystem errors; treat as fatal and verify `vault_path` in `config.json` points to a real Obsidian vault directory
 
 ## Cross-Cutting Concerns
 

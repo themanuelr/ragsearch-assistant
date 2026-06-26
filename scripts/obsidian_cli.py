@@ -1,31 +1,30 @@
 """
-Obsidian desktop CLI wrapper — single sanctioned vault-I/O chokepoint (D-01, D-02).
+Obsidian vault I/O chokepoint — direct atomic file write (D-01, D-02, 02-06).
 
-All vault writes in this project go through this module.  The functions build
-subprocess argv as a Python list (never shell=True) and detect errors by parsing
-stdout for an ``Error:`` prefix (CLI exit code is always 0).
+All vault writes in this project go through this module.  Notes are written
+as byte-exact UTF-8 .md files directly under vault_root (resolved from
+config["vault_path"]).  Obsidian's file watcher auto-indexes new or changed
+files instantly, so a direct atomic write is functionally equivalent to an
+obsidian-cli ``create`` command — without any running-instance dependency,
+subprocess invocation, or argv serialization overhead.
+
+This module remains the single sanctioned vault-I/O chokepoint (D-01, D-02);
+only the mechanism changes: direct file I/O instead of shelling out to
+obsidian.COM.  (obsidian.COM passed content as an argv token, which Obsidian
+serialized to JSON; a ~6.7 KB note body with ~80 newlines + LaTeX backslashes
+corrupted that JSON → main-process crash → 30 s timeout, note never written.)
 
 Functions:
-  preflight     — fail-fast probe: is Obsidian running / vault reachable?
-  note_exists   — does a note exist at the given vault-relative path?
-  create_note   — write a note to the vault (create or overwrite)
+  preflight     — filesystem check: does the vault root exist as a directory?
+  note_exists   — does a note file exist at the given vault-relative path?
+  create_note   — write a note to the vault (atomic temp-file + os.replace,
+                  UTF-8, LF, byte-exact — no escaping, no subprocess)
 """
 
 import datetime
-import json
+import os
 import pathlib
-import shutil
-import subprocess
 import sys
-
-# ---------------------------------------------------------------------------
-# Module constants
-# ---------------------------------------------------------------------------
-
-DEFAULT_OBSIDIAN_EXE = r"C:\Users\manue\AppData\Local\Programs\Obsidian\obsidian"
-
-# Maximum safe argv-join length before the Windows CreateProcess limit (~32,600)
-_MAX_ARGV_LENGTH = 30000
 
 
 # ---------------------------------------------------------------------------
@@ -44,148 +43,118 @@ def _log(msg: str) -> None:
 # Config helpers
 # ---------------------------------------------------------------------------
 
-def _load_config() -> dict:
-    """Read config.json from the repo root (parent of scripts/) with UTF-8 encoding."""
-    cfg_path = pathlib.Path(__file__).parent.parent / "config.json"
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+def _vault_root(config: dict) -> pathlib.Path:
+    """Resolve the absolute vault root from config["vault_path"].
 
-
-def _resolve_obsidian_exe(config: dict | None = None) -> str:
+    vault_path may be relative (e.g. "./.local/ragsearch_dev_vault") —
+    resolved relative to the repo root (parent of this module's directory).
+    Absolute paths are used as-is.
     """
-    Resolve the Obsidian executable path.
-
-    Returns config['obsidian_exe'] if truthy and the path exists, else falls back
-    to shutil.which('obsidian'), else DEFAULT_OBSIDIAN_EXE.
-    """
-    if config is None:
-        config = _load_config()
-    configured = config.get("obsidian_exe")
-    if configured and pathlib.Path(configured).exists():
-        return configured
-    found = shutil.which("obsidian")
-    if found:
-        return found
-    return DEFAULT_OBSIDIAN_EXE
-
-
-# ---------------------------------------------------------------------------
-# Core subprocess wrapper
-# ---------------------------------------------------------------------------
-
-def _obsidian_cli(
-    args: list[str],
-    vault_name: str | None = None,
-    timeout: int = 30,
-    config: dict | None = None,
-) -> str:
-    """
-    Run an Obsidian CLI command and return stdout.
-
-    Builds argv as a Python list — never uses shell=True (T-02-02).
-    Content is passed only inside the content= token.
-
-    Args:
-        args:       CLI subcommand tokens (e.g. ["create", "path=Papers/x.md"]).
-        vault_name: Obsidian vault name for vault=<name> targeting.
-        timeout:    Subprocess timeout in seconds (default 30).
-        config:     Optional config dict; loaded from config.json if None.
-
-    Returns:
-        Stripped stdout string.
-
-    Raises:
-        subprocess.TimeoutExpired: When the command exceeds the timeout.
-        FileNotFoundError: When the Obsidian executable is not found.
-    """
-    exe = _resolve_obsidian_exe(config)
-    argv: list[str] = [exe]
-    if vault_name:
-        argv.append(f"vault={vault_name}")
-    argv.extend(args)
-
-    result = subprocess.run(
-        argv,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return result.stdout.strip()
+    vault_path = config.get("vault_path", "")
+    p = pathlib.Path(vault_path)
+    if not p.is_absolute():
+        repo_root = pathlib.Path(__file__).parent.parent
+        p = repo_root / p
+    return p.resolve()
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def preflight(vault_name: str | None = None, config: dict | None = None) -> bool:
+def preflight(config: dict) -> bool:
     """
-    Fail-fast probe: is Obsidian running and the vault reachable? (D-03)
+    Filesystem check: does the vault root exist and is it a directory? (D-03)
 
-    Runs ``files total`` and returns True only when stdout is all digits
-    (indicating a count of files).  On TimeoutExpired / FileNotFoundError
-    returns False — caller should emit ``[note error: Obsidian not running /
-    vault unreachable ...]`` and exit.
+    Returns True only when vault_path is set in config AND vault_root is a real
+    directory on disk.  No running-Obsidian dependency, no subprocess, no
+    30-second timeout.  On any error (including missing vault_path) returns False
+    — the caller should emit a ``[note error: vault root does not exist ...]``
+    message and abort.
     """
+    if not config.get("vault_path"):
+        return False
     try:
-        out = _obsidian_cli(["files", "total"], vault_name=vault_name, config=config)
-        return out.strip().isdigit()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return _vault_root(config).is_dir()
+    except Exception:
         return False
 
 
-def note_exists(
-    path: str,
-    vault_name: str | None = None,
-    config: dict | None = None,
-) -> bool:
+def note_exists(path: str, config: dict) -> bool:
     """
-    Check whether a note exists at the given vault-relative path.
+    Check whether a note exists at the given vault-relative path (filesystem).
 
-    Returns False when stdout starts with ``Error:`` (Pitfall 3: CLI exit code
-    is always 0, so we parse stdout instead).  Returns True for any non-error
-    stdout.
+    Returns True when <vault_root>/<path> exists on disk, False otherwise
+    (including on any exception).
     """
     try:
-        out = _obsidian_cli(["file", f"path={path}"], vault_name=vault_name, config=config)
-        return not out.startswith("Error:")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return (_vault_root(config) / path).exists()
+    except Exception:
         return False
 
 
 def create_note(
     path: str,
     content: str,
-    vault_name: str | None = None,
+    config: dict,
     overwrite: bool = False,
-    config: dict | None = None,
 ) -> str:
     """
-    Write a note to the vault at the given path (D-04).
+    Write a note to the vault at the given vault-relative path (D-04, T-02-06a/b).
 
-    Content is passed inside the ``content=`` token — never interpolated into a
-    shell string (T-02-02).  When ``overwrite=True`` the ``overwrite`` token is
-    appended so the CLI replaces an existing note.
+    Content is written byte-exact as UTF-8 with LF newlines via a temp file +
+    os.replace (atomic).  No subprocess, no shell, no argv escaping — LaTeX
+    backslashes (``\\text``, ``\\Delta``) and raw newlines are preserved exactly
+    as-is.  This eliminates the JSON-corruption crash that the obsidian.COM argv
+    path caused on notes exceeding ~30 KB or containing special characters.
 
-    Emits a length warning to stderr if the joined argv exceeds ~30KB (Pitfall 1:
-    Windows CreateProcess ~32,600-char limit).  Full chunking is deferred to
-    Plan 02 only if a real paper trips it.
+    When overwrite=False and the target already exists, the file is not modified
+    and the existing absolute path is returned.  When overwrite=True the target
+    is replaced atomically.
+
+    Security:
+        - Rejects path traversal: ``..`` segments, leading ``/`` or ``\\``
+          (T-02-03, T-02-06a).
+        - Write is constrained under the resolved vault_root.
+
+    Args:
+        path:      Vault-relative path (e.g. ``"Papers/My Paper.md"``).
+        content:   Note content as a Python str.
+        config:    Config dict containing at minimum ``"vault_path"``.
+        overwrite: Whether to replace an existing note (default False).
 
     Returns:
-        Stripped stdout string from the CLI.
-    """
-    args = ["create", f"path={path}", f"content={content}"]
-    if overwrite:
-        args.append("overwrite")
+        Absolute path string to the written (or already-existing) note file.
 
-    # Length guard (Pitfall 1)
-    total_len = sum(len(a) for a in args)
-    if total_len > _MAX_ARGV_LENGTH:
-        _log(
-            f"[note warning: note exceeds ~30KB ({total_len} chars) "
-            "-- chunked write may be required]"
+    Raises:
+        ValueError: When path contains traversal sequences.
+    """
+    # Security: path-traversal guard (T-02-03, T-02-06a)
+    path_obj = pathlib.Path(path)
+    if ".." in path_obj.parts or path.startswith("/") or path.startswith("\\"):
+        raise ValueError(
+            f"[obsidian_cli error: invalid path '{path}' -- path traversal rejected]"
         )
 
-    return _obsidian_cli(args, vault_name=vault_name, config=config)
+    root = _vault_root(config)
+    target = root / path
+
+    # Honour overwrite=False: skip without clobbering
+    if target.exists() and not overwrite:
+        _log(f"note already exists at {target} -- skipping (overwrite=False)")
+        return str(target)
+
+    # Ensure parent directory exists (e.g. Papers/)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Normalise line endings to LF (byte-exact; no character escaping of any kind)
+    content_lf = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Atomic write: temp file beside target, then os.replace (D-04, T-02-06a)
+    tmp_file = str(target) + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content_lf)
+    os.replace(tmp_file, str(target))
+
+    _log(f"wrote note to {target}")
+    return str(target)

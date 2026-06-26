@@ -425,17 +425,18 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
 
     Orchestrates: preflight -> analysis -> render -> vault write.
 
-    Returns the vault path on success, or a ``[note error: ...]`` string on failure.
-    On an existing note with ``force=False``, skips (D-16) and returns a skip notice.
+    Returns the vault-relative path on success, or a ``[note error: ...]``
+    string on failure.  On an existing note with ``force=False``, skips
+    (D-16) and returns the path without running any LLM calls.
     """
-    # Fail-fast: vault_name required
-    vault_name = config.get("vault_name")
-    if not vault_name:
-        return "[note error: vault_name not set in config.json]"
+    # Fail-fast: vault_path required
+    vault_path = config.get("vault_path")
+    if not vault_path:
+        return "[note error: vault_path not set in config.json]"
 
-    # Preflight: Obsidian running + vault reachable
-    if not preflight(vault_name):
-        return "[note error: Obsidian not running / vault unreachable]"
+    # Preflight: vault root exists as a directory (filesystem check, no Obsidian dependency)
+    if not preflight(config):
+        return "[note error: vault root does not exist -- check vault_path in config.json]"
 
     # Determine filename and path (uses extraction metadata only — no LLM)
     meta = paperjson["extraction"]["metadata"]
@@ -448,7 +449,7 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
         return f"[note error: invalid path '{path}' -- path traversal rejected]"
 
     # Skip-by-default (D-16): existing note + no force -> skip (zero LLM calls)
-    if note_exists(path, vault_name) and not force:
+    if note_exists(path, config) and not force:
         _log(f"note already exists at {path} -- skipping (use --force to overwrite)")
         return path
 
@@ -458,8 +459,8 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     # Render the note
     rendered = _render_note(paperjson)
 
-    # Write to vault via obsidian-cli chokepoint
-    create_note(path=path, content=rendered, vault_name=vault_name, overwrite=force)
+    # Write to vault via obsidian_cli chokepoint (direct atomic write)
+    create_note(path=path, content=rendered, config=config, overwrite=force)
     _log(f"wrote note to {path}")
     return path
 
