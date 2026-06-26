@@ -137,7 +137,16 @@ def create_note(
         )
 
     root = _vault_root(config)
-    target = root / path
+    # Containment check: resolve the final target and assert it stays under the
+    # resolved vault_root.  A Windows drive-absolute path (e.g. "C:/Windows/x.md")
+    # has no ".." segment and no leading slash, yet ``root / path`` discards root
+    # entirely (pathlib: a right-hand operand with a drive/anchor wins).  Asserting
+    # containment closes that escape (T-02-03, T-02-06a).
+    target = (root / path).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError(
+            f"[obsidian_cli error: invalid path '{path}' -- path traversal rejected (escapes vault_root)]"
+        )
 
     # Honour overwrite=False: skip without clobbering
     if target.exists() and not overwrite:
