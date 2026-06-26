@@ -52,6 +52,12 @@ _WINDOWS_RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+# Obsidian tag slug: collapse any maximal run of characters NOT in the
+# allowed set (Unicode word chars, forward slash, hyphen) to a single hyphen.
+# Forward slash is preserved so "input/output" becomes a nested Obsidian tag.
+# Precompiled for repeated use in _slugify_tag (GAP-1 / NOTE-02).
+_TAG_INVALID_RUN = re.compile(r'[^\w/-]+')
+
 # Math-span regex: matches $$...$$ (display) and $...$ (inline) spans, including
 # multi-line content (re.S so . and [^$] span newlines).  Used by the LaTeX
 # escape repair to scope substitutions to math only (Task 2b).
@@ -363,6 +369,34 @@ def _sanitize_filename(title: str, max_length: int = 200) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tag slug helper (GAP-1 / NOTE-02, D-11)
+# ---------------------------------------------------------------------------
+
+def _slugify_tag(topic) -> str | None:
+    """Convert an LLM-generated topic string to an Obsidian-valid tag slug.
+
+    Obsidian forbids parentheses, commas, spaces, and most punctuation in tags
+    (only Unicode word characters, hyphens, and forward slashes are safe).
+    This helper:
+      1. Lowercases the topic.
+      2. Collapses every maximal run of forbidden characters to a single ``-``.
+      3. Strips leading/trailing ``-``.
+      4. Returns None if the result is empty (topic had no valid characters).
+
+    Forward slashes are preserved as Obsidian nested-tag separators
+    (``input/output gating`` -> ``input/output-gating``).
+
+    Args:
+        topic: A raw topic string from analysis.topics (may contain any chars).
+
+    Returns:
+        A non-empty slug string, or None if no valid characters remain.
+    """
+    slug = _TAG_INVALID_RUN.sub("-", str(topic).lower()).strip("-")
+    return slug if slug else None
+
+
+# ---------------------------------------------------------------------------
 # YAML frontmatter rendering (D-17, D-18, SC2, Pitfall 6)
 # ---------------------------------------------------------------------------
 
@@ -404,16 +438,20 @@ def _render_frontmatter(meta: dict, analysis: dict) -> str:
     if arxiv_id:
         lines.append(f'arxiv_id: "{arxiv_id}"')
 
-    # Tags from analysis.topics (D-11) — slugified lower-kebab
+    # Tags from analysis.topics (D-11, GAP-1) — Obsidian-valid slugs only.
+    # _slugify_tag restricts to [\w/-]+ (Unicode word chars + slash + hyphen),
+    # collapsing forbidden runs (parentheses, commas, spaces, …) to a single
+    # hyphen and returning None for topics that reduce to empty.  Only emit
+    # the tags: block when at least one slug survives (NOTE-02, CR-03).
     topics = analysis.get("topics") or []
-    if topics:
+    slugs = [s for s in (_slugify_tag(t) for t in topics) if s is not None]
+    if slugs:
         lines.append("tags:")
-        for t in topics:
-            # Quote each tag like every other scalar (NOTE-02): slugification only
-            # lowercases and replaces spaces, so an LLM topic starting with a YAML
-            # indicator char (``*``/``[``/``#``) would otherwise produce unparseable
-            # or silently-corrupted frontmatter.  Escape embedded quotes too.
-            slug = str(t).lower().replace(" ", "-").replace('"', '\\"')
+        for slug in slugs:
+            # Double-quote each slug (CR-03 / NOTE-02 yaml.safe_load round-trip).
+            # The charset restriction means quotes/spaces can no longer appear in
+            # a slug, but double-quoting is retained so the YAML invariant holds
+            # even if a future slug source changes.
             lines.append(f'  - "{slug}"')
 
     lines.append("status: ingested")
