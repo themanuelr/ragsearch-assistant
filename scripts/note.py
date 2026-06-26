@@ -439,8 +439,12 @@ def _render_note(paperjson: dict) -> str:
     # [!important] callout after Summary (D-15)
     claims = analysis.get("claims") or []
     if claims:
+        # Prefix every line so a multi-line LLM value stays inside the callout
+        # block; otherwise lines after the first fall outside the ``>`` and break
+        # the Obsidian callout (WR-02).
+        first_claim = str(claims[0]).replace("\n", "\n> ")
         parts.append(f"> [!important] Key Contribution")
-        parts.append(f"> {claims[0]}")
+        parts.append(f"> {first_claim}")
         parts.append("")
 
     # Key Findings section — bullet list of all claims
@@ -469,8 +473,10 @@ def _render_note(paperjson: dict) -> str:
     parts.append("")
     limitations = analysis.get("limitations") or []
     if limitations:
+        # Prefix every line so a multi-line value stays inside the callout (WR-02).
+        first_lim = str(limitations[0]).replace("\n", "\n> ")
         parts.append(f"> [!warning] Limitation")
-        parts.append(f"> {limitations[0]}")
+        parts.append(f"> {first_lim}")
         parts.append("")
     for lim in limitations:
         parts.append(f"- {lim}")
