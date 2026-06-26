@@ -8,6 +8,7 @@ Tests cover:
   - test_ollama_unreachable_fails_fast: [Ollama error:] raises RuntimeError (D-13)
   - test_results_field_in_skeleton: D-09 regression lock
   - test_frontmatter_yaml_safe (NOTE-02): colon in title round-trips yaml.safe_load()
+  - TestSlugifyTag (GAP-1 / NOTE-02): _slugify_tag restricts to Obsidian tag charset
 
 Run with:  python -m pytest tests/test_note.py -x
 """
@@ -664,3 +665,193 @@ class TestRepairMathEscapes:
         assert "\\text" in summary, (
             f"Expected '\\\\text' (backslash+text) in repaired summary; got: {summary!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# GAP-1 / NOTE-02: Obsidian tag charset restriction (_slugify_tag)
+# ---------------------------------------------------------------------------
+
+class TestSlugifyTag:
+    """Tests for _slugify_tag helper (GAP-1 fix, closing 02-UAT.md GAP 1 severity major).
+
+    Obsidian forbids parentheses, commas, spaces, and other non-word characters in
+    tags.  _slugify_tag must collapse forbidden runs to a single hyphen, preserve
+    forward slashes (nested-tag separator), and return None for topics that reduce
+    to an empty string after stripping.
+    """
+
+    def test_parentheses_collapsed(self):
+        """Parentheses and contained text run collapsed to hyphen; trailing hyphen stripped."""
+        from scripts.note import _slugify_tag
+        result = _slugify_tag("Cation-Chloride Cotransporter (CCC)")
+        assert result == "cation-chloride-cotransporter-ccc", (
+            f"Expected 'cation-chloride-cotransporter-ccc', got {result!r}"
+        )
+
+    def test_commas_collapsed(self):
+        """Commas (and surrounding spaces) collapsed to a single hyphen."""
+        from scripts.note import _slugify_tag
+        result = _slugify_tag("Calcium, Sodium, Chloride")
+        assert result == "calcium-sodium-chloride", (
+            f"Expected 'calcium-sodium-chloride', got {result!r}"
+        )
+
+    def test_forward_slash_preserved(self):
+        """Forward slash is kept as a nested-tag separator; spaces collapsed."""
+        from scripts.note import _slugify_tag
+        result = _slugify_tag("input/output gating")
+        assert result == "input/output-gating", (
+            f"Expected 'input/output-gating', got {result!r}"
+        )
+
+    def test_all_forbidden_returns_none(self):
+        """A topic consisting only of forbidden characters returns None."""
+        from scripts.note import _slugify_tag
+        assert _slugify_tag("()") is None, "Expected None for '()'"
+        assert _slugify_tag("!!!") is None, "Expected None for '!!!'"
+        assert _slugify_tag("---") is None, "Expected None for '---'"
+
+    def test_empty_string_returns_none(self):
+        """Empty string input returns None."""
+        from scripts.note import _slugify_tag
+        assert _slugify_tag("") is None, "Expected None for empty string"
+
+    def test_plain_topic_lowercased(self):
+        """Plain word topic is lowercased with no changes."""
+        from scripts.note import _slugify_tag
+        assert _slugify_tag("Transformers") == "transformers"
+
+    def test_spaces_become_hyphens(self):
+        """Spaces are replaced by a single hyphen."""
+        from scripts.note import _slugify_tag
+        assert _slugify_tag("attention mechanisms") == "attention-mechanisms"
+
+    def test_multiple_spaces_one_hyphen(self):
+        """Multiple consecutive spaces collapse to a single hyphen."""
+        from scripts.note import _slugify_tag
+        result = _slugify_tag("ion   transport")
+        assert result == "ion-transport", (
+            f"Expected 'ion-transport', got {result!r}"
+        )
+
+    def test_leading_trailing_hyphens_stripped(self):
+        """Leading/trailing hyphens that arise from stripping are removed."""
+        from scripts.note import _slugify_tag
+        result = _slugify_tag("(leading) word (trailing)")
+        # After collapse: "-leading--word--trailing-" then strip leading/trailing '-'
+        assert not result.startswith("-"), f"Result starts with '-': {result!r}"
+        assert not result.endswith("-"), f"Result ends with '-': {result!r}"
+
+
+class TestRenderFrontmatterTagSlugification:
+    """Integration tests: _render_frontmatter emits only valid Obsidian tag slugs."""
+
+    def test_forbidden_chars_removed_from_tags(self):
+        """Topics with parentheses/commas produce clean Obsidian tag slugs."""
+        import yaml
+        from scripts.note import _render_frontmatter
+
+        meta = {
+            "title": "Ion Transport",
+            "authors": ["Alice Smith"],
+            "year": 2024,
+        }
+        analysis = {
+            "topics": ["Cation-Chloride Cotransporter (CCC)", "Calcium, Sodium, Chloride"],
+        }
+        fm = _render_frontmatter(meta, analysis)
+
+        # No parentheses or commas should appear in the tags block
+        assert "(" not in fm, f"Parenthesis found in frontmatter: {fm!r}"
+        assert "," not in fm, f"Comma found in frontmatter (outside authors): {fm!r}"
+
+        # Must still be valid YAML
+        lines = fm.strip().split("\n")
+        end_idx = next(i for i in range(1, len(lines)) if lines[i] == "---")
+        yaml_text = "\n".join(lines[1:end_idx])
+        loaded = yaml.safe_load(yaml_text)
+        tags = loaded.get("tags", [])
+        assert "cation-chloride-cotransporter-ccc" in tags, (
+            f"Expected slug not in tags: {tags!r}"
+        )
+        assert "calcium-sodium-chloride" in tags, (
+            f"Expected slug not in tags: {tags!r}"
+        )
+
+    def test_slash_preserved_as_nested_tag(self):
+        """Forward slashes in topics are preserved in the emitted tag slug."""
+        from scripts.note import _render_frontmatter
+
+        meta = {"title": "Test", "authors": [], "year": 2024}
+        analysis = {"topics": ["input/output gating"]}
+        fm = _render_frontmatter(meta, analysis)
+        assert "input/output-gating" in fm, (
+            f"Expected 'input/output-gating' in frontmatter, got: {fm!r}"
+        )
+
+    def test_all_empty_topics_omits_tags_key(self):
+        """When every topic slugifies to empty/None, the tags: key is omitted entirely."""
+        import yaml
+        from scripts.note import _render_frontmatter
+
+        meta = {"title": "Test", "authors": [], "year": 2024}
+        analysis = {"topics": ["()", "!!!", "---"]}
+        fm = _render_frontmatter(meta, analysis)
+
+        # The word 'tags' should not appear in frontmatter at all
+        lines = fm.strip().split("\n")
+        end_idx = next(i for i in range(1, len(lines)) if lines[i] == "---")
+        yaml_text = "\n".join(lines[1:end_idx])
+        loaded = yaml.safe_load(yaml_text)
+        assert "tags" not in loaded, (
+            f"Expected no 'tags' key when all topics are empty, got: {loaded!r}"
+        )
+
+    def test_empty_topics_list_omits_tags_key(self):
+        """Empty topics list -> no tags: key (pre-existing behaviour preserved)."""
+        import yaml
+        from scripts.note import _render_frontmatter
+
+        meta = {"title": "Test", "authors": [], "year": 2024}
+        analysis = {"topics": []}
+        fm = _render_frontmatter(meta, analysis)
+
+        lines = fm.strip().split("\n")
+        end_idx = next(i for i in range(1, len(lines)) if lines[i] == "---")
+        yaml_text = "\n".join(lines[1:end_idx])
+        loaded = yaml.safe_load(yaml_text)
+        assert "tags" not in loaded, (
+            f"Expected no 'tags' key for empty topics, got: {loaded!r}"
+        )
+
+    def test_yaml_safe_load_roundtrip_with_forbidden_chars(self):
+        """Topics with forbidden chars still produce yaml.safe_load-safe frontmatter."""
+        import yaml
+        from scripts.note import _render_frontmatter
+
+        meta = {
+            "title": "Test: Colon Safety",
+            "authors": ["Author One"],
+            "year": 2023,
+        }
+        analysis = {
+            "topics": [
+                "Cation-Chloride Cotransporter (CCC)",
+                "Calcium, Sodium, Chloride",
+                "input/output gating",
+            ]
+        }
+        fm = _render_frontmatter(meta, analysis)
+
+        lines = fm.strip().split("\n")
+        end_idx = next(i for i in range(1, len(lines)) if lines[i] == "---")
+        yaml_text = "\n".join(lines[1:end_idx])
+        loaded = yaml.safe_load(yaml_text)
+
+        assert loaded is not None, "yaml.safe_load returned None"
+        tags = loaded.get("tags", [])
+        assert len(tags) == 3, f"Expected 3 tags, got {tags!r}"
+        # Verify cleaned slugs
+        assert "cation-chloride-cotransporter-ccc" in tags
+        assert "calcium-sodium-chloride" in tags
+        assert "input/output-gating" in tags
