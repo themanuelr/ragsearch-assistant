@@ -37,7 +37,10 @@ from scripts.obsidian_cli import preflight, note_exists, create_note
 # Module constants
 # ---------------------------------------------------------------------------
 
-_SECTION_TIMEOUT = 300  # seconds per analysis call (configurable via config.json)
+DEFAULT_SECTION_TIMEOUT = 300  # seconds per analysis call
+# Mutable module global; set by generate_note() from config.json key
+# "ollama_section_timeout" (mirrors ingest.py).  Threaded into _analysis_call.
+_SECTION_TIMEOUT: int = DEFAULT_SECTION_TIMEOUT
 _WINDOWS_ILLEGAL = re.compile(r'[/\\:*?"<>|]')
 
 # Math-span regex: matches $$...$$ (display) and $...$ (inline) spans, including
@@ -519,6 +522,11 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     if note_exists(path, config) and not force:
         _log(f"note already exists at {path} -- skipping (use --force to overwrite)")
         return path
+
+    # Honour the per-clone analysis timeout (config.json "ollama_section_timeout",
+    # default 300s) — slow hardware can raise it (WR-01; mirrors ingest.py).
+    global _SECTION_TIMEOUT
+    _SECTION_TIMEOUT = int(config.get("ollama_section_timeout", DEFAULT_SECTION_TIMEOUT))
 
     # Run analysis generation (7 LLM calls)
     _generate_analysis(paperjson)
