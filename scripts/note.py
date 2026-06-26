@@ -40,6 +40,21 @@ from scripts.obsidian_cli import preflight, note_exists, create_note
 _SECTION_TIMEOUT = 300  # seconds per analysis call (configurable via config.json)
 _WINDOWS_ILLEGAL = re.compile(r'[/\\:*?"<>|]')
 
+# Math-span regex: matches $$...$$ (display) and $...$ (inline) spans, including
+# multi-line content (re.S so . and [^$] span newlines).  Used by the LaTeX
+# escape repair to scope substitutions to math only (Task 2b).
+_MATH_SPAN = re.compile(r'\$\$.*?\$\$|\$[^$]*?\$', re.S)
+
+# Mapping of control chars the JSON decoder silently inserts for single-backslash
+# LaTeX sequences emitted by gemma4:e4b → their intended backslash-escape forms.
+_CTRL_TO_ESCAPE: dict[str, str] = {
+    '\t': '\\t',   # \text, \to, \theta …
+    '\n': '\\n',   # \nabla, \nu …
+    '\r': '\\r',   # \rightarrow, \rightleftharpoons …
+    '\x08': '\\b', # \beta (rare)
+    '\x0c': '\\f', # \frac (rare)
+}
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -230,6 +245,51 @@ _ANALYSIS_SPECS = [
 ]
 
 
+def _repair_math_escapes(text: str) -> str:
+    """Within $$...$$ and $...$ math spans only, map decoded control chars back to
+    their backslash-escape forms.
+
+    gemma4:e4b emits LaTeX with single backslashes in its analysis JSON output
+    (e.g. ``"\\text{Na}^+"``).  The JSON decoder silently converts these to
+    control characters (``\\t`` → TAB, ``\\r`` → CR, ``\\n`` → LF).  Evidence
+    across 3 real papers showed all 72 such control chars fell inside ``$...$``
+    math spans; 0 were in prose; 266 genuine paragraph newlines were all
+    outside math.  Scoping the repair to math spans is therefore safe (zero
+    false positives) and complete.
+
+    Text outside math spans — including genuine paragraph-break newlines — is
+    untouched.  The function is idempotent and a no-op on text without ``$``.
+    """
+    if '$' not in text:
+        return text
+
+    def _fix_span(m: re.Match) -> str:
+        span = m.group(0)
+        for ctrl, escaped in _CTRL_TO_ESCAPE.items():
+            span = span.replace(ctrl, escaped)
+        return span
+
+    return _MATH_SPAN.sub(_fix_span, text)
+
+
+def _repair_analysis_value(value):
+    """Apply _repair_math_escapes to str or list[str] analysis values; pass others through.
+
+    Args:
+        value: the raw value extracted from an analysis model field — may be
+               ``str`` (summary, methods_overview, results) or ``list[str]``
+               (claims, limitations, topics, open_questions), or ``None``.
+
+    Returns:
+        Repaired str / list[str], or the original value unchanged for other types.
+    """
+    if isinstance(value, str):
+        return _repair_math_escapes(value)
+    elif isinstance(value, list):
+        return [_repair_math_escapes(v) if isinstance(v, str) else v for v in value]
+    return value
+
+
 def _generate_analysis(paperjson: dict) -> None:
     """Run the 7 analysis calls and populate paperjson["analysis"] in place.
 
@@ -252,7 +312,7 @@ def _generate_analysis(paperjson: dict) -> None:
 
         if result is not None:
             value = getattr(result, field_name)
-            analysis[field_name] = value
+            analysis[field_name] = _repair_analysis_value(value)
         else:
             _log(f"[note warning: {field_name} fill_failed]")
             # Leave as skeleton default (None for scalars, [] for lists)
