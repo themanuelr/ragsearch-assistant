@@ -2047,15 +2047,19 @@ def test_output_flag_writes_utf8_file(tmp_path):
 
 
 def test_output_omitted_uses_stdout(tmp_path, capsys):
-    """_emit_result(result, None) prints JSON to stdout; no file is written."""
+    """_emit_result(result, None, print_json=True) prints JSON to stdout; no file is written.
+
+    Updated in Plan 08: print_json=True is now required to get the full JSON on stdout.
+    The legacy 2-arg call (print_json=False, the new default) prints a short confirmation.
+    """
     from scripts.ingest import _emit_result
 
     data = {"title": "plain ascii"}
-    _emit_result(data, None)
+    _emit_result(data, None, print_json=True)
     captured = capsys.readouterr()
 
     loaded = json.loads(captured.out)
-    assert loaded == data, f"Expected JSON on stdout, got: {captured.out!r}"
+    assert loaded == data, f"Expected JSON on stdout with print_json=True, got: {captured.out!r}"
     # No file should exist in tmp_path
     assert not list(tmp_path.iterdir()), "Expected no file written when output_path is None"
 

@@ -3,7 +3,11 @@ MinerU-based PDF ingestion pipeline.
 
 Invokes MinerU (hybrid_auto backend), parses the resulting content_list.json by block
 type, and assembles a PaperJSON v2 document (extraction/analysis/provenance namespaces,
-schema_version 2) that is printed to stdout as UTF-8 JSON.
+schema_version 2).
+
+By default a short confirmation (cache path + written note path) is printed to stdout.
+Pass --print / --stdout to emit the full PaperJSON as UTF-8 JSON to stdout instead.
+Use --output / -o to write the PaperJSON to a file (bypasses PowerShell mojibake on Windows).
 
 This module is extraction-only: no Ollama or LLM calls.
 The analysis namespace ships as an empty skeleton; Phase 2 populates it.
@@ -82,7 +86,8 @@ def _log(msg: str) -> None:
     """Emit a timestamped progress line to stderr.
 
     Format: [ingest YYYY-MM-DD HH:MM:SS] <msg>
-    stdout stays reserved for the final PaperJSON output.
+    stdout is used for the short confirmation by default; pass --print/--stdout to
+    emit the full PaperJSON there, or use --output/-o to write it to a file.
     """
     print(f"[ingest {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", file=sys.stderr)
 
@@ -91,21 +96,32 @@ def _log(msg: str) -> None:
 # Phase 1.3 Plan 06 — GAP B: UTF-8 file-write helper
 # ---------------------------------------------------------------------------
 
-def _emit_result(result: dict, output_path: "str | None") -> None:
+def _emit_result(
+    result: dict,
+    output_path: "str | None",
+    print_json: bool = False,
+    confirmation: "str | None" = None,
+) -> None:
     """Emit the final PaperJSON result to a file or stdout.
 
-    When output_path is given, writes the result directly as UTF-8 JSON to that
-    path using open(..., encoding='utf-8'), bypassing PowerShell '>' redirection
-    which re-decodes correct UTF-8 through the OEM console code page and writes
-    UTF-16LE with mojibake (observed on Windows — José→"Jos├⌐", U+2019→"ΓÇÖ").
-    When output_path is None, prints to stdout (preserving prior behavior).
+    Branch logic:
+    - output_path truthy: write UTF-8 JSON directly to the file (bypasses PowerShell
+      '>' redirection which re-decodes correct UTF-8 through the OEM console code page
+      and writes UTF-16LE with mojibake — observed on Windows: José→"Jos├⌐", U+2019→"ΓÇÖ").
+    - print_json True: print the full PaperJSON to stdout (opt-in, --print/--stdout).
+    - default: print the short confirmation string (cache path + note path). If confirmation
+      is None, a minimal fallback line is printed instead.
+
+    output_path takes precedence over print_json — if both are given the file is written.
     """
     if output_path:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         _log(f"wrote {output_path}")
-    else:
+    elif print_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(confirmation if confirmation is not None else "[ingest] done.")
 
 
 # ---------------------------------------------------------------------------
@@ -1940,7 +1956,12 @@ if __name__ == "__main__":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(
-        description="Ingest a research paper PDF via MinerU and emit PaperJSON v2 to stdout."
+        description=(
+            "Ingest a research paper PDF via MinerU and emit a short confirmation "
+            "(cache path + note path) to stdout. "
+            "Use --print/--stdout to emit the full PaperJSON v2 to stdout instead, "
+            "or use --output/-o to write it to a file."
+        )
     )
     parser.add_argument("--pdf", required=True, help="Path to the input PDF file.")
     parser.add_argument(
@@ -1974,6 +1995,16 @@ if __name__ == "__main__":
             "Registry write uses merge (Plan 10 union-merge) — does not clobber other projects."
         ),
     )
+    parser.add_argument(
+        "--print", "--stdout",
+        dest="print_json",
+        action="store_true",
+        help=(
+            "Emit the full PaperJSON v2 to stdout as UTF-8 JSON. "
+            "By default only a short confirmation (cache path + note path) is printed; "
+            "use this flag to restore the full JSON dump."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1983,7 +2014,29 @@ if __name__ == "__main__":
         if args.timeout != DEFAULT_TIMEOUT:
             config["mineru_timeout"] = args.timeout
         result = ingest(args.pdf, config, force_extract=args.force_extract, refill=args.refill)
-        _emit_result(result, args.output)
+
+        # Build a short confirmation: cache path + written note path.
+        # Used by the default (non --print) stdout branch; never aborts the run on failure.
+        confirmation = None
+        try:
+            # Cache path: present on a cache-hit registry entry; otherwise derive from stem.
+            cache_path = result.get("paperjson_path") or str(
+                pathlib.Path(".paperjson_cache", pathlib.Path(args.pdf).stem + ".json").resolve()
+            )
+            # Note path: reconstruct from title via note._sanitize_filename (single source of truth).
+            from scripts import note as _note_mod
+            title = (
+                result.get("extraction", {}).get("metadata", {}).get("title")
+                or result.get("title")
+                or "Untitled"
+            )
+            safe_name = _note_mod._sanitize_filename(title)
+            note_path = f"Papers/{safe_name}.md"
+            confirmation = f"Cache: {cache_path}\nNote:  {note_path}"
+        except Exception:
+            pass  # fallback to default "[ingest] done." line
+
+        _emit_result(result, args.output, print_json=args.print_json, confirmation=confirmation)
     except SystemExit:
         raise
     except Exception as e:
