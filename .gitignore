@@ -38,8 +38,11 @@ Thumbs.db
 .vscode/
 .obsidian/
 
-# Claude Code local settings and memory
-.claude/
+# Claude Code per-machine settings and worktree state (not shared)
+.claude/settings.json
+.claude/settings.local.json
+.claude/worktrees/
+# .claude/skills/ is intentionally tracked — project skill knowledge
 
 # pytest cache
 .pytest_cache/
