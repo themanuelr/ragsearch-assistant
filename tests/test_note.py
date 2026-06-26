@@ -402,7 +402,7 @@ def test_generate_note_creates_note():
     from scripts.note import generate_note
 
     pj = _make_paperjson()
-    config = {"vault_name": "test-vault"}
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
 
     with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
          mock.patch("scripts.note._render_note", return_value="# Test Note\n") as mock_render, \
@@ -419,7 +419,7 @@ def test_generate_note_creates_note():
     assert path_arg.startswith("Papers/"), f"path should start with Papers/, got {path_arg!r}"
     assert ".." not in path_arg, f"path should not contain '..', got {path_arg!r}"
     # overwrite should be False (default)
-    overwrite_arg = call_kwargs[1].get("overwrite", call_kwargs[0][3] if len(call_kwargs[0]) > 3 else False)
+    overwrite_arg = call_kwargs[1].get("overwrite", False)
     assert overwrite_arg is False, "overwrite should be False when force=False"
 
 
@@ -429,7 +429,7 @@ def test_generate_note_skips_existing():
     from scripts.note import generate_note
 
     pj = _make_paperjson()
-    config = {"vault_name": "test-vault"}
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
 
     with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
          mock.patch("scripts.note._render_note", return_value="# Test\n"), \
@@ -452,7 +452,7 @@ def test_generate_note_force_overwrites():
     from scripts.note import generate_note
 
     pj = _make_paperjson()
-    config = {"vault_name": "test-vault"}
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
 
     with mock.patch("scripts.note._generate_analysis"), \
          mock.patch("scripts.note._render_note", return_value="# Test\n"), \
@@ -468,12 +468,12 @@ def test_generate_note_force_overwrites():
     assert overwrite_arg is True, "overwrite should be True when force=True"
 
 
-def test_generate_note_missing_vault_name():
-    """generate_note returns error when vault_name is missing from config."""
+def test_generate_note_missing_vault_path():
+    """generate_note returns error when vault_path is missing from config."""
     from scripts.note import generate_note
 
     pj = _make_paperjson()
-    config = {}  # no vault_name
+    config = {}  # no vault_path
 
     result = generate_note(pj, config)
     assert result.startswith("[note error:"), (
@@ -482,11 +482,11 @@ def test_generate_note_missing_vault_name():
 
 
 def test_generate_note_preflight_failure():
-    """generate_note returns error when preflight fails."""
+    """generate_note returns error when preflight fails (vault root missing)."""
     from scripts.note import generate_note
 
     pj = _make_paperjson()
-    config = {"vault_name": "test-vault"}
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
 
     with mock.patch("scripts.note.preflight", return_value=False):
         result = generate_note(pj, config)
