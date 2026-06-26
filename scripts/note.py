@@ -392,8 +392,12 @@ def _render_frontmatter(meta: dict, analysis: dict) -> str:
     if topics:
         lines.append("tags:")
         for t in topics:
-            slug = str(t).lower().replace(" ", "-")
-            lines.append(f"  - {slug}")
+            # Quote each tag like every other scalar (NOTE-02): slugification only
+            # lowercases and replaces spaces, so an LLM topic starting with a YAML
+            # indicator char (``*``/``[``/``#``) would otherwise produce unparseable
+            # or silently-corrupted frontmatter.  Escape embedded quotes too.
+            slug = str(t).lower().replace(" ", "-").replace('"', '\\"')
+            lines.append(f'  - "{slug}"')
 
     lines.append("status: ingested")
     lines.append(f"date_ingested: {datetime.date.today().isoformat()}")
