@@ -548,3 +548,119 @@ def test_direct_invocation_import_resolves():
     assert "cannot import name" not in result.stderr, (
         f"'cannot import name' in stderr:\n{result.stderr}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 2b: Math-scoped LaTeX escape repair (_repair_math_escapes)
+# ---------------------------------------------------------------------------
+
+class TestRepairMathEscapes:
+    """Tests for _repair_math_escapes and _repair_analysis_value (Task 2b).
+
+    gemma4:e4b emits LaTeX with single backslashes in JSON values; the JSON
+    decoder silently turns \\text → TAB+"ext", \\r → CR, \\n → LF.
+    These tests verify that the repair reconstructs the intended backslash
+    sequences within math spans only, leaving prose text unchanged.
+    """
+
+    def test_tab_in_math_span(self):
+        """$<TAB>ext{Na}^+$ repaired to $\\text{Na}^+$."""
+        from scripts.note import _repair_math_escapes
+        # Real TAB character inside $...$: simulates \text decoded by JSON
+        inp = "$" + "\t" + "ext{Na}^+$"
+        assert _repair_math_escapes(inp) == "$\\text{Na}^+$"
+
+    def test_cr_in_math_span(self):
+        """$<CR>ightleftharpoons$ repaired to $\\rightleftharpoons$."""
+        from scripts.note import _repair_math_escapes
+        inp = "$" + "\r" + "ightleftharpoons$"
+        assert _repair_math_escapes(inp) == "$\\rightleftharpoons$"
+
+    def test_compound_tabs_in_math_span(self):
+        """$<TAB>ext{Tl}_2<TAB>ext{SO}_4$ repaired to $\\text{Tl}_2\\text{SO}_4$."""
+        from scripts.note import _repair_math_escapes
+        inp = "$" + "\t" + "ext{Tl}_2" + "\t" + "ext{SO}_4$"
+        assert _repair_math_escapes(inp) == "$\\text{Tl}_2\\text{SO}_4$"
+
+    def test_lf_in_math_span(self):
+        """$<LF>abla$ repaired to $\\nabla$."""
+        from scripts.note import _repair_math_escapes
+        inp = "$" + "\n" + "abla$"
+        assert _repair_math_escapes(inp) == "$\\nabla$"
+
+    def test_prose_newlines_outside_math_unchanged(self):
+        """Real paragraph-break newlines OUTSIDE math spans are preserved unchanged."""
+        from scripts.note import _repair_math_escapes
+        inp = "First paragraph.\n\nSecond paragraph."
+        assert _repair_math_escapes(inp) == inp
+
+    def test_prose_newlines_with_math_mixed(self):
+        """Prose newlines outside math are unchanged; control chars inside math are repaired."""
+        from scripts.note import _repair_math_escapes
+        inp = "Some text.\n\nThe ion $" + "\t" + "ext{Na}^+$ is reactive.\n\nMore text."
+        expected = "Some text.\n\nThe ion $\\text{Na}^+$ is reactive.\n\nMore text."
+        assert _repair_math_escapes(inp) == expected
+
+    def test_no_dollar_sign_noop(self):
+        """Text without any $ is returned unchanged (fast-path)."""
+        from scripts.note import _repair_math_escapes
+        inp = "No math here: just text with " + "\t" + " tabs and " + "\n" + " newlines."
+        assert _repair_math_escapes(inp) == inp
+
+    def test_repair_analysis_value_str(self):
+        """_repair_analysis_value repairs a str value."""
+        from scripts.note import _repair_analysis_value
+        inp = "$" + "\t" + "ext{Na}^+$"
+        assert _repair_analysis_value(inp) == "$\\text{Na}^+$"
+
+    def test_repair_analysis_value_list(self):
+        """_repair_analysis_value repairs each str element in a list."""
+        from scripts.note import _repair_analysis_value
+        inp = [
+            "$" + "\t" + "ext{Na}^+$",
+            "plain text (no dollar sign)",
+            "$" + "\r" + "ightarrow$",
+        ]
+        result = _repair_analysis_value(inp)
+        assert result[0] == "$\\text{Na}^+$"
+        assert result[1] == "plain text (no dollar sign)"
+        assert result[2] == "$\\rightarrow$"
+
+    def test_repair_analysis_value_passthrough(self):
+        """_repair_analysis_value passes through non-str/non-list values unchanged."""
+        from scripts.note import _repair_analysis_value
+        assert _repair_analysis_value(None) is None
+        assert _repair_analysis_value(42) == 42
+
+    def test_generate_analysis_wiring(self):
+        """_generate_analysis repairs control chars inside $...$ in analysis fields.
+
+        Mocks _ollama_extraction_call to return JSON with a literal TAB inside a
+        math span for the summary field; asserts the stored analysis value has the
+        TAB replaced by backslash+t (i.e. the repair is wired in _generate_analysis).
+        """
+        from scripts.note import _generate_analysis
+
+        pj = _make_paperjson()
+
+        def _mock_mangled_summary(prompt, system, schema, num_ctx=4096, timeout=120):
+            props = schema.get("properties", {})
+            if "summary" in props:
+                # Literal TAB inside $...$: simulates gemma4:e4b \text decoded by JSON
+                mangled = "The ion $" + "\t" + "ext{Na}^+$ is notable."
+                return json.dumps({"summary": mangled})
+            return _mock_ollama_success(prompt, system, schema, num_ctx, timeout)
+
+        with mock.patch("scripts.note._ollama_extraction_call",
+                        side_effect=_mock_mangled_summary), \
+             mock.patch("scripts.note._warmup_ollama"):
+            _generate_analysis(pj)
+
+        summary = pj["analysis"]["summary"]
+        # TAB inside $...$ must be repaired to backslash+t
+        assert "\t" not in summary, (
+            f"TAB char should be repaired in analysis summary; got: {summary!r}"
+        )
+        assert "\\text" in summary, (
+            f"Expected '\\\\text' (backslash+text) in repaired summary; got: {summary!r}"
+        )
