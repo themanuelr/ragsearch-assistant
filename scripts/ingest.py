@@ -2199,6 +2199,115 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: boo
     )
 
 
+def ingest_url(url: str, config: dict) -> dict:
+    """
+    Ingest a paper by URL (arXiv, PubMed, or journal) and return a PaperJSON v2 dict.
+
+    Sibling entry point to ingest() (D-01): swaps MinerU steps 1–3 for a defuddle
+    subprocess + heading-split markdown parser, then joins the same fill cascade via
+    _run_fill_cascade (the PDF and web paths converge there).
+
+    Step ordering:
+      1. Preflight — reject non-http(s) URLs; resolve defuddle; set module globals.
+      2. URL rewrite — arXiv /abs→/html; PubMed→PMC (fail-open).
+      3. Run defuddle (argv list, timeout-bounded — D-08 / T-03-02 / T-03-04).
+      4. Parse markdown → PaperJSON sections skeleton.
+      5. Build web provenance dict.
+      6. Assemble PaperJSON skeleton via _assemble_paperjson.
+      7. Quality gate on skeleton (D-12).
+      8–16. Shared fill cascade via _run_fill_cascade.
+
+    D-09 thin-content gate and ar5iv retry land in 03-03.
+    _web_doi_key_fallback lands in 03-04.
+
+    Args:
+        url:    HTTP(S) URL of the paper to ingest.
+        config: Loaded config.json dict (use _load_config()).
+
+    Returns:
+        PaperJSON v2 dict (new ingest) OR cached registry entry dict (cache hit).
+
+    Raises:
+        SystemExit: On preflight failure or quality-gate failure.
+    """
+    # Step 1: Preflight
+    # Scheme validation (T-03-03: reject file:// / data: / etc.)
+    if not url.startswith(("http://", "https://")):
+        print(
+            f"[ingest error: invalid URL scheme — only http/https allowed: {url}]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    defuddle_exe = _resolve_defuddle(config)
+    if defuddle_exe is None:
+        print(
+            "[ingest error: defuddle not found — install with: npm install -g defuddle]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Set module globals from config (mirror ingest() lines 1877-1880)
+    global _NUM_CTX_CAP
+    _NUM_CTX_CAP = int(config.get("ollama_num_ctx_cap", DEFAULT_NUM_CTX_CAP))
+    global _SECTION_TIMEOUT
+    _SECTION_TIMEOUT = int(config.get("ollama_section_timeout", DEFAULT_SECTION_TIMEOUT))
+
+    registry_path = os.path.expanduser(config.get("registry_path", ""))
+    project_name = config.get("project_name", "")
+    defuddle_timeout = int(config.get("defuddle_timeout", 60))
+
+    # Step 2: URL rewrite (arXiv /abs→/html; PubMed→PMC fail-open)
+    _log(f"url rewrite: {url}")
+    rewritten_url = _rewrite_url(url, config)
+    if rewritten_url != url:
+        _log(f"url rewritten to: {rewritten_url}")
+
+    # Step 3: Run defuddle (T-03-02: argv list; T-03-04: timeout-bounded; D-08: empty gate)
+    _log("defuddle extraction starting")
+    try:
+        md_text = _run_defuddle(rewritten_url, defuddle_exe, timeout=defuddle_timeout)
+    except subprocess.TimeoutExpired:
+        print(
+            f"[ingest error: defuddle timed out after {defuddle_timeout}s]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+    _log("defuddle extraction finished")
+
+    # Step 4: Parse markdown → sections skeleton
+    _log("markdown parse")
+    parsed = _parse_defuddle_markdown(md_text)
+
+    # Step 5: Build web provenance dict
+    provenance = _web_provenance(url, rewritten_url, md_text)
+
+    # Step 6: Assemble PaperJSON skeleton
+    skeleton = _assemble_paperjson(parsed, provenance)
+
+    # Step 7: Quality gate — before any LLM call (D-12)
+    gate_error = _quality_gate(skeleton)
+    if gate_error:
+        print(gate_error, file=sys.stderr)
+        sys.exit(1)
+
+    # Steps 8–16: Shared fill cascade (converges with PDF path here)
+    return _run_fill_cascade(
+        skeleton,
+        parsed,
+        config,
+        full_text=md_text,
+        first_page_text=md_text[:3000],
+        source_path=url,
+        cache_stem=_web_cache_stem(url),
+        registry_path=registry_path,
+        project_name=project_name,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -2210,13 +2319,21 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "Ingest a research paper PDF via MinerU and emit a short confirmation "
-            "(cache path + note path) to stdout. "
+            "Ingest a research paper PDF or URL via MinerU/defuddle and emit a short "
+            "confirmation (cache path + note path) to stdout. "
             "Use --print/--stdout to emit the full PaperJSON v2 to stdout instead, "
             "or use --output/-o to write it to a file."
         )
     )
-    parser.add_argument("--pdf", required=True, help="Path to the input PDF file.")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--pdf",
+        help="Path to the input PDF file.",
+    )
+    source_group.add_argument(
+        "--url",
+        help="URL of the paper to ingest (arXiv, PubMed, or journal).",
+    )
     parser.add_argument(
         "--force-extract",
         action="store_true",
@@ -2263,20 +2380,20 @@ if __name__ == "__main__":
 
     try:
         config = _load_config()
-        # Allow CLI --timeout to override config
-        if args.timeout != DEFAULT_TIMEOUT:
-            config["mineru_timeout"] = args.timeout
-        result = ingest(args.pdf, config, force_extract=args.force_extract, refill=args.refill)
+
+        # Dispatch: --pdf or --url (mutually exclusive, one is required)
+        if args.pdf:
+            # Allow CLI --timeout to override config (PDF only)
+            if args.timeout != DEFAULT_TIMEOUT:
+                config["mineru_timeout"] = args.timeout
+            result = ingest(args.pdf, config, force_extract=args.force_extract, refill=args.refill)
+        elif args.url:
+            result = ingest_url(args.url, config)
 
         # Build a short confirmation: cache path + written note path.
         # Used by the default (non --print) stdout branch; never aborts the run on failure.
         confirmation = None
         try:
-            # Cache path: present on a cache-hit registry entry; otherwise derive from stem.
-            cache_path = result.get("paperjson_path") or str(
-                pathlib.Path(".paperjson_cache", pathlib.Path(args.pdf).stem + ".json").resolve()
-            )
-            # Note path: reconstruct from title via note._sanitize_filename (single source of truth).
             from scripts import note as _note_mod
             title = (
                 result.get("extraction", {}).get("metadata", {}).get("title")
@@ -2285,6 +2402,15 @@ if __name__ == "__main__":
             )
             safe_name = _note_mod._sanitize_filename(title)
             note_path = f"Papers/{safe_name}.md"
+            # Cache path: derive from pdf stem (PDF) or web cache stem (URL)
+            if args.pdf:
+                cache_path = result.get("paperjson_path") or str(
+                    pathlib.Path(".paperjson_cache", pathlib.Path(args.pdf).stem + ".json").resolve()
+                )
+            else:
+                cache_path = result.get("paperjson_path") or str(
+                    pathlib.Path(".paperjson_cache", _web_cache_stem(args.url) + ".json").resolve()
+                )
             confirmation = f"Cache: {cache_path}\nNote:  {note_path}"
         except Exception:
             pass  # fallback to default "[ingest] done." line
