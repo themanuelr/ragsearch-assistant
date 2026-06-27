@@ -1274,7 +1274,7 @@ def _run_defuddle(url: str, defuddle_exe: str, timeout: int = 60) -> str:
     Lets subprocess.TimeoutExpired propagate to the caller for clean error handling.
     """
     result = subprocess.run(
-        [defuddle_exe, "parse", url, "--md"],
+        [defuddle_exe, "parse", url, "--md", "--frontmatter"],
         timeout=timeout,
         capture_output=True,
         text=True,
@@ -1528,6 +1528,34 @@ def _parse_defuddle_markdown(md_text: str) -> dict:
     text blocks.
     """
     lines = md_text.split("\n")
+
+    # Detect and strip a leading YAML frontmatter block (---\n…\n---).
+    # Extract title: from it as a fallback when no # H1 is present in the body.
+    fm_title: str | None = None
+    if lines and lines[0].strip() == "---":
+        closing_idx = None
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                closing_idx = i
+                break
+        if closing_idx is not None:
+            for fm_line in lines[1:closing_idx]:
+                stripped = fm_line.strip()
+                if stripped.startswith("title:"):
+                    raw_value = stripped[len("title:"):].strip()
+                    # Strip a single matching pair of surrounding quotes (" or ')
+                    if (
+                        len(raw_value) >= 2
+                        and raw_value[0] in ('"', "'")
+                        and raw_value[-1] == raw_value[0]
+                    ):
+                        raw_value = raw_value[1:-1]
+                    candidate = _build_plain(raw_value)
+                    fm_title = candidate if candidate else None
+                    break
+            # Remove frontmatter lines so they never enter paragraph accumulation
+            lines = lines[closing_idx + 1:]
+
     title = None
     sections: list[dict] = []
     current_section: dict = {"heading": "", "level": 0, "blocks": []}
@@ -1576,6 +1604,10 @@ def _parse_defuddle_markdown(md_text: str) -> dict:
     _flush_paragraph()
     if current_section["blocks"]:
         sections.append(current_section)
+
+    # Frontmatter title fallback: use when no # H1 was found in the body
+    if title is None and fm_title:
+        title = fm_title
 
     metadata = {
         "title": title,
