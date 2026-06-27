@@ -420,6 +420,44 @@ def _rewrite_url(url: str, config: dict) -> str:
     return url
 
 
+def _is_arxiv_url(url: str) -> bool:
+    """Return True for arxiv.org or ar5iv.labs.arxiv.org URLs (D-04 / 03-03)."""
+    return bool(_ARXIV_URL_RE.match(url)) or "ar5iv.labs.arxiv.org" in url
+
+
+def _extract_arxiv_id(url: str) -> str | None:
+    """
+    Extract the arXiv paper id from an arxiv.org or ar5iv URL.
+
+    Returns the id string (e.g. "1706.03762" or "1706.03762v7"), or None when
+    the URL does not match either pattern (D-04 / 03-03).
+    """
+    m = _ARXIV_URL_RE.match(url)
+    if m:
+        return m.group(1)
+    m2 = re.match(r"https?://ar5iv\.labs\.arxiv\.org/html/(.+?)(?:\?.*)?$", url)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def _web_body_too_thin(skeleton: dict, min_chars: int) -> bool:
+    """
+    Return True when the total plain text in the skeleton is below min_chars (D-09).
+
+    Counts only type=="text" blocks' plain field — web pages produced by defuddle
+    have no figures/tables for MVP, so only text content is relevant.
+    Mirrors the block-iteration shape of _quality_gate (lines 1119-1128) but
+    counts text-only plain for the web paywall check.
+    """
+    total = 0
+    for section in skeleton.get("extraction", {}).get("sections", []):
+        for block in section.get("blocks", []):
+            if block.get("type") == "text":
+                total += len(block.get("plain", "") or "")
+    return total < min_chars
+
+
 def _normalize_text(text: str) -> str:
     """
     Apply P0 normalization fix (MINERU.md §3, D-09).
@@ -2287,6 +2325,49 @@ def ingest_url(url: str, config: dict) -> dict:
 
     # Step 6: Assemble PaperJSON skeleton
     skeleton = _assemble_paperjson(parsed, provenance)
+
+    # Step 6b: D-04 ar5iv retry + D-09 body-size gate (03-03)
+    min_chars = int(config.get("web_min_body_chars", 2000))
+
+    # D-04: ar5iv retry — fires once when arXiv HTML is thin (older papers lack native HTML)
+    if (
+        _is_arxiv_url(url)
+        and _web_body_too_thin(skeleton, min_chars)
+        and "ar5iv.labs.arxiv.org" not in rewritten_url
+    ):
+        arxiv_id = _extract_arxiv_id(url)
+        if arxiv_id:
+            ar5iv_url = f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}"
+            _log(f"arxiv html thin — retrying with ar5iv: {ar5iv_url}")
+            try:
+                md_text = _run_defuddle(ar5iv_url, defuddle_exe, timeout=defuddle_timeout)
+            except subprocess.TimeoutExpired:
+                print(
+                    f"[ingest error: defuddle timed out after {defuddle_timeout}s]",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            except RuntimeError as e:
+                print(f"[ingest error: {e}]", file=sys.stderr)
+                sys.exit(1)
+            parsed = _parse_defuddle_markdown(md_text)
+            provenance = _web_provenance(url, ar5iv_url, md_text)
+            skeleton = _assemble_paperjson(parsed, provenance)
+
+    # D-09: Body-size gate — reject paywall / abstract-only pages pre-LLM (T-03-06)
+    if _web_body_too_thin(skeleton, min_chars):
+        total = sum(
+            len(block.get("plain", "") or "")
+            for section in skeleton.get("extraction", {}).get("sections", [])
+            for block in section.get("blocks", [])
+            if block.get("type") == "text"
+        )
+        print(
+            f"[ingest error: web content too short — likely paywalled or abstract-only: "
+            f"{url} (body chars: {total} < {min_chars})]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Step 7: Quality gate — before any LLM call (D-12)
     gate_error = _quality_gate(skeleton)
