@@ -597,6 +597,47 @@ def _syntactic_doi_valid(doi: str | None) -> bool:
     return bool(doi and DOI_RE.fullmatch(doi.strip()))
 
 
+def _web_doi_key_fallback(
+    url: str,
+    probe: "DoiProbeResult | None",
+) -> "tuple[str | None, str | None]":
+    """
+    Extract a DOI or arXiv ID directly from the URL as a last-resort key (D-07).
+
+    Only invoked when _doi_probe returned neither a DOI nor an arXiv ID.  The
+    probe argument is accepted for signature symmetry but is not consulted —
+    the function reads only the URL.
+
+    Match order:
+      1. New-style arXiv ID:  arxiv.org/{abs|html|pdf}/<NNNN.NNNNN[vN]>
+      2. Old-style arXiv ID:  arxiv.org/{abs|html|pdf}/<archive[.SS]/NNNNNNN>
+      3. doi.org/<DOI> path:  extracted DOI accepted only when _syntactic_doi_valid.
+
+    Returns:
+        (doi_or_None, arxiv_id_or_None) — both str | None.
+        A URL-mined DOI that fails _syntactic_doi_valid is NOT returned
+        (guards against a malformed string becoming the registry key, T-03-08).
+    """
+    # New-style arXiv ID — e.g. 1706.03762 or 1706.03762v7
+    m = re.search(r"arxiv\.org/(?:abs|html|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)", url)
+    if m:
+        return None, m.group(1)
+
+    # Old-style arXiv ID — e.g. hep-th/9712052 or math.AG/0601001
+    m = re.search(r"arxiv\.org/(?:abs|html|pdf)/([a-z-]+(?:\.[A-Z]{2})?/\d{7})", url)
+    if m:
+        return None, m.group(1)
+
+    # DOI from a doi.org redirect URL — strip trailing slash and any query string
+    m = re.search(r"doi\.org/(10\.\d{4,}/.+?)(?:\?|$)", url)
+    if m:
+        doi = m.group(1).rstrip("/")
+        if _syntactic_doi_valid(doi):
+            return doi, None
+
+    return None, None
+
+
 def _doi_probe(full_text: str) -> "DoiProbeResult | None":
     """
     Pre-gate call: extract DOI, arXiv ID, and title from the FULL document text.
