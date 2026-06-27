@@ -609,7 +609,9 @@ def _web_doi_key_fallback(
     the function reads only the URL.
 
     Match order:
-      1. New-style arXiv ID:  arxiv.org/{abs|html|pdf}/<NNNN.NNNNN[vN]>
+      1. New-style arXiv ID:  arxiv.org/{abs|html|pdf}/<NNNN.NNNNN>[vN]
+         (a trailing vN version suffix is matched but stripped from the
+         returned id so the key converges with the PDF probe — WR-01 / SC3)
       2. Old-style arXiv ID:  arxiv.org/{abs|html|pdf}/<archive[.SS]/NNNNNNN>
       3. doi.org/<DOI> path:  extracted DOI accepted only when _syntactic_doi_valid.
 
@@ -618,8 +620,10 @@ def _web_doi_key_fallback(
         A URL-mined DOI that fails _syntactic_doi_valid is NOT returned
         (guards against a malformed string becoming the registry key, T-03-08).
     """
-    # New-style arXiv ID — e.g. 1706.03762 or 1706.03762v7
-    m = re.search(r"arxiv\.org/(?:abs|html|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)", url)
+    # New-style arXiv ID — e.g. 1706.03762.  A trailing version suffix (vN) is
+    # matched but kept OUT of the capture group, so a versioned URL yields the bare
+    # id ("1706.03762"), converging with the PDF probe's key (WR-01 / SC3).
+    m = re.search(r"arxiv\.org/(?:abs|html|pdf)/(\d{4}\.\d{4,5})(?:v\d+)?", url)
     if m:
         return None, m.group(1)
 
@@ -1986,7 +1990,15 @@ def _run_fill_cascade(
     # No fill helpers run if the paper is already in the registry.
     # BYPASSED when refill=True — the whole point of --refill is to re-run the fill
     # even on a cache hit (Plan 11, INGEST-01).
-    registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": title_hint})
+    # CR-01 (SC3): when the probe yielded no title (a web probe failure on a generic
+    # journal URL with neither a DOI nor an arXiv id), fall back to the parsed H1 title in
+    # the skeleton so the key does not collapse to the constant empty-string hash
+    # (sha256:e3b0c44298fc1c14) shared by every such paper. source_url-gated → web only;
+    # the PDF path (source_url=None) keeps title_hint and stays byte-identical.
+    key_title = title_hint
+    if source_url and not key_title:
+        key_title = skeleton.get("extraction", {}).get("metadata", {}).get("title")
+    registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": key_title})
     cached = _check_registry(registry_key, registry_path)
     if cached is not None and not force_extract and not refill:
         # Cache-hit append: add current project to cached entry if absent (CR-01, REG-02).

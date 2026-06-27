@@ -225,6 +225,82 @@ def test_registry_key_convergence():
     )
 
 
+def test_registry_key_convergence_versioned():
+    """WR-01 (SC3): a versioned arXiv URL keys on the BARE id, converging with the PDF probe.
+
+    _web_doi_key_fallback strips the trailing vN suffix, so
+    'https://arxiv.org/abs/1706.03762v7' yields arxiv_id '1706.03762' — identical to the
+    PDF path's bare-id key. Without the strip, the two ingests would produce duplicate
+    registry entries ('1706.03762v7' vs '1706.03762').
+    """
+    doi, arxiv_id = ing._web_doi_key_fallback("https://arxiv.org/abs/1706.03762v7", None)
+    assert doi is None, f"Expected doi=None for versioned arXiv URL, got {doi!r}"
+    assert arxiv_id == "1706.03762", (
+        f"Expected version-stripped arxiv_id='1706.03762', got {arxiv_id!r}"
+    )
+
+    web_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": None})
+    pdf_key = _registry_key({"doi": None, "arxiv_id": "1706.03762", "title": None})
+    assert web_key == pdf_key == "1706.03762", (
+        f"Versioned URL key must converge with PDF key: web={web_key!r}, pdf={pdf_key!r}"
+    )
+
+    # /html/ and /pdf/ versioned variants strip the suffix too
+    _, html_id = ing._web_doi_key_fallback("https://arxiv.org/html/2310.06825v2", None)
+    assert html_id == "2310.06825", (
+        f"Expected version-stripped '2310.06825' from /html/ URL, got {html_id!r}"
+    )
+
+
+def test_registry_key_web_probe_failure_uses_skeleton_title(monkeypatch, parsed):
+    """CR-01 (SC3): a generic journal URL whose DOI probe fails (probe=None) keys on the
+    parsed H1 skeleton title, NOT the constant empty-string hash (sha256:e3b0c44298fc1c14).
+
+    Drives _run_fill_cascade with the probe stubbed to None and the registry check stubbed
+    to a cache hit, so the derived key is captured before any LLM fill runs. No Ollama,
+    network, or defuddle binary required.
+    """
+    skeleton = _assemble_paperjson(parsed, {})
+    skeleton_title = skeleton["extraction"]["metadata"]["title"]
+    assert skeleton_title, "fixture skeleton must carry a non-empty H1 title"
+
+    captured: dict = {}
+
+    def _fake_check_registry(key, registry_path):
+        captured["key"] = key
+        return {"projects": ["t"]}  # truthy → early cache-hit return, zero LLM calls
+
+    monkeypatch.setattr(ing, "_warmup_ollama", lambda *a, **kw: None)
+    monkeypatch.setattr(ing, "_doi_probe", lambda full_text: None)
+    monkeypatch.setattr(ing, "_check_registry", _fake_check_registry)
+
+    journal_url = "https://www.nature.com/articles/nature12373"
+    ing._run_fill_cascade(
+        skeleton,
+        parsed,
+        {},
+        full_text="body text with no in-text doi or arxiv id",
+        first_page_text="body text",
+        source_path=journal_url,
+        cache_stem="url-deadbeef",
+        registry_path="",
+        project_name="t",
+        source_url=journal_url,
+    )
+
+    constant_empty_key = _registry_key({"doi": None, "arxiv_id": None, "title": None})
+    expected_key = _registry_key(
+        {"doi": None, "arxiv_id": None, "title": skeleton_title}
+    )
+    assert captured.get("key") == expected_key, (
+        f"Expected key from skeleton title {expected_key!r}, got {captured.get('key')!r}"
+    )
+    assert captured["key"] != constant_empty_key, (
+        "Web probe failure must NOT collapse to the constant empty-title hash "
+        f"({constant_empty_key!r})"
+    )
+
+
 def test_ingest_url_thin_exits(monkeypatch, thin_md, capsys):
     """D-09 gate: ingest_url raises SystemExit on thin content with no LLM call.
 
