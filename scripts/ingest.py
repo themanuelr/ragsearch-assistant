@@ -1174,7 +1174,7 @@ def _crossref_published_year(doi: str, config: dict) -> int | None:
 # Quality gate
 # ---------------------------------------------------------------------------
 
-def _quality_gate(paperjson: dict) -> str | None:
+def _quality_gate(paperjson: dict, source: str = "pdf") -> str | None:
     """
     Validate extraction output quality (INGEST-03 redefined per D-11).
 
@@ -1183,12 +1183,19 @@ def _quality_gate(paperjson: dict) -> str | None:
       - total non-noise text is near-empty (below threshold).
 
     Returns None when output passes quality checks.
+
+    source: "pdf" (default) uses PDF-specific wording; "web" uses web-appropriate wording.
     """
     extraction = paperjson.get("extraction", {})
     metadata = extraction.get("metadata", {})
     title = metadata.get("title")
 
     if not title:
+        if source == "web":
+            return (
+                "[ingest error: extraction produced no usable content — "
+                "no title found on web page]"
+            )
         return (
             "[ingest error: extraction produced no usable content — "
             "possible scanned/garbage PDF (no title detected)]"
@@ -1214,6 +1221,12 @@ def _quality_gate(paperjson: dict) -> str | None:
     # for a real paper (even an abstract is ~500 chars)
     NEAR_EMPTY_THRESHOLD = 100
     if total_text_len < NEAR_EMPTY_THRESHOLD:
+        if source == "web":
+            return (
+                f"[ingest error: extraction produced no usable content — "
+                f"web page body near-empty (total content {total_text_len} chars "
+                f"below threshold {NEAR_EMPTY_THRESHOLD})]"
+            )
         return (
             f"[ingest error: extraction produced no usable content — "
             f"possible scanned/garbage PDF (total content {total_text_len} chars "
@@ -2473,7 +2486,7 @@ def ingest_url(url: str, config: dict) -> dict:
         sys.exit(1)
 
     # Step 7: Quality gate — before any LLM call (D-12)
-    gate_error = _quality_gate(skeleton)
+    gate_error = _quality_gate(skeleton, source="web")
     if gate_error:
         print(gate_error, file=sys.stderr)
         sys.exit(1)
