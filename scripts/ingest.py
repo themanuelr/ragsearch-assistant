@@ -1916,6 +1916,7 @@ def _run_fill_cascade(
     project_name: str,
     force_extract: bool = False,
     refill: bool = False,
+    source_url: str | None = None,
 ) -> dict:
     """
     Run the shared fill-cascade tail (steps 5–13) for both PDF and web ingestion.
@@ -1937,6 +1938,9 @@ def _run_fill_cascade(
       project_name:    Project identifier from config.json.
       force_extract:   PDF only — bypass registry cache even on a hit.
       refill:          PDF only — bypass registry cache for re-fill runs.
+      source_url:      Web only — original URL passed to _web_doi_key_fallback (D-07)
+                       when the DOI probe yields neither a DOI nor an arXiv ID.
+                       Defaults to None; PDF callers omit it, preserving identical behaviour.
     """
     # Step 5: Warm up Ollama to pin gemma4:e4b in VRAM for the full run (D-00d / Pattern 4)
     _log(f"warming up {OLLAMA_MODEL}")
@@ -1959,6 +1963,20 @@ def _run_fill_cascade(
     # Step 7: Syntactic DOI validation — never use a malformed DOI as registry key (D-00c)
     if doi and not _syntactic_doi_valid(doi):
         doi = None  # fall back to arXiv ID or title-hash key chain
+
+    # Step 7b: D-07 URL-pattern last-resort key (web path only)
+    # Fires when the probe returned neither a DOI nor an arXiv ID AND source_url was provided.
+    # Parses the URL itself for a recognisable arXiv id or doi.org DOI so the chain never
+    # collapses straight to a title-hash key for a URL whose page did not print an id in-text.
+    # PDF callers pass source_url=None (default) → this block is completely skipped.
+    if not doi and not arxiv_id and source_url:
+        doi, arxiv_id = _web_doi_key_fallback(source_url, probe)
+        # Re-apply syntactic guard: a URL-mined DOI that fails the check must not become the key
+        if doi and not _syntactic_doi_valid(doi):
+            doi = None
+        _log(
+            f"url-pattern key fallback (D-07): doi={doi!r} arxiv_id={arxiv_id!r}"
+        )
 
     # Step 8: Crossref validation hook (Plan 03)
     if config.get("crossref_validate", False) and doi:
@@ -2427,6 +2445,7 @@ def ingest_url(url: str, config: dict) -> dict:
         cache_stem=_web_cache_stem(url),
         registry_path=registry_path,
         project_name=project_name,
+        source_url=url,  # D-07: URL-pattern key fallback when probe finds no DOI/arXiv ID
     )
 
 
