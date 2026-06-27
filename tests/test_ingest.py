@@ -1253,16 +1253,20 @@ def test_ingest_crossref_hook_comment_present():
 
 
 def test_ingest_check_registry_after_doi_probe():
-    """In ingest() source, _check_registry appears after _doi_probe (ordering constraint D-00b)."""
+    """_check_registry appears after _doi_probe in the shared cascade (ordering constraint D-00b).
+
+    Phase 3 refactor: both calls now live in _run_fill_cascade (shared by PDF + web paths).
+    The ordering constraint D-00b is still enforced — just in the shared helper.
+    """
     import inspect
-    from scripts.ingest import ingest
-    source = inspect.getsource(ingest)
+    from scripts.ingest import _run_fill_cascade
+    source = inspect.getsource(_run_fill_cascade)
     probe_pos = source.find("_doi_probe")
     check_pos = source.find("_check_registry")
-    assert probe_pos != -1, "Expected _doi_probe call in ingest()"
-    assert check_pos != -1, "Expected _check_registry call in ingest()"
+    assert probe_pos != -1, "Expected _doi_probe call in _run_fill_cascade"
+    assert check_pos != -1, "Expected _check_registry call in _run_fill_cascade"
     assert probe_pos < check_pos, (
-        f"Expected _doi_probe (pos {probe_pos}) to appear before _check_registry (pos {check_pos}) in ingest()"
+        f"Expected _doi_probe (pos {probe_pos}) to appear before _check_registry (pos {check_pos}) in _run_fill_cascade"
     )
 
 
@@ -1470,13 +1474,17 @@ def test_crossref_validate_config_user_agent():
 
 
 def test_crossref_hook_wired_in_ingest():
-    """ingest() must call _crossref_validate (not just a comment) when the flag is on."""
+    """The shared cascade must call _crossref_validate (not just a comment) when the flag is on.
+
+    Phase 3 refactor: the call now lives in _run_fill_cascade (shared by PDF + web paths).
+    The Plan 03 hook is still a live call — just in the shared helper rather than ingest() directly.
+    """
     import inspect
-    from scripts.ingest import ingest
-    source = inspect.getsource(ingest)
+    from scripts.ingest import _run_fill_cascade
+    source = inspect.getsource(_run_fill_cascade)
     # After Plan 03, the real call (not the commented-out placeholder) must appear
     assert "_crossref_validate(" in source, (
-        "Expected live _crossref_validate( call in ingest() (Plan 03 hook activated)"
+        "Expected live _crossref_validate( call in _run_fill_cascade (Plan 03 hook activated)"
     )
 
 

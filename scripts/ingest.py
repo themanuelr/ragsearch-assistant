@@ -1821,6 +1821,238 @@ def _web_provenance(url: str, fetched_url: str, md_text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — shared fill cascade (PDF + web converge here)
+# ---------------------------------------------------------------------------
+
+def _run_fill_cascade(
+    skeleton: dict,
+    parsed: dict,
+    config: dict,
+    *,
+    full_text: str,
+    first_page_text: str,
+    source_path: str,
+    cache_stem: str,
+    registry_path: str,
+    project_name: str,
+    force_extract: bool = False,
+    refill: bool = False,
+) -> dict:
+    """
+    Run the shared fill-cascade tail (steps 5–13) for both PDF and web ingestion.
+
+    This helper encapsulates the warmup → DOI probe → registry gate → metadata fill
+    → section fill → ref fill → cache write → registry write → note generation path.
+    Both ingest() and ingest_url() call it after producing their respective skeleton
+    and parsed objects.
+
+    Parameters that differ between PDF and web:
+      full_text:       Full document text for DOI probe (blocks-extracted for PDF,
+                       md_text for web).
+      first_page_text: Cover-page text for metadata fill (first-page blocks for PDF,
+                       md_text[:3000] for web).
+      source_path:     Absolute PDF path string (PDF) or original URL (web) — used
+                       as the informational source_path field in the registry entry.
+      cache_stem:      pdf.stem for PDF; _web_cache_stem(url) for web.
+      registry_path:   Expanded registry JSON path.
+      project_name:    Project identifier from config.json.
+      force_extract:   PDF only — bypass registry cache even on a hit.
+      refill:          PDF only — bypass registry cache for re-fill runs.
+    """
+    # Step 5: Warm up Ollama to pin gemma4:e4b in VRAM for the full run (D-00d / Pattern 4)
+    _log(f"warming up {OLLAMA_MODEL}")
+    _warmup_ollama()
+
+    # Step 6: DOI probe — LLM call on FULL document text; title hint is at the start.
+    # full_text feeds the DOI probe (may include Supporting Information DOI on later pages);
+    # first_page_text feeds _fill_metadata (cover-page metadata is more reliable for title/authors).
+    _log("doi probe")
+    try:
+        probe = _doi_probe(full_text)
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+
+    doi = probe.doi if probe else None
+    arxiv_id = probe.arxiv_id if probe else None
+    title_hint = probe.title if probe else None
+
+    # Step 7: Syntactic DOI validation — never use a malformed DOI as registry key (D-00c)
+    if doi and not _syntactic_doi_valid(doi):
+        doi = None  # fall back to arXiv ID or title-hash key chain
+
+    # Step 8: Crossref validation hook (Plan 03)
+    if config.get("crossref_validate", False) and doi:
+        _crossref_validate(doi, title_hint, config)
+
+    # Step 9: Registry check — HARD GATE (D-00b / REG-02)
+    # No fill helpers run if the paper is already in the registry.
+    # BYPASSED when refill=True — the whole point of --refill is to re-run the fill
+    # even on a cache hit (Plan 11, INGEST-01).
+    registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": title_hint})
+    cached = _check_registry(registry_key, registry_path)
+    if cached is not None and not force_extract and not refill:
+        # Cache-hit append: add current project to cached entry if absent (CR-01, REG-02).
+        # Persists via _write_registry (which union-merges) under the lock.
+        if project_name and project_name not in cached.get("projects", []):
+            cached.setdefault("projects", []).append(project_name)
+            if registry_path:
+                try:
+                    _write_registry(cached, registry_path, registry_key)
+                except Exception as e:
+                    _log(f"registry cache-hit update failed: {e}")
+        # GAP-CLOSURE (02-04): note-aware registry hit. If a surviving PaperJSON cache
+        # exists for this already-ingested paper, generate the note from it best-effort.
+        # generate_note self-skips when the note already exists (force=False, D-16), so this
+        # is idempotent and runs zero LLM fill calls. A note failure never fails the ingest.
+        pj_path = cached.get("paperjson_path") or ""
+        if pj_path and pathlib.Path(pj_path).exists():
+            try:
+                from scripts import note as note
+                with open(pj_path, "r", encoding="utf-8") as _pjf:
+                    _cached_paperjson = json.load(_pjf)
+                _note_result = note.generate_note(_cached_paperjson, config)
+                if isinstance(_note_result, str) and _note_result.startswith("[note error:"):
+                    _log(f"registry-hit note generation failed: {_note_result}")
+            except Exception as e:
+                print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
+        return cached  # cache hit: return immediately, zero fill calls
+
+    # Steps 10–12 (miss path): fill → renditions → registry write
+    failed_count = 0
+
+    # Step 10a: Metadata fill (one call post-miss)
+    _log("metadata fill")
+    try:
+        metadata = _fill_metadata(first_page_text, probe)
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 10a+: Crossref journal_full enrichment (Plan 08 GAP B).
+    if config.get("crossref_validate", False) and doi and metadata.journal_full is None:
+        full = _crossref_journal_full(doi, config)
+        if full is not None:
+            metadata.journal_full = full
+
+    # Step 10a++: Crossref published-year enrichment (Plan 10 Item 1b, INGEST-01).
+    if config.get("crossref_validate", False) and doi and metadata.year is None:
+        crossref_year = _crossref_published_year(doi, config)
+        if crossref_year is not None:
+            metadata.year = crossref_year
+
+    # Step 10a+++: journal-abbreviation fallback (Plan 09 GAP C).
+    if not metadata.journal and metadata.journal_full:
+        metadata.journal = metadata.journal_full
+
+    skeleton["extraction"]["metadata"] = metadata.model_dump()
+
+    # Step 10b: Per-section fill (one call per section, two-strike, D-01)
+    total = len(skeleton["extraction"]["sections"])
+    kept_sections: list[dict] = []
+    kept_count = 0
+    dropped_count = 0
+    try:
+        for i, section in enumerate(skeleton["extraction"]["sections"]):
+            raw_parts = []
+            for blk in section.get("blocks", []):
+                if blk.get("type") == "text":
+                    raw_parts.append(blk.get("display") or blk.get("plain") or "")
+            raw_section_text = "\n".join(raw_parts)
+            log_label = section.get("heading") or f"Section {i}"
+            raw_heading = section.get("heading") or ""
+            _log(f"section fill {i + 1}/{total}: '{log_label}'")
+            fill_result = _fill_section(raw_section_text, raw_heading)
+            out_heading = fill_result.heading or f"Section {i}"
+            if fill_result.fill_failed:
+                failed_count += 1
+                kept_count += 1
+                kept_sections.append({
+                    "heading": out_heading,
+                    "body": fill_result.body,
+                    "fill_failed": fill_result.fill_failed,
+                })
+            elif fill_result.keep:
+                kept_count += 1
+                kept_sections.append({
+                    "heading": out_heading,
+                    "body": fill_result.body,
+                    "fill_failed": fill_result.fill_failed,
+                })
+            else:
+                dropped_count += 1
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+    # WR-01 body-less-fill floor (Plan 11)
+    if total > 0 and not kept_sections:
+        print(
+            f"[ingest warning: all {total} sections judged non-substantive — "
+            f"retaining unfiltered (body-less floor)]",
+            file=sys.stderr,
+        )
+        kept_sections = []
+        for i, section in enumerate(skeleton["extraction"]["sections"]):
+            raw_parts = []
+            for blk in section.get("blocks", []):
+                if blk.get("type") == "text":
+                    raw_parts.append(blk.get("display") or blk.get("plain") or "")
+            raw_section_text = "\n".join(raw_parts)
+            kept_sections.append({
+                "heading": section.get("heading") or f"Section {i}",
+                "body": raw_section_text,
+                "fill_failed": True,
+            })
+        kept_count = len(kept_sections)
+        dropped_count = 0
+
+    skeleton["extraction"]["sections"] = kept_sections
+    _log(f"section filter: kept {kept_count}, dropped {dropped_count}")
+
+    # Step 10c: Ref batch fill (~10 per batch, D-02)
+    try:
+        refs, ref_failures = _fill_references_batched(parsed.get("references", []))
+    except RuntimeError as e:
+        print(f"[ingest error: {e}]", file=sys.stderr)
+        sys.exit(1)
+    skeleton["extraction"]["references"] = refs
+    failed_count += ref_failures
+
+    # Step 11: Renditions — body IS the cleaned text from LLM fill (D-10)
+    _log("renditions")
+
+    # Step 11b: PaperJSON cache write (D-06 — surviving, gitignored)
+    _log("cache write")
+    cache_path = _write_paperjson_cache(skeleton, cache_stem)
+
+    # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
+    if registry_path:
+        _log("registry write")
+        entry = _registry_entry(skeleton, source_path, cache_path, project_name)
+        try:
+            _write_registry(entry, registry_path, registry_key)
+        except Exception as e:
+            print(f"[ingest warning: registry write failed: {e}]", file=sys.stderr)
+
+    # Step 12b: Auto-invoke note generation (D-05/D-07 — best-effort)
+    try:
+        from scripts import note as note
+        note_result = note.generate_note(skeleton, config)
+        if isinstance(note_result, str) and (
+            note_result.startswith("[note error:") or note_result.startswith("[note warning:")
+        ):
+            _log(f"note generation failed: {note_result}")
+    except Exception as e:
+        print(f"[ingest warning: note generation failed: {e}]", file=sys.stderr)
+
+    # Step 13: Warn on partial fill, return skeleton
+    if failed_count > 0:
+        print(f"[ingest warning: {failed_count} sections/batches unfilled]", file=sys.stderr)
+
+    return skeleton
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1946,234 +2178,25 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: boo
         print(gate_error, file=sys.stderr)
         sys.exit(1)
 
-    # Step 5: Warm up Ollama to pin gemma4:e4b in VRAM for the full run (D-00d / Pattern 4)
-    _log(f"warming up {OLLAMA_MODEL}")
-    _warmup_ollama()
-
-    # Step 6: DOI probe — LLM call on FULL document text; title hint is at the start of the document.
-    # full_text feeds the DOI probe (may include Supporting Information DOI on later pages);
-    # first_page_text feeds _fill_metadata (cover-page metadata is more reliable for title/authors).
-    _log("doi probe")
+    # Steps 5–13: Shared fill cascade (PDF path — delegates to shared helper).
+    # Compute full_text and first_page_text from blocks here; the cascade helper
+    # accepts them as parameters so the web path can pass md_text instead.
     full_text = _extract_full_text(blocks)
     first_page_text = _extract_first_page_and_footers(blocks)
-    try:
-        probe = _doi_probe(full_text)
-    except RuntimeError as e:
-        print(f"[ingest error: {e}]", file=sys.stderr)
-        sys.exit(1)
 
-    doi = probe.doi if probe else None
-    arxiv_id = probe.arxiv_id if probe else None
-    title_hint = probe.title if probe else None
-
-    # Step 7: Syntactic DOI validation — never use a malformed DOI as registry key (D-00c)
-    if doi and not _syntactic_doi_valid(doi):
-        doi = None  # fall back to arXiv ID or title-hash key chain
-
-    # Step 8: Crossref validation hook (Plan 03)
-    if config.get("crossref_validate", False) and doi:
-        _crossref_validate(doi, title_hint, config)
-
-    # Step 9: Registry check — HARD GATE (D-00b / REG-02)
-    # No fill helpers run if the paper is already in the registry.
-    # BYPASSED when refill=True — the whole point of --refill is to re-run the fill
-    # even on a cache hit (Plan 11, INGEST-01).
-    registry_key = _registry_key({"doi": doi, "arxiv_id": arxiv_id, "title": title_hint})
-    cached = _check_registry(registry_key, registry_path)
-    if cached is not None and not force_extract and not refill:
-        # Cache-hit append: add current project to cached entry if absent (CR-01, REG-02).
-        # Persists via _write_registry (which union-merges) under the lock.
-        if project_name and project_name not in cached.get("projects", []):
-            cached.setdefault("projects", []).append(project_name)
-            if registry_path:
-                try:
-                    _write_registry(cached, registry_path, registry_key)
-                except Exception as e:
-                    _log(f"registry cache-hit update failed: {e}")
-        # GAP-CLOSURE (02-04): note-aware registry hit. If a surviving PaperJSON cache
-        # exists for this already-ingested paper, generate the note from it best-effort.
-        # generate_note self-skips when the note already exists (force=False, D-16), so this
-        # is idempotent and runs zero LLM fill calls. A note failure never fails the ingest.
-        pj_path = cached.get("paperjson_path") or ""
-        if pj_path and pathlib.Path(pj_path).exists():
-            try:
-                from scripts import note as note
-                with open(pj_path, "r", encoding="utf-8") as _pjf:
-                    _cached_paperjson = json.load(_pjf)
-                _note_result = note.generate_note(_cached_paperjson, config)
-                if isinstance(_note_result, str) and _note_result.startswith("[note error:"):
-                    _log(f"registry-hit note generation failed: {_note_result}")
-            except Exception as e:
-                print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
-        return cached  # cache hit: return immediately, zero fill calls
-
-    # Steps 10–12 (miss path): fill → renditions → registry write
-    failed_count = 0
-
-    # Step 10a: Metadata fill (one call post-miss)
-    _log("metadata fill")
-    try:
-        metadata = _fill_metadata(first_page_text, probe)
-    except RuntimeError as e:
-        print(f"[ingest error: {e}]", file=sys.stderr)
-        sys.exit(1)
-
-    # Step 10a+: Crossref journal_full enrichment (Plan 08 GAP B).
-    # Fires when crossref_validate is on (same flag as the same-paper guard above) AND
-    # a syntactically-valid DOI exists AND journal_full was not extracted from the PDF.
-    # Sets journal_full verbatim from Crossref container-title[0] — extract-never-infer preserved.
-    # journal (abbreviation) is left exactly as extracted; only journal_full is enriched.
-    # The same flag governs _crossref_validate (same-paper guard, Step 8) and this enrichment.
-    if config.get("crossref_validate", False) and doi and metadata.journal_full is None:
-        full = _crossref_journal_full(doi, config)
-        if full is not None:
-            metadata.journal_full = full  # set before model_dump() so it reaches the output
-
-    # Step 10a++: Crossref published-year enrichment (Plan 10 Item 1b, INGEST-01).
-    # Fires when crossref_validate is on AND a syntactically-valid DOI exists AND
-    # metadata.year was not extracted from the PDF (left null by the fill).
-    # Sets year verbatim from Crossref date-parts — extract-never-infer preserved.
-    # An already-extracted year is NEVER overwritten.
-    if config.get("crossref_validate", False) and doi and metadata.year is None:
-        crossref_year = _crossref_published_year(doi, config)
-        if crossref_year is not None:
-            metadata.year = crossref_year  # set before model_dump() so it reaches the output
-
-    # Step 10a+++: journal-abbreviation fallback (Plan 09 GAP C).
-    # The printed abbreviation is preferred; when absent (None/empty), fall back to the full name
-    # so `journal` holds a real abbreviation or the full name, never a DOI-prefix fragment like
-    # "Trechm" (produced when the model mined "10.1016/j.trechm…"). This copies an already-
-    # extracted/enriched field — extract-never-infer preserved; no inference, no regex.
-    if not metadata.journal and metadata.journal_full:
-        metadata.journal = metadata.journal_full  # copy verbatim; journal_full left unchanged
-
-    skeleton["extraction"]["metadata"] = metadata.model_dump()
-
-    # Step 10b: Per-section fill (one call per section, two-strike, D-01)
-    # The same per-section call also judges substantive-vs-non-substantive content (Plan 08 GAP A).
-    # keep=False (successful fill, explicit verdict) → section is dropped.
-    # keep=True OR fill_failed=True → section is retained (conservative default: false-negatives
-    # are recoverable; false-positives silently lose paper content and are not — Plan 08).
-    total = len(skeleton["extraction"]["sections"])
-    kept_sections: list[dict] = []
-    kept_count = 0
-    dropped_count = 0
-    try:
-        for i, section in enumerate(skeleton["extraction"]["sections"]):
-            # Derive raw section text from existing block display/plain content
-            raw_parts = []
-            for blk in section.get("blocks", []):
-                if blk.get("type") == "text":
-                    raw_parts.append(blk.get("display") or blk.get("plain") or "")
-            raw_section_text = "\n".join(raw_parts)
-            # GAP E fix: pass the RAW heading (possibly empty) to _fill_section so the relabel can fire.
-            # 'Section {i}' is a log label + last-resort fallback only — never pre-assigned to the model.
-            log_label = section.get("heading") or f"Section {i}"   # non-blank label for _log
-            raw_heading = section.get("heading") or ""              # raw (possibly empty) for _fill_section
-            _log(f"section fill {i + 1}/{total}: '{log_label}'")
-            fill_result = _fill_section(raw_section_text, raw_heading)
-            # Last-resort fallback: if model returned an empty heading, use 'Section {i}' so we
-            # never emit a blank heading in the output.
-            out_heading = fill_result.heading or f"Section {i}"
-            if fill_result.fill_failed:
-                # fill_failed means no verdict — always retain (conservative: keep=True default)
-                failed_count += 1
-                kept_count += 1
-                kept_sections.append({
-                    "heading": out_heading,
-                    "body": fill_result.body,
-                    "fill_failed": fill_result.fill_failed,
-                    # keep is intentionally NOT persisted; output stays {heading, body, fill_failed}
-                })
-            elif fill_result.keep:
-                # Successful fill with keep=True verdict (or default True) → retain
-                kept_count += 1
-                kept_sections.append({
-                    "heading": out_heading,  # use possibly-relabeled heading (e.g. "Abstract")
-                    "body": fill_result.body,
-                    "fill_failed": fill_result.fill_failed,
-                    # keep is intentionally NOT persisted; output stays {heading, body, fill_failed}
-                })
-            else:
-                # Successful fill with explicit keep=False verdict → drop (non-substantive)
-                dropped_count += 1
-    except RuntimeError as e:
-        print(f"[ingest error: {e}]", file=sys.stderr)
-        sys.exit(1)
-    # WR-01 body-less-fill floor (Plan 11): if EVERY section was judged non-substantive
-    # (keep=False on all, total > 0), the fill produced no body. Rather than silently
-    # writing a body-less registry entry and exiting 0, retain all sections unfiltered
-    # with a warning. This fail-open approach preserves paper content for later re-review
-    # (better than losing data silently). Choice documented: retain-unfiltered + warn.
-    if total > 0 and not kept_sections:
-        print(
-            f"[ingest warning: all {total} sections judged non-substantive — "
-            f"retaining unfiltered (body-less floor)]",
-            file=sys.stderr,
-        )
-        # Re-run the section loop but retain everything unconditionally
-        kept_sections = []
-        for i, section in enumerate(skeleton["extraction"]["sections"]):
-            raw_parts = []
-            for blk in section.get("blocks", []):
-                if blk.get("type") == "text":
-                    raw_parts.append(blk.get("display") or blk.get("plain") or "")
-            raw_section_text = "\n".join(raw_parts)
-            kept_sections.append({
-                "heading": section.get("heading") or f"Section {i}",
-                "body": raw_section_text,
-                "fill_failed": True,  # mark as unvetted so downstream knows
-            })
-        kept_count = len(kept_sections)
-        dropped_count = 0
-
-    skeleton["extraction"]["sections"] = kept_sections
-    _log(f"section filter: kept {kept_count}, dropped {dropped_count}")
-
-    # Step 10c: Ref batch fill (~10 per batch, D-02)
-    try:
-        refs, ref_failures = _fill_references_batched(parsed.get("references", []))
-    except RuntimeError as e:
-        print(f"[ingest error: {e}]", file=sys.stderr)
-        sys.exit(1)
-    skeleton["extraction"]["references"] = refs
-    failed_count += ref_failures
-
-    # Step 11: Renditions — run on LLM-cleaned body text (D-10)
-    # _build_display / _build_plain already applied during block routing;
-    # the section body from LLM fill replaces the concatenated block text.
-    # No additional rendition pass is required here — the body IS the cleaned text.
-    _log("renditions")
-
-    # Step 11b: PaperJSON cache write (D-06 — surviving, gitignored)
-    _log("cache write")
-    cache_path = _write_paperjson_cache(skeleton, pathlib.Path(pdf).stem)
-
-    # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
-    if registry_path:
-        _log("registry write")
-        entry = _registry_entry(skeleton, str(pdf), cache_path, project_name)
-        try:
-            _write_registry(entry, registry_path, registry_key)
-        except Exception as e:
-            print(f"[ingest warning: registry write failed: {e}]", file=sys.stderr)
-
-    # Step 12b: Auto-invoke note generation (D-05/D-07 — best-effort)
-    try:
-        from scripts import note as note
-        note_result = note.generate_note(skeleton, config)
-        if isinstance(note_result, str) and (
-            note_result.startswith("[note error:") or note_result.startswith("[note warning:")
-        ):
-            _log(f"note generation failed: {note_result}")
-    except Exception as e:
-        print(f"[ingest warning: note generation failed: {e}]", file=sys.stderr)
-
-    # Step 13: Warn on partial fill, return skeleton
-    if failed_count > 0:
-        print(f"[ingest warning: {failed_count} sections/batches unfilled]", file=sys.stderr)
-
-    return skeleton
+    return _run_fill_cascade(
+        skeleton,
+        parsed,
+        config,
+        full_text=full_text,
+        first_page_text=first_page_text,
+        source_path=str(pdf),
+        cache_stem=pathlib.Path(pdf).stem,
+        registry_path=registry_path,
+        project_name=project_name,
+        force_extract=force_extract,
+        refill=refill,
+    )
 
 
 # ---------------------------------------------------------------------------
