@@ -46,6 +46,9 @@ NOISE_BLOCK_TYPES = {"footer", "page_number", "aside_text", "header"}
 OLLAMA_BASE = "http://localhost:11434"
 OLLAMA_MODEL = "gemma4:e4b"
 DOI_RE = re.compile(r"10\.\d{4,}/\S+")
+_ARXIV_URL_RE = re.compile(
+    r"https?://(?:www\.)?arxiv\.org/(?:abs|pdf|html)/(.+?)(?:\?.*)?$"
+)
 
 # ---------------------------------------------------------------------------
 # num_ctx ladder + cap (Phase 1.3 Plan 05 — RTX 4060 benchmark 2026-06-12)
@@ -353,6 +356,68 @@ def _resolve_mineru(config: dict) -> str | None:
     if configured and pathlib.Path(configured).exists():
         return configured
     return shutil.which("mineru")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — web ingestion helpers: URL rewrite / PubMed resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_defuddle(config: dict) -> str | None:
+    """
+    Resolve the defuddle executable path.
+
+    Returns config['defuddle_path'] if truthy and the file exists, else falls back
+    to shutil.which('defuddle'). Returns None if neither resolves.
+    """
+    configured = config.get("defuddle_path")
+    if configured and pathlib.Path(configured).exists():
+        return configured
+    return shutil.which("defuddle")
+
+
+def _resolve_pubmed_to_pmc(pmid: str, config: dict) -> str | None:
+    """
+    Query the NCBI E-utilities elink endpoint to resolve a PubMed ID to a PMC URL.
+
+    Sends only the integer PMID to the fixed NCBI host. Fails open on any
+    network or parse error (D-05 / T-03-05).
+    """
+    try:
+        endpoint = (
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
+            f"?dbfrom=pubmed&db=pmc&id={pmid}&retmode=json"
+        )
+        with urllib.request.urlopen(endpoint, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        pmc_id = data["linksets"][0]["linksetdbs"][0]["links"][0]
+        return f"https://pmc.ncbi.nlm.nih.gov/articles/PMC{pmc_id}/"
+    except Exception:
+        return None
+
+
+def _rewrite_url(url: str, config: dict) -> str:
+    """
+    Rewrite a user-supplied URL to the preferred full-text form (D-04/D-05).
+
+    - arXiv /abs/<id> or /pdf/<id> → /html/<id>  (full-text HTML, defuddle-friendly)
+    - PubMed URL → look up PMC via NCBI elink; return PMC URL or original on failure
+    - All other URLs → returned unchanged (journal URLs defuddled as-given)
+
+    Pure string matching; no try/except (rewriting cannot fail; network calls are
+    encapsulated in _resolve_pubmed_to_pmc which fails open).
+    """
+    m = _ARXIV_URL_RE.match(url)
+    if m:
+        arxiv_id = m.group(1)
+        return f"https://arxiv.org/html/{arxiv_id}"
+    pubmed_m = re.match(r"https?://pubmed\.ncbi\.nlm\.nih\.gov/(\d+)", url)
+    if pubmed_m:
+        pmid = pubmed_m.group(1)
+        pmc_url = _resolve_pubmed_to_pmc(pmid, config)
+        if pmc_url:
+            return pmc_url
+        return url
+    return url
 
 
 def _normalize_text(text: str) -> str:
@@ -1114,6 +1179,36 @@ def _run_mineru(
         raise RuntimeError(f"MinerU exited with code {result.returncode}: {stderr}")
 
 
+def _run_defuddle(url: str, defuddle_exe: str, timeout: int = 60) -> str:
+    """
+    Run defuddle on a URL and return the extracted markdown text (D-08 / T-03-02).
+
+    Invokes defuddle as an argv list (never shell=True) so the URL is passed as a
+    single literal token without shell-metacharacter expansion.
+
+    Raises RuntimeError on non-zero exit (content gated or unreachable) or on empty
+    stdout (D-08 Pitfall 2: defuddle exits 0 but produced nothing).
+    Lets subprocess.TimeoutExpired propagate to the caller for clean error handling.
+    """
+    result = subprocess.run(
+        [defuddle_exe, "parse", url, "--md"],
+        timeout=timeout,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() if result.stderr else "(no stderr)"
+        raise RuntimeError(
+            f"web extraction failed — content gated or unreachable: {url} "
+            f"(defuddle exit {result.returncode}: {stderr})"
+        )
+    md = result.stdout
+    if not md.strip():
+        raise RuntimeError(f"web extraction failed — empty output: {url}")
+    return md
+
+
 def _find_content_list_path(out_dir: str) -> str | None:
     """
     Locate the *_content_list.json produced by MinerU under out_dir.
@@ -1319,6 +1414,100 @@ def _parse_content_list(blocks: list) -> dict:
         "title": title,
         "sections": sections,
         "references": references,
+        "metadata": metadata,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — defuddle markdown parser
+# ---------------------------------------------------------------------------
+
+def _parse_defuddle_markdown(md_text: str) -> dict:
+    """
+    Parse defuddle-produced markdown into the same section/block/metadata shape
+    as _parse_content_list (D-02 / byte-compatible so _assemble_paperjson consumes
+    it unchanged).
+
+    Line-by-line rules:
+    - First `# ` line → title (H1 text, without the `# ` prefix).
+    - `## ` line     → flush current section, start a level-2 section.
+    - `### ` line    → flush current section, start a level-3 section.
+    - Blank line     → flush the current paragraph into a text block.
+    - Other lines    → accumulate into the current paragraph.
+
+    Text blocks: {type:"text", display:_build_display(text), plain:_build_plain(text)}.
+    Citation markers [^N] and inline $…$ survive in `display`; _build_plain strips `$…$`.
+
+    Fallback: if no ## / ### headings were produced but text exists, a single fallback
+    section {heading:"", level:0} is emitted (same as the default section).
+
+    References stay empty (Phase 4). The `## References` block is left as ordinary
+    text blocks.
+    """
+    lines = md_text.split("\n")
+    title = None
+    sections: list[dict] = []
+    current_section: dict = {"heading": "", "level": 0, "blocks": []}
+    current_para_lines: list[str] = []
+
+    def _flush_paragraph() -> None:
+        if current_para_lines:
+            text = "\n".join(current_para_lines).strip()
+            if text:
+                current_section["blocks"].append({
+                    "type": "text",
+                    "display": _build_display(text),
+                    "plain": _build_plain(text),
+                })
+            current_para_lines.clear()
+
+    for line in lines:
+        if line.startswith("# ") and title is None:
+            # H1 — first only; flush any accumulated para then extract title
+            _flush_paragraph()
+            title = _build_plain(line[2:].strip())
+        elif line.startswith("## ") or line.startswith("### "):
+            # Section boundary — flush para, flush section, start new section
+            _flush_paragraph()
+            if current_section["blocks"]:
+                sections.append(current_section)
+            if line.startswith("## "):
+                heading_text = line[3:].strip()
+                level = 2
+            else:
+                heading_text = line[4:].strip()
+                level = 3
+            current_section = {
+                "heading": _build_plain(heading_text),
+                "level": level,
+                "blocks": [],
+            }
+        elif not line.strip():
+            # Blank line — flush current paragraph
+            _flush_paragraph()
+        else:
+            # Non-blank, non-heading — accumulate into current paragraph
+            current_para_lines.append(line)
+
+    # Flush final paragraph and section
+    _flush_paragraph()
+    if current_section["blocks"]:
+        sections.append(current_section)
+
+    metadata = {
+        "title": title,
+        "authors": None,
+        "year": None,
+        "journal": None,
+        "doi": None,
+        "arxiv_id": None,
+        "accession_codes": [],
+    }
+
+    return {
+        "title": title,
+        "sections": sections,
+        "references": [],
         "metadata": metadata,
     }
 
@@ -1587,6 +1776,47 @@ def _registry_entry(
         "paperjson_path": paperjson_path,
         "summary": None,
         "key_findings": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — web cache stem + web provenance
+# ---------------------------------------------------------------------------
+
+def _web_cache_stem(url: str) -> str:
+    """
+    Derive a cache-file stem for a web-ingested paper (D-03).
+
+    Priority: arXiv ID from URL (human-readable, stable) → SHA-256 of normalized
+    URL (generic fallback). The stem is passed to _write_paperjson_cache as `stem`
+    and must not contain path separators or a .json suffix.
+    """
+    m = re.search(r"arxiv\.org/(?:abs|html|pdf)/(\d{4}\.\d{4,5}(?:v\d+)?)", url)
+    if m:
+        return f"arxiv-{m.group(1)}"
+    m = re.search(r"ar5iv\.labs\.arxiv\.org/html/(\d{4}\.\d{4,5}(?:v\d+)?)", url)
+    if m:
+        return f"arxiv-{m.group(1)}"
+    normalized = url.lower().rstrip("/")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"url-{digest[:16]}"
+
+
+def _web_provenance(url: str, fetched_url: str, md_text: str) -> dict:
+    """
+    Build the provenance dict for a web-ingested paper (analog of the PDF provenance dict).
+
+    Omits pdf_sha256 / source_filename / mineru_version — nothing downstream reads
+    those provenance keys at runtime (verified in 03-RESEARCH.md).
+    """
+    return {
+        "source_url": url,
+        "fetched_url": fetched_url,
+        "content_sha256": hashlib.sha256(md_text.encode("utf-8")).hexdigest(),
+        "backend": "defuddle",
+        "extracted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "normalizations_applied": ["llm_fill"],
+        "schema_version": SCHEMA_VERSION,
     }
 
 
