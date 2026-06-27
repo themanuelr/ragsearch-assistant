@@ -223,3 +223,30 @@ def test_registry_key_convergence():
     assert doi_key == "10.1038/nature12373", (
         f"Expected DOI key '10.1038/nature12373', got {doi_key!r}"
     )
+
+
+def test_ingest_url_thin_exits(monkeypatch, thin_md, capsys):
+    """D-09 gate: ingest_url raises SystemExit on thin content with no LLM call.
+
+    Uses a non-arXiv URL so the ar5iv retry (D-04) does not trigger — the path
+    is deterministic and requires no live defuddle binary or Ollama server.
+    Monkeypatches _resolve_defuddle and _run_defuddle only.
+    """
+    monkeypatch.setattr(ing, "_resolve_defuddle", lambda config: "defuddle")
+    monkeypatch.setattr(ing, "_run_defuddle", lambda url, exe, timeout=60: thin_md)
+
+    with pytest.raises(SystemExit):
+        ing.ingest_url(
+            "https://www.nature.com/articles/paywalled",
+            {
+                "web_min_body_chars": 2000,
+                "registry_path": "",
+                "project_name": "t",
+                "defuddle_timeout": 60,
+            },
+        )
+
+    captured = capsys.readouterr()
+    assert "web content too short" in captured.err, (
+        f"Expected 'web content too short' in stderr, got: {captured.err!r}"
+    )
