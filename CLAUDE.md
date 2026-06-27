@@ -40,7 +40,7 @@ A local-first, AI-powered research management system that ingests scientific pap
 - Ollama SDK - HTTP client for local Gemma 4 e4b model
 - ddgs (via `ddgs>=0.1.0`) - DuckDuckGo Search client for web research without API keys
 - obsidian-cli - CLI tool for vault I/O (installed as skill, invoked via subprocess)
-- defuddle - Web paper extraction tool (installed as skill, invoked via subprocess)
+- defuddle - Web paper extraction tool; the npm package `defuddle` (install globally: `npm install -g defuddle`), invoked via subprocess as `defuddle parse <url> --md`
 - ChromaDB - Local embedded vector database for semantic search
 - pdfplumber - PDF text extraction and metadata parsing
 - pypdf - PDF manipulation and analysis
@@ -80,7 +80,7 @@ A local-first, AI-powered research management system that ingests scientific pap
 
 - Phase 1: `pdfplumber`, `pypdf` for PDF extraction
 - Phase 5: ChromaDB for vector embeddings
-- Phase 3: defuddle (already installed as skill, imported via subprocess)
+- Phase 3: defuddle (npm package, installed globally via `npm install -g defuddle`; invoked via subprocess)
 
 <!-- GSD:stack-end -->
 
