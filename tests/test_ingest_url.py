@@ -31,6 +31,7 @@ from scripts.ingest import (
 
 FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "sample_defuddle.md"
 THIN_FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "sample_defuddle_thin.md"
+FRONTMATTER_FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "sample_defuddle_frontmatter.md"
 
 
 @pytest.fixture(scope="module")
@@ -325,4 +326,60 @@ def test_ingest_url_thin_exits(monkeypatch, thin_md, capsys):
     captured = capsys.readouterr()
     assert "web content too short" in captured.err, (
         f"Expected 'web content too short' in stderr, got: {captured.err!r}"
+    )
+
+
+def test_parse_defuddle_frontmatter_title():
+    """Frontmatter-only title (no '# ' H1) is captured by _parse_defuddle_markdown.
+
+    Verifies: title comes from the YAML frontmatter block; metadata["title"] matches;
+    at least one section with heading "Abstract" exists; frontmatter keys do NOT leak
+    into any parsed block's display or plain text.
+    """
+    text = FRONTMATTER_FIXTURE_PATH.read_text(encoding="utf-8")
+    result = ing._parse_defuddle_markdown(text)
+
+    assert result["title"] == "Sparse Attention Mechanisms for Long-Document Retrieval", (
+        f"Expected frontmatter title, got {result['title']!r}"
+    )
+    assert result["metadata"]["title"] == result["title"], (
+        "metadata['title'] must equal top-level title"
+    )
+
+    assert result["sections"], "Expected at least one section"
+    headings = [s["heading"] for s in result["sections"]]
+    assert "Abstract" in headings, (
+        f"Expected a section with heading 'Abstract', found headings: {headings}"
+    )
+
+    # Frontmatter keys must not bleed into block text
+    blob = " ".join(
+        block.get("display", "") + " " + block.get("plain", "")
+        for section in result["sections"]
+        for block in section.get("blocks", [])
+    )
+    assert "word_count" not in blob, "Frontmatter key 'word_count' leaked into block text"
+    assert "language:" not in blob, "Frontmatter key 'language:' leaked into block text"
+    assert "https://arxiv.org/html/2406.01234" not in blob, (
+        "Frontmatter source URL leaked into block text"
+    )
+
+
+def test_quality_gate_web_message():
+    """_quality_gate(source='web') returns a web-appropriate message (no PDF wording).
+
+    The PDF branch (default source) still includes 'possible scanned/garbage PDF'.
+    """
+    skeleton = {"extraction": {"metadata": {"title": None}, "sections": []}}
+
+    web_msg = ing._quality_gate(skeleton, source="web")
+    assert web_msg is not None, "_quality_gate must return a message for no-title skeleton"
+    assert "possible scanned/garbage PDF" not in web_msg, (
+        f"Web-path gate message must not mention PDF: {web_msg!r}"
+    )
+
+    pdf_msg = ing._quality_gate(skeleton)
+    assert pdf_msg is not None, "_quality_gate must return a message for no-title skeleton (PDF)"
+    assert "possible scanned/garbage PDF" in pdf_msg, (
+        f"PDF-path gate message must mention 'possible scanned/garbage PDF': {pdf_msg!r}"
     )
