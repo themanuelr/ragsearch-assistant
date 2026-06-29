@@ -1,0 +1,63 @@
+{
+  "extraction": {
+    "metadata": {
+      "title": "Test Citing Paper",
+      "authors": null,
+      "year": null,
+      "journal": null,
+      "doi": "10.9999/citing",
+      "arxiv_id": null,
+      "accession_codes": []
+    },
+    "sections": [],
+    "references": [
+      {
+        "number": 1,
+        "raw": "Vaswani, A., Shazeer, N., Parmar, N., et al. (2017). Attention is all you need. Advances in Neural Information Processing Systems, 30.",
+        "doi": "10.1234/attn",
+        "title": "Attention Is All You Need",
+        "year": 2017,
+        "fill_failed": false
+      },
+      {
+        "number": 2,
+        "raw": "LeCun, Y., Bengio, Y., & Hinton, G. (2015). Deep learning. Nature, 521(7553), 436-444.",
+        "doi": null,
+        "title": "Deep Learning",
+        "year": 2015,
+        "fill_failed": false
+      },
+      {
+        "number": 3,
+        "raw": "",
+        "doi": null,
+        "title": null,
+        "year": null,
+        "fill_failed": true
+      }
+    ]
+  },
+  "analysis": {
+    "generated_by": null,
+    "summary": null,
+    "claims": [],
+    "methods_overview": null,
+    "results": null,
+    "limitations": [],
+    "open_questions": [],
+    "entities": [],
+    "topics": [],
+    "connections": {
+      "builds_on": [],
+      "contradicts": [],
+      "same_domain": []
+    }
+  },
+  "provenance": {
+    "pdf_sha256": "abc123def456",
+    "source_filename": "test_citing_paper.pdf",
+    "backend": "hybrid_auto",
+    "schema_version": 2,
+    "normalizations_applied": []
+  }
+}
