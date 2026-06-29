@@ -313,6 +313,27 @@ def run_biblio(paperjson: dict, config: dict) -> str:
 
         refs_markdown = _process_refs(refs, citing_path, config)
         _inject_references_section(citing_path, refs_markdown, config)
+
+        # Stub upgrade detection (D-07/SC3): if the paper being ingested matches
+        # an existing stub, promote it — merge cited_by into full note frontmatter,
+        # rewrite backlinks, and delete the stub. Inner try/except so any upgrade
+        # failure is swallowed and citing_path is still returned (D-09).
+        try:
+            metadata = paperjson.get("extraction", {}).get("metadata", {})
+            self_key = _registry_key(metadata)
+            stub_path = _find_stub_by_key(self_key, config)
+            if stub_path:
+                vault_root = _vault_root(config)
+                full_note_abs = vault_root / citing_path
+                if full_note_abs.exists():
+                    stub_abs = vault_root / stub_path
+                    stub_content = stub_abs.read_text(encoding="utf-8")
+                    cited_by = _parse_cited_by(stub_content)
+                    _merge_cited_by_into_note(citing_path, cited_by, config)
+                    _upgrade_stub(stub_path, citing_path, config)
+        except Exception as _upgrade_err:
+            _log(f"stub upgrade failed (non-fatal): {_upgrade_err}")
+
         return citing_path
     except Exception as e:
         return f"[biblio warning: {e}]"
@@ -388,6 +409,146 @@ def _resolve_citing_path(
         except OSError:
             continue
     return None
+
+
+def _merge_cited_by_into_note(full_note_path: str, cited_by: list, config: dict) -> None:
+    """Merge cited_by paths into the full note's YAML frontmatter (SC3).
+
+    If the frontmatter has no cited_by block, inserts one immediately before
+    the closing --- of the frontmatter. If a block exists, union-merges (skips
+    paths already present). Writes atomically via create_note(overwrite=True).
+
+    Args:
+        full_note_path: vault-relative path to the full note (Papers/<file>.md).
+        cited_by:       List of vault-relative citing-note paths from the stub.
+        config:         Config dict with vault_path.
+    """
+    if not cited_by:
+        return
+
+    vault_root = _vault_root(config)
+    abs_path = vault_root / full_note_path
+    content = abs_path.read_text(encoding="utf-8")
+
+    # Determine which paths are already listed in the note's cited_by block
+    existing = set(_parse_cited_by(content))
+    new_paths = [p for p in cited_by if p not in existing]
+    if not new_paths:
+        return
+
+    new_entry_lines = [f'  - "{p}"' for p in new_paths]
+
+    lines = content.split("\n")
+    fm_count = 0
+    cited_by_line = -1    # index of "cited_by:" in frontmatter
+    last_entry_line = -1  # index of last "  - ..." under cited_by
+    closing_fm_line = -1  # index of closing "---"
+    in_cited_by = False
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "---":
+            fm_count += 1
+            if fm_count == 2:
+                closing_fm_line = i
+                break
+            continue
+        if fm_count == 0:
+            continue
+        if stripped == "cited_by:":
+            cited_by_line = i
+            in_cited_by = True
+            continue
+        if in_cited_by:
+            if line.startswith("  - "):
+                last_entry_line = i
+            elif stripped and not line.startswith(" "):
+                in_cited_by = False
+
+    if cited_by_line >= 0:
+        # Union-merge: insert new entries after the last existing entry
+        insert_at = last_entry_line if last_entry_line >= 0 else cited_by_line
+        for entry in reversed(new_entry_lines):
+            lines.insert(insert_at + 1, entry)
+    elif closing_fm_line >= 0:
+        # No cited_by block yet — insert block before the closing ---
+        insert_block = ["cited_by:"] + new_entry_lines
+        for entry in reversed(insert_block):
+            lines.insert(closing_fm_line, entry)
+    else:
+        # No recognisable frontmatter — append to end of file
+        lines += ["cited_by:"] + new_entry_lines
+
+    create_note(full_note_path, "\n".join(lines), config, overwrite=True)
+
+
+def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
+    """Rewrite cited_by backlinks and delete the stub file (D-07/SC3).
+
+    Bounded to the stub's cited_by list — never an O(vault) scan (D-04/D-07).
+    Replacement is scoped to the ## References section of each citing note only
+    so occurrences outside ## References are untouched (Pitfall 7).
+    Stub deletion is wrapped so failure logs a warning and never re-raises (D-09/SC4).
+
+    Called from run_biblio after _merge_cited_by_into_note. The full note must
+    already exist; its frontmatter title drives the [[full_title]] wikilink.
+
+    Args:
+        stub_path:      Vault-relative path to the stub (Stubs/<file>.md).
+        full_note_path: Vault-relative path to the full note (Papers/<file>.md).
+        config:         Config dict with vault_path.
+    """
+    vault_root = _vault_root(config)
+    stub_abs = vault_root / stub_path
+    stub_content = stub_abs.read_text(encoding="utf-8")
+
+    cited_by = _parse_cited_by(stub_content)
+    stub_title_raw = _parse_frontmatter_field(stub_content, "title")
+    stub_title = _sanitize_filename(stub_title_raw) if stub_title_raw else stub_abs.stem
+
+    full_note_abs = vault_root / full_note_path
+    full_note_content = full_note_abs.read_text(encoding="utf-8")
+    full_title_raw = _parse_frontmatter_field(full_note_content, "title")
+    full_link_title = (
+        _sanitize_filename(full_title_raw) if full_title_raw else full_note_abs.stem
+    )
+
+    stub_link = f"[[{stub_title}]]"
+    full_link = f"[[{full_link_title}]]"
+
+    # Rewrite [[stub_title]] → [[full_title]] in each citing note (bounded to cited_by)
+    for citing_path in cited_by:
+        abs_citing = _resolve_citing_path(citing_path, vault_root)
+        if abs_citing is None:
+            continue
+        try:
+            citing_content = abs_citing.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if stub_link not in citing_content:
+            continue
+        # Scope replacement to ## References section only (Pitfall 7)
+        refs_match = re.search(
+            r"\n## References\n([\s\S]*?)(?=\n## |\Z)", citing_content
+        )
+        if refs_match:
+            refs_section = refs_match.group(0).replace(stub_link, full_link)
+            updated = (
+                citing_content[: refs_match.start()]
+                + refs_section
+                + citing_content[refs_match.end() :]
+            )
+        else:
+            # No \n## References marker — global replace as fallback
+            updated = citing_content.replace(stub_link, full_link)
+        vault_relative = abs_citing.relative_to(vault_root).as_posix()
+        create_note(vault_relative, updated, config, overwrite=True)
+
+    # Delete stub file (real filesystem unlink — never via create_note)
+    try:
+        stub_abs.unlink()
+    except OSError as e:
+        _log(f"[biblio warning: could not delete stub {stub_path}: {e}]")
 
 
 def upgrade_stub(stub_key: str, full_title: str, vault_path: str) -> None:
