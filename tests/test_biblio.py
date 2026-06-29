@@ -336,3 +336,46 @@ def test_biblio_failure_does_not_abort_ingest(tmp_vault, config):
         result = biblio.run_biblio(pj, config)
     assert result.startswith("[biblio warning:"), \
         f"Expected '[biblio warning:...]' but got: {result!r}"
+
+
+def test_upgrade_merges_cited_by_into_full_note(tmp_vault, config):
+    """BIBLIO-04f / SC3: after upgrade via run_biblio, full note frontmatter has cited_by."""
+    from scripts import biblio  # noqa: PLC0415
+
+    paper_title = "Deep Learning"
+    stub_key = _registry_key({"title": paper_title})
+    citing_note_rel = "Papers/Citing Paper.md"
+
+    # Pre-write the citing note that already references this paper as a stub
+    (tmp_vault / "Papers" / "Citing Paper.md").write_text(
+        "\n## References\n\n[[Deep Learning]]\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+
+    # Pre-write the stub with cited_by pointing at the citing note
+    stub_file = tmp_vault / "Stubs" / "Deep Learning.md"
+    stub_file.write_text(
+        f'---\ntitle: "Deep Learning"\nstatus: stub\nstub_key: "{stub_key}"\n'
+        f'cited_by:\n  - "{citing_note_rel}"\n---\n\n',
+        encoding="utf-8",
+    )
+
+    # Pre-write the full note (simulating step 12b — note.generate_note having run)
+    full_note_file = tmp_vault / "Papers" / "Deep Learning.md"
+    full_note_file.write_text(
+        '---\ntitle: "Deep Learning"\nauthor: "LeCun"\n---\n\n# Deep Learning\n\n## My Notes\n\n',
+        encoding="utf-8",
+    )
+
+    # Build a paperjson whose self_key matches the stub (no DOI → title-hash key)
+    pj = _make_paperjson_with_refs(refs=[])
+    pj["extraction"]["metadata"]["title"] = paper_title
+    pj["extraction"]["metadata"]["doi"] = None  # force title-hash key to match stub_key
+
+    result = biblio.run_biblio(pj, config)
+
+    assert not result.startswith("[biblio warning:"), f"run_biblio failed unexpectedly: {result}"
+    assert not stub_file.exists(), "Stub must be deleted after upgrade"
+    full_note_content = full_note_file.read_text(encoding="utf-8")
+    assert "cited_by:" in full_note_content, "Full note must have cited_by in frontmatter after upgrade"
+    assert citing_note_rel in full_note_content, "cited_by must include the citing note path"
