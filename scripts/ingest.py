@@ -2199,6 +2199,15 @@ def _run_fill_cascade(
     except Exception as e:
         print(f"[ingest warning: note generation failed: {e}]", file=sys.stderr)
 
+    # Step 12c: Bibliography linking (D-09 — non-fatal tail stage; Phase 4)
+    try:
+        from scripts import biblio as biblio_mod
+        biblio_result = biblio_mod.run_biblio(skeleton, config)
+        if isinstance(biblio_result, str) and biblio_result.startswith("[biblio warning:"):
+            _log(f"bibliography linking: {biblio_result}")
+    except Exception as e:
+        print(f"[biblio warning: bibliography linking failed: {e}]", file=sys.stderr)
+
     # Step 13: Warn on partial fill, return skeleton
     if failed_count > 0:
         print(f"[ingest warning: {failed_count} sections/batches unfilled]", file=sys.stderr)
