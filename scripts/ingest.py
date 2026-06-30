@@ -33,6 +33,7 @@ if _REPO_ROOT not in sys.path:
 import filelock
 import urllib.request
 import urllib.error
+import urllib.parse
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1171,131 @@ def _crossref_published_year(doi: str, config: dict) -> int | None:
     return None
 
 
+# Crossref title->DOI search constants (Plan 05)
+# ---------------------------------------------------------------------------
+# Minimum relevance score from api.crossref.org/works?query.bibliographic that
+# must be met (strictly >=) before a returned DOI is considered a candidate.
+# Crossref scores are unbounded floats; empirically, good matches land well
+# above 50. A threshold of 70 rejects weak/partial matches while accepting
+# strong bibliographic hits.
+_CROSSREF_TITLE_MATCH_MIN_SCORE: float = 70.0
+
+# Maximum result rows to request from the Crossref works-query endpoint.
+# Only the top item is used; a small cap keeps the response payload tiny and
+# the request latency low (T-04-05-03 DoS mitigation).
+_CROSSREF_TITLE_SEARCH_ROWS: int = 5
+
+
+def _crossref_title_to_doi(title: str, config: dict) -> str | None:
+    """Search Crossref by bibliographic title and return the top DOI if above threshold.
+
+    Outbound data: the reference title in the URL query string and the contact
+    email in the User-Agent header (T-04-05-01 — opt-in only; gated by
+    _crossref_contact_ok + crossref_validate flag).
+
+    Behavior:
+      - Returns None immediately when _crossref_contact_ok is False (no request sent).
+      - URL-encodes the title via urllib.parse.urlencode (T-04-05-04 injection defence).
+      - Requests at most _CROSSREF_TITLE_SEARCH_ROWS results; considers only the
+        highest-scoring item (items[0] from the already-sorted Crossref response).
+      - Returns the item's DOI when its score >= _CROSSREF_TITLE_MATCH_MIN_SCORE,
+        else returns None (T-04-05-02 false-match gate, first layer).
+      - Returns None on empty items list, sub-threshold score, or any
+        (URLError, TimeoutError, JSONDecodeError, KeyError, IndexError, TypeError)
+        — fail-open, one quiet stderr line (T-04-05-03 / mirrors _crossref_journal_full).
+
+    Args:
+        title:  Reference title string (LLM-filled; may contain any unicode).
+        config: Loaded config dict; reads crossref_contact_email for User-Agent.
+
+    Returns:
+        DOI string (e.g. "10.1073/pnas.x") or None.
+    """
+    # WR-03: skip when email is placeholder/empty (no bogus mailto sent)
+    if not _crossref_contact_ok(config):
+        return None
+
+    contact = config.get("crossref_contact_email", "unknown@example.com")
+    params = urllib.parse.urlencode({
+        "query.bibliographic": title,
+        "rows": _CROSSREF_TITLE_SEARCH_ROWS,
+    })
+    url = f"https://api.crossref.org/works?{params}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header(
+        "User-Agent",
+        f"ragsearch-assistant/1.3 (mailto:{contact})",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        _log("crossref title->doi lookup unavailable")
+        return None  # fail-open — one quiet log line; ingest proceeds
+
+    # Extract top item (Crossref returns items ranked by relevance score)
+    try:
+        items = data["message"]["items"]
+        if not items:
+            return None
+        top = items[0]
+        score = float(top["score"])
+        doi = top["DOI"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+    if score < _CROSSREF_TITLE_MATCH_MIN_SCORE:
+        return None
+
+    return doi
+
+
+def _enrich_references_with_crossref(skeleton: dict, config: dict) -> None:
+    """Assign DOIs to doiless references via opt-in Crossref title search (Plan 05 Layer 3).
+
+    Runs in-place on skeleton["extraction"]["references"]. For each reference
+    that has a truthy title and a falsy doi:
+      1. Calls _crossref_title_to_doi to get a candidate DOI (score-gated).
+      2. If a DOI is returned, calls the existing _crossref_validate LLM
+         same-paper confirmation:
+           - Returns normally -> assigns ref["doi"] = doi.
+           - Raises RuntimeError (confirmed mismatch, D-15) -> leaves doi unset,
+             logs, continues (fail-open per ref).
+    Each reference's enrichment is wrapped in its own try/except so one failure
+    never aborts the cascade (T-04-05-03).
+
+    Gate: returns immediately (no network, no mutation) unless
+    config["crossref_validate"] is truthy AND _crossref_contact_ok(config).
+
+    Args:
+        skeleton: Mutable PaperJSON dict (extraction.references mutated in-place).
+        config:   Loaded config dict; reads crossref_validate and crossref_contact_email.
+    """
+    if not config.get("crossref_validate", False):
+        return
+    if not _crossref_contact_ok(config):
+        return
+
+    refs = skeleton.get("extraction", {}).get("references", [])
+    for ref in refs:
+        if not ref.get("title") or ref.get("doi"):
+            continue  # skip refs with no title or already-resolved DOI
+        try:
+            candidate_doi = _crossref_title_to_doi(ref["title"], config)
+            if not candidate_doi:
+                continue
+            # Second gate: LLM same-paper confirmation (T-04-05-02, D-15)
+            try:
+                _crossref_validate(candidate_doi, ref["title"], config)
+            except RuntimeError:
+                # Confirmed mismatch — do not assign DOI; continue with next ref
+                _log(f"crossref title enrichment: confirmed mismatch for ref title {ref['title']!r}")
+                continue
+            ref["doi"] = candidate_doi
+        except Exception as exc:  # noqa: BLE001 — fail-open per ref
+            _log(f"crossref title enrichment: error on ref {ref.get('title')!r}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Quality gate
 # ---------------------------------------------------------------------------
@@ -2171,6 +2297,13 @@ def _run_fill_cascade(
         sys.exit(1)
     skeleton["extraction"]["references"] = refs
     failed_count += ref_failures
+
+    # Step 10d: Opt-in Crossref title->DOI enrichment (Plan 05 Layer 3).
+    # Runs AFTER ref fill so LLM-filled titles are available, and BEFORE the
+    # cache write so enriched DOIs are persisted — a later cache-hit re-run
+    # reads the cached DOIs and never re-hits the network.
+    # No-op when crossref_validate=False (offline default) or email is placeholder.
+    _enrich_references_with_crossref(skeleton, config)
 
     # Step 11: Renditions — body IS the cleaned text from LLM fill (D-10)
     _log("renditions")
