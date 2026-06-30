@@ -5199,3 +5199,196 @@ def test_emit_result_output_path_writes_file_not_stdout(capsys, tmp_path):
     assert out_file.exists(), "Expected output file to have been created"
     data = _json.loads(out_file.read_text(encoding="utf-8"))
     assert data["provenance"]["schema_version"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 04 Plan 05 Task 1 (RED): opt-in Crossref title->DOI enrichment contract
+# ---------------------------------------------------------------------------
+# These four tests pin the enrichment contract (threshold gate, disabled-default
+# no-network, placeholder-email no-network, same-paper-gated DOI assignment).
+# They FAIL until Task 2 (GREEN) adds _crossref_title_to_doi,
+# _enrich_references_with_crossref, and _CROSSREF_TITLE_MATCH_MIN_SCORE.
+# ---------------------------------------------------------------------------
+
+import json as _json_04_05  # noqa: E402 (module-level but after main imports)
+
+
+def _make_doiless_ref(title: str = "A Test Paper Title") -> dict:
+    """Minimal RefEntry-shaped dict with no DOI, as produced by _fill_references_batched."""
+    return {
+        "number": 1,
+        "raw": f"1. {title}.",
+        "doi": None,
+        "title": title,
+        "year": 2022,
+        "fill_failed": False,
+        "is_reference": True,
+    }
+
+
+def _make_minimal_skeleton(refs: list) -> dict:
+    """Minimal PaperJSON skeleton carrying the given refs under extraction.references."""
+    return {
+        "extraction": {
+            "metadata": {
+                "title": "Host Paper",
+                "authors": [],
+                "year": None,
+                "doi": None,
+                "journal": None,
+                "journal_full": None,
+                "arxiv_id": None,
+            },
+            "sections": [],
+            "references": refs,
+        },
+        "analysis": {},
+        "provenance": {"schema_version": 2},
+    }
+
+
+def test_crossref_title_to_doi_returns_doi_above_threshold():
+    """_crossref_title_to_doi returns DOI when Crossref score >= threshold; None below threshold.
+
+    Network fully mocked — urlopen never hits the real internet.
+    References _CROSSREF_TITLE_MATCH_MIN_SCORE so the test tracks the implementation constant.
+    """
+    import json as _json
+    from scripts.ingest import (  # type: ignore[attr-defined]
+        _crossref_title_to_doi,
+        _CROSSREF_TITLE_MATCH_MIN_SCORE,
+    )
+
+    above_payload = _json.dumps({
+        "message": {
+            "items": [
+                {
+                    "DOI": "10.1073/pnas.x",
+                    "score": _CROSSREF_TITLE_MATCH_MIN_SCORE + 1.0,
+                    "title": ["A Test Paper Title"],
+                }
+            ]
+        }
+    }).encode()
+
+    below_payload = _json.dumps({
+        "message": {
+            "items": [
+                {
+                    "DOI": "10.1073/pnas.y",
+                    "score": _CROSSREF_TITLE_MATCH_MIN_SCORE - 1.0,
+                    "title": ["Some Other Title"],
+                }
+            ]
+        }
+    }).encode()
+
+    cfg = {"crossref_contact_email": "real@example.com"}
+
+    # Above threshold: DOI returned
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(above_payload)):
+        result_above = _crossref_title_to_doi("A Test Paper Title", cfg)
+
+    assert result_above == "10.1073/pnas.x", (
+        f"Expected '10.1073/pnas.x' for score above threshold, got {result_above!r}"
+    )
+
+    # Below threshold: None returned
+    with mock.patch("scripts.ingest.urllib.request.urlopen",
+                    return_value=_FakeHttpResponse(below_payload)):
+        result_below = _crossref_title_to_doi("Some Other Title", cfg)
+
+    assert result_below is None, (
+        f"Expected None for score below threshold, got {result_below!r}"
+    )
+
+
+def test_enrich_skipped_when_crossref_disabled():
+    """_enrich_references_with_crossref is a strict no-op when crossref_validate=False (offline default).
+
+    urlopen must NOT be called; refs remain unchanged (doi=None).
+    """
+    from scripts.ingest import _enrich_references_with_crossref  # type: ignore[attr-defined]
+
+    ref = _make_doiless_ref("Attention Is All You Need")
+    skeleton = _make_minimal_skeleton([ref])
+
+    cfg = {"crossref_validate": False, "crossref_contact_email": "real@example.com"}
+    urlopen_mock = mock.MagicMock()
+
+    with mock.patch("scripts.ingest.urllib.request.urlopen", urlopen_mock):
+        _enrich_references_with_crossref(skeleton, cfg)
+
+    urlopen_mock.assert_not_called()
+    for r in skeleton["extraction"]["references"]:
+        assert r.get("doi") is None, (
+            f"Expected doi=None when enrichment disabled, got {r.get('doi')!r}"
+        )
+
+
+def test_enrich_skipped_on_placeholder_email():
+    """_enrich_references_with_crossref is a no-op when email is a known placeholder.
+
+    _crossref_contact_ok returns False for placeholder emails -> urlopen NOT called.
+    """
+    from scripts.ingest import (  # type: ignore[attr-defined]
+        _enrich_references_with_crossref,
+        _CROSSREF_PLACEHOLDER_EMAILS,
+    )
+
+    placeholder_email = next(iter(_CROSSREF_PLACEHOLDER_EMAILS))  # e.g. "your-email@example.com"
+    ref = _make_doiless_ref("Attention Is All You Need")
+    skeleton = _make_minimal_skeleton([ref])
+
+    cfg = {"crossref_validate": True, "crossref_contact_email": placeholder_email}
+    urlopen_mock = mock.MagicMock()
+
+    with mock.patch("scripts.ingest.urllib.request.urlopen", urlopen_mock):
+        _enrich_references_with_crossref(skeleton, cfg)
+
+    urlopen_mock.assert_not_called()
+    for r in skeleton["extraction"]["references"]:
+        assert r.get("doi") is None, (
+            f"Expected doi=None when email is placeholder, got {r.get('doi')!r}"
+        )
+
+
+def test_enrich_assigns_doi_only_on_same_paper_confirmation():
+    """DOI is assigned only when _crossref_validate confirms same paper (no RuntimeError).
+
+    Case A: _crossref_validate returns normally -> ref["doi"] gets the resolved DOI.
+    Case B: _crossref_validate raises RuntimeError (confirmed mismatch) -> ref["doi"] stays None;
+             ingest continues (fail-open, no propagation).
+    """
+    from scripts.ingest import _enrich_references_with_crossref  # type: ignore[attr-defined]
+
+    resolved_doi = "10.1073/pnas.test001"
+
+    cfg = {"crossref_validate": True, "crossref_contact_email": "real@example.com"}
+
+    # Case A: same-paper confirmed (no RuntimeError) -> DOI assigned
+    ref_a = _make_doiless_ref("A Real Paper Title")
+    skeleton_a = _make_minimal_skeleton([ref_a])
+
+    with mock.patch("scripts.ingest._crossref_title_to_doi", return_value=resolved_doi), \
+         mock.patch("scripts.ingest._crossref_validate", return_value=None):
+        _enrich_references_with_crossref(skeleton_a, cfg)
+
+    assert skeleton_a["extraction"]["references"][0].get("doi") == resolved_doi, (
+        f"Expected doi={resolved_doi!r} after same-paper confirmation, "
+        f"got {skeleton_a['extraction']['references'][0].get('doi')!r}"
+    )
+
+    # Case B: confirmed mismatch (RuntimeError) -> doi stays None; no exception propagates
+    ref_b = _make_doiless_ref("A Different Paper Title")
+    skeleton_b = _make_minimal_skeleton([ref_b])
+
+    with mock.patch("scripts.ingest._crossref_title_to_doi", return_value=resolved_doi), \
+         mock.patch("scripts.ingest._crossref_validate",
+                    side_effect=RuntimeError("[ingest error: confirmed mismatch]")):
+        _enrich_references_with_crossref(skeleton_b, cfg)  # must NOT raise
+
+    assert skeleton_b["extraction"]["references"][0].get("doi") is None, (
+        "Expected doi=None when _crossref_validate raises RuntimeError (confirmed mismatch)"
+    )
