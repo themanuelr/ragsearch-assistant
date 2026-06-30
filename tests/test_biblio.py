@@ -15,6 +15,9 @@ Tests cover:
   - test_stubs_not_registered (BIBLIO-04c): stubs never written to registry
   - test_malformed_ref_does_not_abort (BIBLIO-04d / SC4): fill_failed ref is non-fatal
   - test_biblio_failure_does_not_abort_ingest (BIBLIO-04e / SC4): internal fail → [biblio warning:]
+  - test_doiless_ref_to_in_vault_paper_renders_wikilink (BIBLIO-02/04-04): normalized-title hit
+  - test_cross_citer_dedup_with_title_variation_one_stub (BIBLIO-03/04-04): accent-fold dedup
+  - test_match_normalization_folds_accents (04-04): _normalize_title_for_match unit test
 
 Run with:  python -m pytest tests/test_biblio.py -x
 """
@@ -379,3 +382,149 @@ def test_upgrade_merges_cited_by_into_full_note(tmp_vault, config):
     full_note_content = full_note_file.read_text(encoding="utf-8")
     assert "cited_by:" in full_note_content, "Full note must have cited_by in frontmatter after upgrade"
     assert citing_note_rel in full_note_content, "cited_by must include the citing note path"
+
+
+# ---------------------------------------------------------------------------
+# Gap-closure tests (04-04): normalized-title registry resolution + accent-fold dedup
+# ---------------------------------------------------------------------------
+
+def test_doiless_ref_to_in_vault_paper_renders_wikilink(tmp_vault, config):
+    """BIBLIO-02/04-04: a doiless ref whose title matches a DOI-keyed registry entry renders
+    as [[wikilink]] and creates NO stub (Layer 2 of the locked resolution chain)."""
+    from scripts import biblio  # noqa: PLC0415
+
+    # Seed registry with a DOI-keyed entry (paper already in vault)
+    registry = {
+        "10.1073/pnas.2020": {
+            "title": "Cryo EM Structures of KCC1",
+            "authors": None,
+            "year": 2020,
+        }
+    }
+    Path(config["registry_path"]).write_text(json.dumps(registry), encoding="utf-8")
+
+    # Build a ref with NO doi but a title that normalizes to the same string as the
+    # registry entry (hyphen and mixed-case differences only — accent-free so the only
+    # failure mode is the DOI-vs-title-hash key mismatch, not accent folding).
+    refs = [
+        {
+            "number": 1,
+            "raw": "Bhatt et al., PNAS 2020",
+            "doi": None,
+            "title": "Cryo-EM structures of KCC1",
+            "year": 2020,
+            "fill_failed": False,
+        }
+    ]
+    pj = _make_paperjson_with_refs(refs=refs)
+
+    (tmp_vault / "Papers" / "Test Citing Paper.md").write_text(
+        "# Test Citing Paper\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+
+    result = biblio.run_biblio(pj, config)
+    assert not result.startswith("[biblio warning:"), f"run_biblio failed: {result}"
+
+    note_content = (tmp_vault / "Papers" / "Test Citing Paper.md").read_text(encoding="utf-8")
+    assert "## References" in note_content, "References section not injected"
+    assert "[[Cryo EM Structures of KCC1]]" in note_content, (
+        "Doiless ref matching DOI-keyed registry entry must render as [[wikilink]]"
+    )
+
+    stubs = list((tmp_vault / "Stubs").iterdir())
+    assert len(stubs) == 0, (
+        f"No stub should be created for a ref that resolves to an in-vault paper; got {[s.name for s in stubs]}"
+    )
+
+
+def test_cross_citer_dedup_with_title_variation_one_stub(tmp_vault, config):
+    """BIBLIO-03/04-04: two citers with accent-variant titles for the same not-in-vault paper
+    produce exactly ONE stub accumulating both citers in cited_by (accent-fold dedup via _match_key)."""
+    from scripts import biblio  # noqa: PLC0415
+    from scripts.ingest import _assemble_paperjson, SCHEMA_VERSION  # noqa: PLC0415
+
+    # Citer A references the paper with an umlaut: "Structures of Müller Cells"
+    refs_a = [
+        {
+            "number": 1,
+            "raw": "Müller et al., 2019",
+            "doi": None,
+            "title": "Structures of Müller Cells",
+            "year": 2019,
+            "fill_failed": False,
+        }
+    ]
+    pj_a = _make_paperjson_with_refs(refs=refs_a)
+    pj_a["extraction"]["metadata"]["title"] = "Citer Paper A"
+    pj_a["extraction"]["metadata"]["doi"] = "10.9999/citer-a"
+
+    (tmp_vault / "Papers" / "Citer Paper A.md").write_text(
+        "# Citer Paper A\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_a = biblio.run_biblio(pj_a, config)
+    assert not result_a.startswith("[biblio warning:"), f"run_biblio (citer A) failed: {result_a}"
+
+    # Citer B references the same paper without the umlaut: "Structures of Muller Cells"
+    refs_b = [
+        {
+            "number": 1,
+            "raw": "Muller et al., 2019",
+            "doi": None,
+            "title": "Structures of Muller Cells",
+            "year": 2019,
+            "fill_failed": False,
+        }
+    ]
+    parsed_b = {
+        "title": "Citer Paper B",
+        "sections": [],
+        "references": refs_b,
+        "metadata": {"title": "Citer Paper B", "doi": "10.9999/citer-b"},
+    }
+    provenance_b = {
+        "pdf_sha256": "bbb222", "source_filename": "citer_b.pdf",
+        "mineru_version": "2.5", "backend": "hybrid_auto",
+        "extracted_at": "2026-06-30T00:00:00Z",
+        "normalizations_applied": [], "schema_version": SCHEMA_VERSION,
+    }
+    pj_b = _assemble_paperjson(parsed_b, provenance_b)
+    pj_b["extraction"]["references"] = refs_b
+
+    (tmp_vault / "Papers" / "Citer Paper B.md").write_text(
+        "# Citer Paper B\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_b = biblio.run_biblio(pj_b, config)
+    assert not result_b.startswith("[biblio warning:"), f"run_biblio (citer B) failed: {result_b}"
+
+    stubs = list((tmp_vault / "Stubs").iterdir())
+    assert len(stubs) == 1, (
+        f"Expected exactly ONE stub for the accent-variant titles (dedup by _match_key); "
+        f"got {len(stubs)}: {[s.name for s in stubs]}"
+    )
+
+    stub_content = stubs[0].read_text(encoding="utf-8")
+    assert "Citer Paper A" in stub_content, "First citer (A) must appear in stub cited_by"
+    assert "Citer Paper B" in stub_content, "Second citer (B) must appear in stub cited_by"
+
+
+def test_match_normalization_folds_accents(tmp_vault, config):
+    """04-04 unit: _normalize_title_for_match folds NFKD accents and collapses case/punctuation."""
+    from scripts import biblio  # noqa: PLC0415
+
+    # Accent folding: ü -> u, accent diacritics stripped
+    assert biblio._normalize_title_for_match("Müller") == biblio._normalize_title_for_match(
+        "Muller"
+    ), "_normalize_title_for_match must fold 'ü' to 'u'"
+
+    # Case collapsing
+    assert biblio._normalize_title_for_match("MÜLLER") == biblio._normalize_title_for_match(
+        "muller"
+    ), "_normalize_title_for_match must be case-insensitive after accent folding"
+
+    # Punctuation collapsing (hyphen treated same as space)
+    assert biblio._normalize_title_for_match("Cryo-EM") == biblio._normalize_title_for_match(
+        "Cryo EM"
+    ), "_normalize_title_for_match must collapse punctuation and whitespace runs"
