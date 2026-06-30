@@ -16,11 +16,13 @@ Public API:
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import pathlib
 import re
 import sys
+import unicodedata
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -32,6 +34,7 @@ from scripts.ingest import (
     _check_registry,
     _read_registry,
     _load_config,
+    _TITLE_HASH_PREFIX_LEN,
 )
 from scripts.note import _sanitize_filename, _repair_math_escapes
 from scripts.obsidian_cli import (
@@ -75,6 +78,96 @@ def _ref_key(ref: dict) -> str:
     Chain: DOI → title-hash only (RefEntry has no arxiv_id field — Pitfall 2).
     """
     return _registry_key({"doi": ref.get("doi"), "title": ref.get("title")})
+
+
+# ---------------------------------------------------------------------------
+# Layer-2 offline matching: normalized-title index + accent-folded dedup key
+# ---------------------------------------------------------------------------
+
+def _normalize_title_for_match(title: str) -> str:
+    """Accent-fold and normalize a title for cross-ref matching and dedup keying.
+
+    Steps:
+      1. NFKD-decompose via unicodedata.normalize so accented chars split into
+         base letter + combining mark (e.g. "ü" → "u" + combining umlaut).
+      2. Drop all combining characters so accented chars collapse to their ASCII
+         base (e.g. "Müller" → "Muller").
+      3. Delegate to the existing _normalize_title from scripts.ingest which
+         lowercases, strips, and collapses whitespace/punctuation runs to a
+         single space — giving a strict superset of that normalization.
+
+    This is the SINGLE normalization used for both the title index and _match_key.
+    """
+    decomposed = unicodedata.normalize("NFKD", title)
+    ascii_only = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return _normalize_title(ascii_only)
+
+
+def _build_title_index(registry_path: str) -> dict:
+    """Build a read-only normalized-title → registry_key index from the registry.
+
+    Returns a dict mapping _normalize_title_for_match(entry["title"]) to the
+    registry key for every entry that carries a non-empty title field.
+    Never writes to the registry (D-08). Returns {} if registry is absent or empty.
+    """
+    registry = _read_registry(registry_path) if registry_path else {}
+    index: dict[str, str] = {}
+    for reg_key, entry in registry.items():
+        title = entry.get("title") or ""
+        if title:
+            norm = _normalize_title_for_match(title)
+            if norm:
+                index[norm] = reg_key
+    return index
+
+
+def _resolve_ref_in_registry(
+    ref: dict, registry_path: str, title_index: dict
+) -> dict | None:
+    """Layered registry resolution for a single reference (Layer 1 + Layer 2).
+
+    Resolution chain (offline, no network):
+      1. Exact DOI via _check_registry when the ref carries a doi.
+      2. Normalized-title lookup: _normalize_title_for_match(ref title) → title_index
+         → matched registry key → _check_registry(matched_key, registry_path).
+
+    Returns the registry entry dict on any hit, or None on miss.
+    """
+    # Layer 1: exact DOI
+    doi = ref.get("doi")
+    if doi and registry_path:
+        entry = _check_registry(doi, registry_path)
+        if entry is not None:
+            return entry
+
+    # Layer 2: normalized-title index
+    title = ref.get("title") or ""
+    if title and title_index and registry_path:
+        norm = _normalize_title_for_match(title)
+        matched_key = title_index.get(norm)
+        if matched_key:
+            entry = _check_registry(matched_key, registry_path)
+            if entry is not None:
+                return entry
+
+    return None
+
+
+def _match_key(ref_or_meta: dict) -> str:
+    """Derive the identity key for stub dedup and upgrade detection.
+
+    DOI if present, else "sha256:<16-hex-chars>" derived from the
+    accent-folded normalized title (via _normalize_title_for_match).
+    Uses _TITLE_HASH_PREFIX_LEN so the format is byte-identical to
+    _registry_key for ASCII-only titles.
+    """
+    doi = ref_or_meta.get("doi")
+    if doi:
+        return doi
+    title = ref_or_meta.get("title") or ""
+    norm = _normalize_title_for_match(title)
+    digest = hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    return "sha256:" + digest[:_TITLE_HASH_PREFIX_LEN]
 
 
 def _find_stub_by_key(key: str, config: dict) -> str | None:
@@ -198,8 +291,17 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
 
     Per-ref errors are caught, logged, and emitted as raw text — the loop continues
     (D-09 inner containment / SC4 / BIBLIO-04d).
+
+    Resolution chain (Layer 1 + Layer 2, fully offline):
+      - Layer 1: exact DOI registry hit
+      - Layer 2: normalized-title index hit (accent-folded, no network)
+      - Miss: dedup-or-create stub using _match_key for stable cross-citer identity
     """
     registry_path = config.get("registry_path", "")
+
+    # Build the title index ONCE before the per-ref loop (Layer 2 prerequisite)
+    title_index = _build_title_index(registry_path) if registry_path else {}
+
     lines = []
 
     for i, ref in enumerate(refs):
@@ -215,8 +317,8 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
                 lines.append(f"{number}. {display}")
                 continue
 
-            key = _ref_key(ref)
-            entry = _check_registry(key, registry_path) if registry_path else None
+            # Layered registry resolution (Layer 1: exact DOI, Layer 2: normalized title)
+            entry = _resolve_ref_in_registry(ref, registry_path, title_index)
 
             if entry:
                 # Registry hit: derive wikilink from entry["title"] (no vault_note field — Pitfall 1)
@@ -225,16 +327,18 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
                 lines.append(f"{number}. [[{display_title}]]")
             else:
                 # Registry miss: dedup-or-create stub (D-06 / BIBLIO-03)
+                # Use _match_key for cross-citer dedup (accent-folded, stable identity)
+                stub_key = _match_key(ref)
                 stub_title = title or raw
                 stub_filename = _sanitize_filename(stub_title)
                 stub_path = f"Stubs/{stub_filename}.md"
-                existing_stub = _find_stub_by_key(key, config)
+                existing_stub = _find_stub_by_key(stub_key, config)
                 if existing_stub:
                     # Existing stub for this key — accumulate cited_by (BIBLIO-03b)
                     _append_cited_by(existing_stub, citing_path, config)
                 else:
                     # New stub — safe default won't clobber an existing stub (overwrite=False)
-                    stub_content = _render_stub(ref, key, citing_path)
+                    stub_content = _render_stub(ref, stub_key, citing_path)
                     create_note(stub_path, stub_content, config, overwrite=False)
 
                 # Markdown-injection guard: emit as numbered list item, never as heading (T-04-04)
@@ -320,7 +424,7 @@ def run_biblio(paperjson: dict, config: dict) -> str:
         # failure is swallowed and citing_path is still returned (D-09).
         try:
             metadata = paperjson.get("extraction", {}).get("metadata", {})
-            self_key = _registry_key(metadata)
+            self_key = _match_key(metadata)
             stub_path = _find_stub_by_key(self_key, config)
             if stub_path:
                 vault_root = _vault_root(config)
