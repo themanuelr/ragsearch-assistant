@@ -5304,6 +5304,59 @@ def test_crossref_title_to_doi_returns_doi_above_threshold():
     )
 
 
+def test_crossref_title_to_doi_request_shape_and_timeout():
+    """Regression: _crossref_title_to_doi sends rows=1, a select param (DOI,score,title),
+    and reads urlopen timeout from config.get('crossref_timeout', 30).
+
+    This test pins the post-fix request shape.  It FAILS against the pre-fix code
+    (rows=5, no select param, timeout=10).
+    """
+    import json as _json
+    import urllib.parse
+    from scripts.ingest import _crossref_title_to_doi  # type: ignore[attr-defined]
+
+    empty_payload = _json.dumps({"message": {"items": []}}).encode()
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        return _FakeHttpResponse(empty_payload)
+
+    # Test A: explicit crossref_timeout — value flows through to urlopen
+    cfg_with_timeout = {"crossref_contact_email": "real@example.com", "crossref_timeout": 30}
+    with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=fake_urlopen):
+        _crossref_title_to_doi("Some Title", cfg_with_timeout)
+
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(captured["url"]).query)
+
+    assert qs.get("rows") == ["1"], (
+        f"Expected rows=1 in request URL (only top item is consulted), got rows={qs.get('rows')!r}"
+    )
+    assert "5" not in (qs.get("rows") or []), (
+        "rows=5 must not appear in request URL after fix"
+    )
+    select_val = qs.get("select", [""])[0]
+    for field in ("DOI", "score", "title"):
+        assert field in select_val, (
+            f"Expected '{field}' in select param to trim payload, got select={select_val!r}"
+        )
+    assert captured["timeout"] == 30, (
+        f"Expected timeout=30 from config['crossref_timeout'], got {captured['timeout']!r}"
+    )
+
+    # Test B: crossref_timeout absent — default of 30 applies (no longer hardcoded 10)
+    cfg_no_timeout = {"crossref_contact_email": "real@example.com"}
+    captured.clear()
+    with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=fake_urlopen):
+        _crossref_title_to_doi("Some Title", cfg_no_timeout)
+
+    assert captured["timeout"] == 30, (
+        f"Expected default timeout=30 when crossref_timeout absent from config, "
+        f"got {captured['timeout']!r}"
+    )
+
+
 def test_enrich_skipped_when_crossref_disabled():
     """_enrich_references_with_crossref is a strict no-op when crossref_validate=False (offline default).
 
