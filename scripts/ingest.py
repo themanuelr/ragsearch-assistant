@@ -1185,6 +1185,13 @@ _CROSSREF_TITLE_MATCH_MIN_SCORE: float = 70.0
 # one row keeps the response payload tiny and latency low (T-04-05-03 DoS mitigation).
 _CROSSREF_TITLE_SEARCH_ROWS: int = 1
 
+# Crossref OR-combines repeated filter names, so this single-string value keeps
+# only publication-like record types and prevents image-data deposits, decision
+# letters, and PDB components from outranking the real article at items[0].
+_CROSSREF_TITLE_TYPE_FILTER: str = (
+    "type:journal-article,type:posted-content,type:proceedings-article,type:book-chapter"
+)
+
 
 def _crossref_title_to_doi(title: str, config: dict) -> str | None:
     """Search Crossref by bibliographic title and return the top DOI if above threshold.
@@ -1219,7 +1226,8 @@ def _crossref_title_to_doi(title: str, config: dict) -> str | None:
     params = urllib.parse.urlencode({
         "query.bibliographic": title,
         "rows": _CROSSREF_TITLE_SEARCH_ROWS,
-        "select": "DOI,score,title"
+        "select": "DOI,score,title",
+        "filter": _CROSSREF_TITLE_TYPE_FILTER
     })
     url = f"https://api.crossref.org/works?{params}"
     req = urllib.request.Request(url, method="GET")
