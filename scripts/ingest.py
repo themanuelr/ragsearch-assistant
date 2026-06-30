@@ -1181,9 +1181,9 @@ def _crossref_published_year(doi: str, config: dict) -> int | None:
 _CROSSREF_TITLE_MATCH_MIN_SCORE: float = 70.0
 
 # Maximum result rows to request from the Crossref works-query endpoint.
-# Only the top item is used; a small cap keeps the response payload tiny and
-# the request latency low (T-04-05-03 DoS mitigation).
-_CROSSREF_TITLE_SEARCH_ROWS: int = 5
+# Set to 1 because only the top item (items[0]) is ever consulted; requesting
+# one row keeps the response payload tiny and latency low (T-04-05-03 DoS mitigation).
+_CROSSREF_TITLE_SEARCH_ROWS: int = 1
 
 
 def _crossref_title_to_doi(title: str, config: dict) -> str | None:
@@ -1219,6 +1219,7 @@ def _crossref_title_to_doi(title: str, config: dict) -> str | None:
     params = urllib.parse.urlencode({
         "query.bibliographic": title,
         "rows": _CROSSREF_TITLE_SEARCH_ROWS,
+        "select": "DOI,score,title"
     })
     url = f"https://api.crossref.org/works?{params}"
     req = urllib.request.Request(url, method="GET")
@@ -1227,7 +1228,7 @@ def _crossref_title_to_doi(title: str, config: dict) -> str | None:
         f"ragsearch-assistant/1.3 (mailto:{contact})",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=config.get("crossref_timeout", 30)) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         _log("crossref title->doi lookup unavailable")
