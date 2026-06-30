@@ -5357,6 +5357,48 @@ def test_crossref_title_to_doi_request_shape_and_timeout():
     )
 
 
+def test_crossref_title_to_doi_request_includes_type_filter():
+    """Regression: _crossref_title_to_doi sends a filter param restricting results to
+    publication-like record types (journal-article OR-combined with posted-content,
+    proceedings-article, book-chapter), preventing image-data deposits, decision
+    letters, and PDB components from outranking the real article at items[0].
+    """
+    import json as _json
+    import urllib.parse
+    from scripts.ingest import _crossref_title_to_doi  # type: ignore[attr-defined]
+
+    empty_payload = _json.dumps({"message": {"items": []}}).encode()
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _FakeHttpResponse(empty_payload)
+
+    cfg = {"crossref_contact_email": "real@example.com"}
+    with mock.patch("scripts.ingest.urllib.request.urlopen", side_effect=fake_urlopen):
+        _crossref_title_to_doi("Some Title", cfg)
+
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(captured["url"]).query)
+    filter_val = qs.get("filter", [""])[0]
+
+    assert "type:journal-article" in filter_val, (
+        f"Expected 'type:journal-article' in filter param to exclude non-article deposits, "
+        f"got filter={filter_val!r}"
+    )
+    assert "type:posted-content" in filter_val, (
+        f"Expected 'type:posted-content' in filter param (OR-combined), "
+        f"got filter={filter_val!r}"
+    )
+    assert "type:proceedings-article" in filter_val, (
+        f"Expected 'type:proceedings-article' in filter param (OR-combined), "
+        f"got filter={filter_val!r}"
+    )
+    assert "type:book-chapter" in filter_val, (
+        f"Expected 'type:book-chapter' in filter param (OR-combined), "
+        f"got filter={filter_val!r}"
+    )
+
+
 def test_enrich_skipped_when_crossref_disabled():
     """_enrich_references_with_crossref is a strict no-op when crossref_validate=False (offline default).
 
