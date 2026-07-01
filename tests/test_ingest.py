@@ -5120,6 +5120,176 @@ def test_registry_hit_no_note_gen_when_paperjson_path_missing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Plan 06 (gap-closure): Step 9b cache-hit biblio hook (closes Gap B)
+# run_biblio must fire on the registry cache-hit path, not only the fill-miss path.
+# ---------------------------------------------------------------------------
+
+
+def test_registry_cache_hit_runs_biblio(tmp_path):
+    """On cache HIT with a valid paperjson_path, ingest() calls run_biblio with the cached
+    PaperJSON (the SAME dict used for note regeneration) and returns the cached entry."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+    reg_path = cfg["registry_path"]
+
+    # Write a real PaperJSON cache file on disk WITH references (one DOI ref, one doiless ref)
+    cache_file = tmp_path / "cached_paper_with_refs.json"
+    cached_paperjson = {
+        "extraction": {
+            "metadata": {"title": "Cached Paper With Refs", "authors": [], "year": 2024,
+                          "journal": None, "doi": "10.1000/biblio.gate", "arxiv_id": None,
+                          "accession_codes": []},
+            "sections": [],
+            "references": [
+                {"number": 1, "raw": "1. Smith J. et al. Nature 2024. 10.1/abc",
+                 "doi": "10.1/abc", "title": "Paper 1", "year": 2024, "fill_failed": False},
+                {"number": 2, "raw": "2. Jones A. Cell 2023.",
+                 "doi": None, "title": "Paper 2", "year": 2023, "fill_failed": False},
+            ],
+        },
+        "analysis": {"generated_by": None},
+        "provenance": {"schema_version": 2},
+    }
+    cache_file.write_text(json.dumps(cached_paperjson), encoding="utf-8")
+
+    # Pre-populate registry with paperjson_path pointing at the real cache file
+    cached_entry = {
+        "title": "Cached Paper With Refs",
+        "doi": "10.1000/biblio.gate",
+        "projects": ["other-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/cached_refs.pdf",
+        "paperjson_path": str(cache_file),
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/biblio.gate")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 biblio gate test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/biblio.gate", arxiv_id=None, title="Cached Paper With Refs")
+
+    mock_gen_note = mock.MagicMock(return_value="Papers/Cached Paper With Refs.md")
+    mock_run_biblio = mock.MagicMock(return_value="Papers/Cached Paper With Refs.md")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Cached Paper With Refs",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Cached Paper With Refs", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/biblio.gate", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note.generate_note", mock_gen_note), \
+         mock.patch("scripts.biblio.run_biblio", mock_run_biblio):
+        result = ingest(str(fake_pdf), cfg)
+
+    # run_biblio must have been called once with the cached PaperJSON dict and config
+    mock_run_biblio.assert_called_once()
+    call_args = mock_run_biblio.call_args
+    pj_arg = call_args[0][0]
+    assert isinstance(pj_arg, dict), "run_biblio should receive a dict (loaded PaperJSON)"
+    assert pj_arg == cached_paperjson, "run_biblio should receive the SAME cached PaperJSON used for note regen"
+
+    cfg_arg = call_args[0][1]
+    assert isinstance(cfg_arg, dict), "run_biblio should receive config as second arg"
+
+    # ingest() must return the cached entry (not a full PaperJSON)
+    assert result.get("title") == "Cached Paper With Refs", (
+        f"Expected cached entry returned, got: {result}"
+    )
+    assert result.get("doi") == "10.1000/biblio.gate"
+
+
+def test_registry_cache_hit_biblio_failure_does_not_propagate(tmp_path):
+    """When run_biblio raises on the registry-hit path, ingest() still returns the cached
+    entry (D-09 best-effort) — and run_biblio was invoked (proving the hook fired)."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_name": "test-vault"})
+    reg_path = cfg["registry_path"]
+
+    cache_file = tmp_path / "cached_paper_biblio_fail.json"
+    cached_paperjson = {
+        "extraction": {
+            "metadata": {"title": "Biblio Fail Paper", "authors": [], "year": 2024,
+                          "journal": None, "doi": "10.1000/biblio.fail", "arxiv_id": None,
+                          "accession_codes": []},
+            "sections": [],
+            "references": [
+                {"number": 1, "raw": "1. Smith J. et al. Nature 2024. 10.1/abc",
+                 "doi": "10.1/abc", "title": "Paper 1", "year": 2024, "fill_failed": False},
+                {"number": 2, "raw": "2. Jones A. Cell 2023.",
+                 "doi": None, "title": "Paper 2", "year": 2023, "fill_failed": False},
+            ],
+        },
+        "analysis": {"generated_by": None},
+        "provenance": {"schema_version": 2},
+    }
+    cache_file.write_text(json.dumps(cached_paperjson), encoding="utf-8")
+
+    cached_entry = {
+        "title": "Biblio Fail Paper",
+        "doi": "10.1000/biblio.fail",
+        "projects": ["test-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/biblio_fail.pdf",
+        "paperjson_path": str(cache_file),
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/biblio.fail")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 biblio fail test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/biblio.fail", arxiv_id=None, title="Biblio Fail Paper")
+
+    mock_gen_note = mock.MagicMock(return_value="Papers/Biblio Fail Paper.md")
+    mock_run_biblio = mock.MagicMock(side_effect=RuntimeError("biblio exploded on cache-hit path!"))
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Biblio Fail Paper",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Biblio Fail Paper", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/biblio.fail", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note.generate_note", mock_gen_note), \
+         mock.patch("scripts.biblio.run_biblio", mock_run_biblio):
+        # Must NOT raise — biblio failure is best-effort on the registry-hit path
+        result = ingest(str(fake_pdf), cfg)
+
+    # Must return the cached entry
+    assert result.get("title") == "Biblio Fail Paper", (
+        f"Expected cached entry returned even on biblio failure, got: {result}"
+    )
+    assert result.get("doi") == "10.1000/biblio.fail"
+
+    # run_biblio must have been invoked (proving the hook fired and its failure was swallowed)
+    mock_run_biblio.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Plan 08 (GAP-2): _emit_result stdout-suppression + --print flag
 # ---------------------------------------------------------------------------
 
