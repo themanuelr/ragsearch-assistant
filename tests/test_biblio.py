@@ -528,3 +528,226 @@ def test_match_normalization_folds_accents(tmp_vault, config):
     assert biblio._normalize_title_for_match("Cryo-EM") == biblio._normalize_title_for_match(
         "Cryo EM"
     ), "_normalize_title_for_match must collapse punctuation and whitespace runs"
+
+
+# ---------------------------------------------------------------------------
+# Gap-closure tests (04-07): stub-title-index dedup for DOI-vs-doiless refs
+# and hyphen/space/joined title variants (Gap C, 04-UAT Test 1 dedup half)
+# ---------------------------------------------------------------------------
+
+def test_doiless_and_doi_ref_dedup_to_one_stub_keyed_by_doi(tmp_vault, config):
+    """BIBLIO-03/04-07: DOI-bearing citer linked first, doiless citer second, same title
+    for a not-in-vault paper -> exactly ONE stub keyed by the DOI, both citers in cited_by
+    (closes Gap C mode 1: DOI-vs-title-hash key mismatch)."""
+    from scripts import biblio  # noqa: PLC0415
+    from scripts.ingest import _assemble_paperjson, SCHEMA_VERSION  # noqa: PLC0415
+
+    shared_title = "Structure and mechanism of the cation-chloride cotransporter NKCC1"
+    shared_doi = "10.1038/s41586-019-1438-2"
+
+    # Citer A references the paper WITH the DOI (linked first)
+    refs_a = [
+        {
+            "number": 1,
+            "raw": "Chew et al., Nature 2019",
+            "doi": shared_doi,
+            "title": shared_title,
+            "year": 2019,
+            "fill_failed": False,
+        }
+    ]
+    pj_a = _make_paperjson_with_refs(refs=refs_a)
+    pj_a["extraction"]["metadata"]["title"] = "Citer Paper A"
+    pj_a["extraction"]["metadata"]["doi"] = "10.9999/citer-a"
+
+    (tmp_vault / "Papers" / "Citer Paper A.md").write_text(
+        "# Citer Paper A\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_a = biblio.run_biblio(pj_a, config)
+    assert not result_a.startswith("[biblio warning:"), f"run_biblio (citer A) failed: {result_a}"
+
+    # Citer B references the SAME paper doiless with the same title text
+    refs_b = [
+        {
+            "number": 1,
+            "raw": "Chew et al., 2019 (doiless cite)",
+            "doi": None,
+            "title": shared_title,
+            "year": 2019,
+            "fill_failed": False,
+        }
+    ]
+    parsed_b = {
+        "title": "Citer Paper B",
+        "sections": [],
+        "references": refs_b,
+        "metadata": {"title": "Citer Paper B", "doi": "10.9999/citer-b"},
+    }
+    provenance_b = {
+        "pdf_sha256": "doib222", "source_filename": "citer_b_doiless.pdf",
+        "mineru_version": "2.5", "backend": "hybrid_auto",
+        "extracted_at": "2026-07-01T00:00:00Z",
+        "normalizations_applied": [], "schema_version": SCHEMA_VERSION,
+    }
+    pj_b = _assemble_paperjson(parsed_b, provenance_b)
+    pj_b["extraction"]["references"] = refs_b
+
+    (tmp_vault / "Papers" / "Citer Paper B.md").write_text(
+        "# Citer Paper B\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_b = biblio.run_biblio(pj_b, config)
+    assert not result_b.startswith("[biblio warning:"), f"run_biblio (citer B) failed: {result_b}"
+
+    stubs = list((tmp_vault / "Stubs").iterdir())
+    assert len(stubs) == 1, (
+        f"Expected exactly ONE stub for the DOI-vs-doiless refs (dedup by stub-title-index); "
+        f"got {len(stubs)}: {[s.name for s in stubs]}"
+    )
+
+    stub_content = stubs[0].read_text(encoding="utf-8")
+    assert f'stub_key: "{shared_doi}"' in stub_content, (
+        f"Surviving stub must be keyed by the DOI ({shared_doi}); got: {stub_content}"
+    )
+    assert "Citer Paper A" in stub_content, "First citer (A, DOI-bearing) must appear in cited_by"
+    assert "Citer Paper B" in stub_content, "Second citer (B, doiless) must appear in cited_by"
+
+
+def test_hyphen_variant_titles_dedup_to_one_stub(tmp_vault, config):
+    """BIBLIO-03/04-07: two doiless citers referencing the same not-in-vault paper with
+    hyphen-vs-joined title variants -> exactly ONE stub (closes Gap C mode 2: punctuation
+    collapsed to a space, not deleted)."""
+    from scripts import biblio  # noqa: PLC0415
+    from scripts.ingest import _assemble_paperjson, SCHEMA_VERSION  # noqa: PLC0415
+
+    # Citer A: hyphenated title
+    refs_a = [
+        {
+            "number": 1,
+            "raw": "Chew et al., 2019 (hyphenated)",
+            "doi": None,
+            "title": "Cryo-EM structures of the human cation-chloride cotransporter KCC1",
+            "year": 2019,
+            "fill_failed": False,
+        }
+    ]
+    pj_a = _make_paperjson_with_refs(refs=refs_a)
+    pj_a["extraction"]["metadata"]["title"] = "Citer Paper A"
+    pj_a["extraction"]["metadata"]["doi"] = "10.9999/citer-a-hyphen"
+
+    (tmp_vault / "Papers" / "Citer Paper A.md").write_text(
+        "# Citer Paper A\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_a = biblio.run_biblio(pj_a, config)
+    assert not result_a.startswith("[biblio warning:"), f"run_biblio (citer A) failed: {result_a}"
+
+    # Citer B: joined (no hyphen) title variant of the same paper
+    refs_b = [
+        {
+            "number": 1,
+            "raw": "Chew et al., 2019 (joined)",
+            "doi": None,
+            "title": "Cryo-EM structures of the human cationchloride cotransporter KCC1",
+            "year": 2019,
+            "fill_failed": False,
+        }
+    ]
+    parsed_b = {
+        "title": "Citer Paper B",
+        "sections": [],
+        "references": refs_b,
+        "metadata": {"title": "Citer Paper B", "doi": "10.9999/citer-b-hyphen"},
+    }
+    provenance_b = {
+        "pdf_sha256": "hyph222", "source_filename": "citer_b_hyphen.pdf",
+        "mineru_version": "2.5", "backend": "hybrid_auto",
+        "extracted_at": "2026-07-01T00:00:00Z",
+        "normalizations_applied": [], "schema_version": SCHEMA_VERSION,
+    }
+    pj_b = _assemble_paperjson(parsed_b, provenance_b)
+    pj_b["extraction"]["references"] = refs_b
+
+    (tmp_vault / "Papers" / "Citer Paper B.md").write_text(
+        "# Citer Paper B\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_b = biblio.run_biblio(pj_b, config)
+    assert not result_b.startswith("[biblio warning:"), f"run_biblio (citer B) failed: {result_b}"
+
+    stubs = list((tmp_vault / "Stubs").iterdir())
+    assert len(stubs) == 1, (
+        f"Expected exactly ONE stub for the hyphen/joined title variants (dedup by "
+        f"stub-title-index); got {len(stubs)}: {[s.name for s in stubs]}"
+    )
+
+    stub_content = stubs[0].read_text(encoding="utf-8")
+    assert "Citer Paper A" in stub_content, "First citer (A, hyphenated) must appear in cited_by"
+    assert "Citer Paper B" in stub_content, "Second citer (B, joined) must appear in cited_by"
+
+
+def test_dedup_normalization_strips_separators(tmp_vault, config):
+    """04-07 unit: _normalize_title_for_dedup collapses hyphen/space/joined title variants
+    to the SAME string, and still folds accents/case (inherited from _normalize_title_for_match)."""
+    from scripts import biblio  # noqa: PLC0415
+
+    hyphenated = biblio._normalize_title_for_dedup("cation-chloride")
+    spaced = biblio._normalize_title_for_dedup("cation chloride")
+    joined = biblio._normalize_title_for_dedup("cationchloride")
+    assert hyphenated == spaced == joined, (
+        f"_normalize_title_for_dedup must converge hyphen/space/joined variants; "
+        f"got hyphenated={hyphenated!r} spaced={spaced!r} joined={joined!r}"
+    )
+
+    # Accent folding + case still hold (inherited from _normalize_title_for_match)
+    assert biblio._normalize_title_for_dedup("Müller") == biblio._normalize_title_for_dedup(
+        "Muller"
+    ), "_normalize_title_for_dedup must still fold accents"
+
+
+def test_layer2_wikilink_unregressed_by_dedup(tmp_vault, config):
+    """GUARD (04-07): a doiless ref to an in-vault DOI-keyed paper still renders a
+    [[wikilink]] and creates NO stub after the dedup change (Layer-2 unregressed)."""
+    from scripts import biblio  # noqa: PLC0415
+
+    # Seed registry with a DOI-keyed entry (paper already in vault)
+    registry = {
+        "10.1073/pnas.2020": {
+            "title": "Cryo EM Structures of KCC1",
+            "authors": None,
+            "year": 2020,
+        }
+    }
+    Path(config["registry_path"]).write_text(json.dumps(registry), encoding="utf-8")
+
+    refs = [
+        {
+            "number": 1,
+            "raw": "Bhatt et al., PNAS 2020",
+            "doi": None,
+            "title": "Cryo-EM structures of KCC1",
+            "year": 2020,
+            "fill_failed": False,
+        }
+    ]
+    pj = _make_paperjson_with_refs(refs=refs)
+
+    (tmp_vault / "Papers" / "Test Citing Paper.md").write_text(
+        "# Test Citing Paper\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+
+    result = biblio.run_biblio(pj, config)
+    assert not result.startswith("[biblio warning:"), f"run_biblio failed: {result}"
+
+    note_content = (tmp_vault / "Papers" / "Test Citing Paper.md").read_text(encoding="utf-8")
+    assert "[[Cryo EM Structures of KCC1]]" in note_content, (
+        "Doiless ref matching DOI-keyed registry entry must still render as [[wikilink]]"
+    )
+
+    stubs = list((tmp_vault / "Stubs").iterdir())
+    assert len(stubs) == 0, (
+        f"No stub should be created for a ref that resolves to an in-vault paper; "
+        f"got {[s.name for s in stubs]}"
+    )
