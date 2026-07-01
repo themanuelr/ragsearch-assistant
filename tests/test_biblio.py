@@ -342,46 +342,158 @@ def test_biblio_failure_does_not_abort_ingest(tmp_vault, config):
 
 
 def test_upgrade_merges_cited_by_into_full_note(tmp_vault, config):
-    """BIBLIO-04f / SC3: after upgrade via run_biblio, full note frontmatter has cited_by."""
+    """BIBLIO-04f / SC3: after upgrade via run_biblio, full note frontmatter has cited_by
+    and the citing note's REAL miss-branch line is relinked (closes Gap F bug 2).
+
+    Rewritten from the masking version (04-09): the citing-note fixture is now produced
+    by an actual run_biblio miss render — never a hand-seeded "[[wikilink]]" — so the
+    backlink-rewrite assertion exercises the real on-disk text a stub-matched reference
+    is rendered as.
+    """
     from scripts import biblio  # noqa: PLC0415
 
-    paper_title = "Deep Learning"
-    stub_key = _registry_key({"title": paper_title})
-    citing_note_rel = "Papers/Citing Paper.md"
+    paper_b_title = "Deep Learning"
+    citer_a_path = "Papers/Citer A.md"
 
-    # Pre-write the citing note that already references this paper as a stub
-    (tmp_vault / "Papers" / "Citing Paper.md").write_text(
-        "\n## References\n\n[[Deep Learning]]\n\n## My Notes\n\n",
+    # Step 1: run a REAL run_biblio pass for Citer A with a single doiless ref to
+    # paper B. This creates a title-hash-keyed Stubs/Deep Learning.md AND writes
+    # Citer A's ## References section using the actual miss-branch render — the
+    # exact real-world text bug 2's masking fixture bypassed.
+    refs_a = [
+        {
+            "number": 1,
+            "raw": "LeCun et al., Deep Learning, Nature 2015",
+            "doi": None,
+            "title": paper_b_title,
+            "year": 2015,
+            "fill_failed": False,
+        }
+    ]
+    pj_a = _make_paperjson_with_refs(refs=refs_a)
+    pj_a["extraction"]["metadata"]["title"] = "Citer A"
+    pj_a["extraction"]["metadata"]["doi"] = "10.9999/citer-a"
+
+    (tmp_vault / "Papers" / "Citer A.md").write_text(
+        "# Citer A\n\n## My Notes\n\n",
         encoding="utf-8",
     )
+    result_a = biblio.run_biblio(pj_a, config)
+    assert not result_a.startswith("[biblio warning:"), f"run_biblio (citer A) failed: {result_a}"
 
-    # Pre-write the stub with cited_by pointing at the citing note
-    stub_file = tmp_vault / "Stubs" / "Deep Learning.md"
-    stub_file.write_text(
-        f'---\ntitle: "Deep Learning"\nstatus: stub\nstub_key: "{stub_key}"\n'
-        f'cited_by:\n  - "{citing_note_rel}"\n---\n\n',
-        encoding="utf-8",
+    citer_a_content_before = (tmp_vault / citer_a_path).read_text(encoding="utf-8")
+    assert "*(not yet in vault)*" in citer_a_content_before, (
+        "Setup precondition: Citer A's real miss-branch render must contain the "
+        "'(not yet in vault)' marker before upgrade"
     )
 
-    # Pre-write the full note (simulating step 12b — note.generate_note having run)
-    full_note_file = tmp_vault / "Papers" / "Deep Learning.md"
+    # Step 2: pre-write Papers/Deep Learning.md (simulating step 12b — note.generate_note
+    # having already run for the newly-ingested full note). The full note must exist
+    # or _inject_references_section raises and run_biblio returns a warning string.
+    full_note_file = tmp_vault / "Papers" / f"{paper_b_title}.md"
     full_note_file.write_text(
-        '---\ntitle: "Deep Learning"\nauthor: "LeCun"\n---\n\n# Deep Learning\n\n## My Notes\n\n',
+        f'---\ntitle: "{paper_b_title}"\nauthor: "LeCun"\n---\n\n'
+        f"# {paper_b_title}\n\n## My Notes\n\n",
         encoding="utf-8",
     )
 
-    # Build a paperjson whose self_key matches the stub (no DOI → title-hash key)
-    pj = _make_paperjson_with_refs(refs=[])
-    pj["extraction"]["metadata"]["title"] = paper_title
-    pj["extraction"]["metadata"]["doi"] = None  # force title-hash key to match stub_key
+    # Step 3: ingest paper B itself. doi=None isolates bug 2 — self_key already
+    # matches the title-hash stub (both were derived from the same doiless title),
+    # so the upgrade block fires; only the backlink rewrite is under test here.
+    pj_b = _make_paperjson_with_refs(refs=[])
+    pj_b["extraction"]["metadata"]["title"] = paper_b_title
+    pj_b["extraction"]["metadata"]["doi"] = None
 
-    result = biblio.run_biblio(pj, config)
+    result_b = biblio.run_biblio(pj_b, config)
+    assert not result_b.startswith("[biblio warning:"), f"run_biblio (paper B) failed: {result_b}"
 
-    assert not result.startswith("[biblio warning:"), f"run_biblio failed unexpectedly: {result}"
-    assert not stub_file.exists(), "Stub must be deleted after upgrade"
+    assert not (tmp_vault / "Stubs" / f"{paper_b_title}.md").exists(), (
+        "Stub must be deleted after upgrade"
+    )
     full_note_content = full_note_file.read_text(encoding="utf-8")
     assert "cited_by:" in full_note_content, "Full note must have cited_by in frontmatter after upgrade"
-    assert citing_note_rel in full_note_content, "cited_by must include the citing note path"
+    assert citer_a_path in full_note_content, "cited_by must include the citing note path"
+
+    citer_a_content_after = (tmp_vault / citer_a_path).read_text(encoding="utf-8")
+    assert f"[[{paper_b_title}]]" in citer_a_content_after, (
+        "Citer A's real miss-branch line must be relinked to [[full title]] "
+        "(bug 2: rewrite must target the actual rendered text, not an idealized wikilink)"
+    )
+    assert "(not yet in vault)" not in citer_a_content_after, (
+        "Citer A's '(not yet in vault)' marker must be gone after backlink rewrite"
+    )
+
+
+def test_stub_upgrade_fires_when_new_ingest_carries_doi(tmp_vault, config):
+    """BIBLIO-04g / SC3: a DOI-bearing new ingest still finds and upgrades a
+    pre-existing title-hash-keyed stub (closes Gap F bug 1 — the DOI-vs-title-hash
+    self_key mismatch on the UPGRADE axis, symmetric to the 04-07 DEDUP fix)."""
+    from scripts import biblio  # noqa: PLC0415
+
+    paper_b_title = "Deep Learning"
+    paper_b_doi = "10.1038/s41586-019-1438-2"
+    citer_a_path = "Papers/Citer A.md"
+
+    # Step 1: same real-fixture setup — Citer A cites paper B doiless, producing a
+    # title-hash-keyed Stubs/Deep Learning.md and a real miss-branch citing line.
+    refs_a = [
+        {
+            "number": 1,
+            "raw": "LeCun et al., Deep Learning, Nature 2015",
+            "doi": None,
+            "title": paper_b_title,
+            "year": 2015,
+            "fill_failed": False,
+        }
+    ]
+    pj_a = _make_paperjson_with_refs(refs=refs_a)
+    pj_a["extraction"]["metadata"]["title"] = "Citer A"
+    pj_a["extraction"]["metadata"]["doi"] = "10.9999/citer-a"
+
+    (tmp_vault / "Papers" / "Citer A.md").write_text(
+        "# Citer A\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_a = biblio.run_biblio(pj_a, config)
+    assert not result_a.startswith("[biblio warning:"), f"run_biblio (citer A) failed: {result_a}"
+
+    stub_file = tmp_vault / "Stubs" / f"{paper_b_title}.md"
+    assert stub_file.exists(), "Setup precondition: title-hash stub must exist before upgrade"
+    stub_content_before = stub_file.read_text(encoding="utf-8")
+    assert "sha256:" in stub_content_before, (
+        "Setup precondition: stub must be keyed by a title-hash (doiless ref), not a DOI"
+    )
+
+    # Step 2: pre-write the full note (simulating step 12b).
+    full_note_file = tmp_vault / "Papers" / f"{paper_b_title}.md"
+    full_note_file.write_text(
+        f'---\ntitle: "{paper_b_title}"\nauthor: "LeCun"\n---\n\n'
+        f"# {paper_b_title}\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+
+    # Step 3: ingest paper B itself — THIS TIME its own metadata carries a real DOI
+    # the original title-hash stub never had (pins bug 1).
+    pj_b = _make_paperjson_with_refs(refs=[])
+    pj_b["extraction"]["metadata"]["title"] = paper_b_title
+    pj_b["extraction"]["metadata"]["doi"] = paper_b_doi
+
+    result_b = biblio.run_biblio(pj_b, config)
+    assert not result_b.startswith("[biblio warning:"), f"run_biblio (paper B) failed: {result_b}"
+
+    assert not stub_file.exists(), "Stub must be deleted after upgrade (bug 1 fix)"
+
+    full_note_content = full_note_file.read_text(encoding="utf-8")
+    assert "cited_by:" in full_note_content, "Full note must have cited_by in frontmatter after upgrade"
+    assert citer_a_path in full_note_content, "cited_by must include the citing note path"
+
+    citer_a_content_after = (tmp_vault / citer_a_path).read_text(encoding="utf-8")
+    assert f"[[{paper_b_title}]]" in citer_a_content_after, (
+        "Citer A's real miss-branch line must be relinked to [[full title]] "
+        "(bug 1: a DOI-bearing new ingest must still find the title-hash-keyed stub)"
+    )
+    assert "(not yet in vault)" not in citer_a_content_after, (
+        "Citer A's '(not yet in vault)' marker must be gone after backlink rewrite"
+    )
 
 
 # ---------------------------------------------------------------------------
