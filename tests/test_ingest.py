@@ -5569,6 +5569,143 @@ def test_crossref_title_to_doi_request_includes_type_filter():
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 04 Plan 08 Task 1 (Gap E): bounded retry on transient Crossref
+# transport errors in _crossref_title_to_doi.
+# ---------------------------------------------------------------------------
+
+def test_crossref_title_to_doi_retries_on_transient_error():
+    """A transient URLError/TimeoutError on the first attempt, followed by a
+    success, still returns the DOI when crossref_retries=2 — the lookup is
+    retried with a short backoff instead of permanently dropping the DOI.
+
+    FAILS today: the current code makes exactly one urlopen call and fail-opens
+    to None on the first error; scripts.ingest.time.sleep also does not exist
+    yet to patch (AttributeError) until Task 2 adds `import time`.
+    """
+    import json as _json
+    from scripts.ingest import (  # type: ignore[attr-defined]
+        _crossref_title_to_doi,
+        _CROSSREF_TITLE_MATCH_MIN_SCORE,
+    )
+
+    above_payload = _json.dumps({
+        "message": {
+            "items": [
+                {
+                    "DOI": "10.1073/pnas.retry",
+                    "score": _CROSSREF_TITLE_MATCH_MIN_SCORE + 1.0,
+                    "title": ["A Retried Paper Title"],
+                }
+            ]
+        }
+    }).encode()
+
+    cfg = {"crossref_contact_email": "real@example.com", "crossref_retries": 2}
+
+    # Sub-case A: URLError then success
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=[_urllib_error.URLError("blip"), _FakeHttpResponse(above_payload)],
+    ) as mock_urlopen, mock.patch("scripts.ingest.time.sleep") as mock_sleep:
+        result = _crossref_title_to_doi("A Retried Paper Title", cfg)
+
+    assert result == "10.1073/pnas.retry", (
+        f"Expected DOI after retry-then-success, got {result!r}"
+    )
+    assert mock_urlopen.call_count == 2, (
+        f"Expected urlopen called twice (fail then succeed), got {mock_urlopen.call_count}"
+    )
+    assert mock_sleep.called, "Expected a backoff sleep between retry attempts"
+
+    # Sub-case B: TimeoutError then success
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=[TimeoutError("timed out"), _FakeHttpResponse(above_payload)],
+    ) as mock_urlopen, mock.patch("scripts.ingest.time.sleep"):
+        result_b = _crossref_title_to_doi("A Retried Paper Title", cfg)
+
+    assert result_b == "10.1073/pnas.retry", (
+        f"Expected DOI after TimeoutError-then-success, got {result_b!r}"
+    )
+    assert mock_urlopen.call_count == 2, (
+        f"Expected urlopen called twice (timeout then succeed), got {mock_urlopen.call_count}"
+    )
+
+
+def test_crossref_title_to_doi_exhausts_retries_fails_open():
+    """When every bounded attempt raises a transient transport error, the
+    lookup fails open to None; retries are exhausted, not infinite.
+
+    FAILS today: urlopen is called only once (no retry loop exists yet).
+    """
+    from scripts.ingest import _crossref_title_to_doi  # type: ignore[attr-defined]
+
+    cfg = {"crossref_contact_email": "real@example.com", "crossref_retries": 2}
+
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=_urllib_error.URLError("blip"),
+    ) as mock_urlopen, mock.patch("scripts.ingest.time.sleep"):
+        result = _crossref_title_to_doi("An Unreachable Title", cfg)
+
+    assert result is None, f"Expected None on exhausted retries, got {result!r}"
+    assert mock_urlopen.call_count == 2, (
+        f"Expected urlopen called exactly crossref_retries=2 times, got {mock_urlopen.call_count}"
+    )
+
+
+def test_crossref_title_to_doi_default_single_attempt():
+    """With crossref_retries unset (default 1), a transient error still yields
+    None after exactly one urlopen call — the offline/opt-out default and
+    prior single-attempt behavior are unchanged.
+    """
+    from scripts.ingest import _crossref_title_to_doi  # type: ignore[attr-defined]
+
+    cfg = {"crossref_contact_email": "real@example.com"}  # no crossref_retries key
+
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=_urllib_error.URLError("blip"),
+    ) as mock_urlopen, mock.patch("scripts.ingest.time.sleep") as mock_sleep:
+        result = _crossref_title_to_doi("A Title", cfg)
+
+    assert result is None, f"Expected None on transient error, got {result!r}"
+    assert mock_urlopen.call_count == 1, (
+        f"Expected exactly one urlopen call by default (crossref_retries unset), "
+        f"got {mock_urlopen.call_count}"
+    )
+    assert not mock_sleep.called, "No backoff sleep expected when there is no retry"
+
+
+def test_crossref_title_to_doi_does_not_retry_on_json_error():
+    """A malformed (non-JSON) response body is a real 'no match' answer, not a
+    transient transport error — it must NOT be retried even when
+    crossref_retries=2.
+
+    FAILS today only insofar as scripts.ingest.time.sleep does not yet exist
+    to patch; the call-count-of-one assertion already holds pre-fix, but is
+    kept as the negative-space sentinel for Task 2's implementation.
+    """
+    from scripts.ingest import _crossref_title_to_doi  # type: ignore[attr-defined]
+
+    malformed_response = _FakeHttpResponse(b"not valid json {{{")
+    cfg = {"crossref_contact_email": "real@example.com", "crossref_retries": 2}
+
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        return_value=malformed_response,
+    ) as mock_urlopen, mock.patch("scripts.ingest.time.sleep") as mock_sleep:
+        result = _crossref_title_to_doi("A Title", cfg)
+
+    assert result is None, f"Expected None on malformed JSON body, got {result!r}"
+    assert mock_urlopen.call_count == 1, (
+        f"Expected exactly one urlopen call — JSON errors are not retried, "
+        f"got {mock_urlopen.call_count}"
+    )
+    assert not mock_sleep.called, "No backoff sleep expected when JSON errors are not retried"
+
+
 def test_enrich_skipped_when_crossref_disabled():
     """_enrich_references_with_crossref is a strict no-op when crossref_validate=False (offline default).
 
