@@ -2203,6 +2203,23 @@ def _run_fill_cascade(
                 _note_result = note.generate_note(_cached_paperjson, config)
                 if isinstance(_note_result, str) and _note_result.startswith("[note error:"):
                     _log(f"registry-hit note generation failed: {_note_result}")
+
+                # Step 9b: Bibliography linking on the cache-hit path (D-09 — non-fatal
+                # tail stage; gap-closure 04-06 / closes Gap B). Mirrors the Step 12c
+                # miss-path hook so a registry-known paper whose note is (re)generated
+                # here also gets its ## References section linked and stub-upgrade
+                # detection run. Reuses _cached_paperjson (already loaded for note
+                # regen) as the skeleton arg — never re-reads the cache file.
+                try:
+                    from scripts import biblio as biblio_mod
+                    _biblio_result = biblio_mod.run_biblio(_cached_paperjson, config)
+                    if isinstance(_biblio_result, str) and _biblio_result.startswith("[biblio warning:"):
+                        _log(f"registry-hit bibliography linking: {_biblio_result}")
+                except Exception as e:
+                    print(
+                        f"[biblio warning: registry-hit bibliography linking failed: {e}]",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
         return cached  # cache hit: return immediately, zero fill calls
