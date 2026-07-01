@@ -55,6 +55,12 @@ _FRONTMATTER_KEY_RE = re.compile(r"^stub_key:\s*['\"]?(.+?)['\"]?\s*$", re.MULTI
 # Regex for stripping existing ## References section on re-link (idempotency)
 _REFS_SECTION_RE = re.compile(r"\n## References\n[\s\S]*?(?=\n## |\Z)")
 
+# Miss-branch marker appended by _render_references_markdown for a stub-matched
+# reference (see the exact f-string there). Single source of truth so the
+# upgrade-path backlink rewrite (04-09/Gap F bug 2) targets the ACTUAL rendered
+# text instead of an idealized wikilink the miss branch never produces.
+_STUB_MISS_MARKER = " *(not yet in vault)*"
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -402,7 +408,7 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
 
                 # Markdown-injection guard: emit as numbered list item, never as heading (T-04-04)
                 display_raw = _repair_math_escapes(raw or stub_title)
-                lines.append(f"{number}. {display_raw} *(not yet in vault)*")
+                lines.append(f"{number}. {display_raw}{_STUB_MISS_MARKER}")
 
         except Exception as e:
             _log(f"ref {i} failed, emitting raw: {e}")
@@ -483,7 +489,16 @@ def run_biblio(paperjson: dict, config: dict) -> str:
         # failure is swallowed and citing_path is still returned (D-09).
         try:
             metadata = paperjson.get("extraction", {}).get("metadata", {})
-            self_key = _match_key(metadata)
+            # 04-09/Gap F bug 1: consult the same stub-title-index the 04-07 miss
+            # branch uses BEFORE falling back to _match_key, so a DOI-bearing new
+            # ingest still resolves a pre-existing title-hash-keyed stub (the stub's
+            # original citers never captured a DOI for it). Falls back to today's
+            # _match_key(metadata) byte-for-byte when no title-index hit exists.
+            self_title = metadata.get("title") or ""
+            stub_title_index = _build_stub_title_index(config)
+            dedup_norm = _normalize_title_for_dedup(self_title) if self_title else ""
+            indexed_self_key = stub_title_index.get(dedup_norm) if dedup_norm else None
+            self_key = indexed_self_key if indexed_self_key else _match_key(metadata)
             stub_path = _find_stub_by_key(self_key, config)
             if stub_path:
                 vault_root = _vault_root(config)
@@ -667,7 +682,6 @@ def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
 
     cited_by = _parse_cited_by(stub_content)
     stub_title_raw = _parse_frontmatter_field(stub_content, "title")
-    stub_title = _sanitize_filename(stub_title_raw) if stub_title_raw else stub_abs.stem
 
     full_note_abs = vault_root / full_note_path
     full_note_content = full_note_abs.read_text(encoding="utf-8")
@@ -676,10 +690,13 @@ def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
         _sanitize_filename(full_title_raw) if full_title_raw else full_note_abs.stem
     )
 
-    stub_link = f"[[{stub_title}]]"
-    full_link = f"[[{full_link_title}]]"
+    # 04-09/Gap F bug 2: a stub-matched reference is rendered by the miss branch as
+    # PLAIN TEXT ("{number}. {display} *(not yet in vault)*"), never a "[[stub_title]]"
+    # wikilink — so match on the ACTUAL rendered form instead of an idealized wikilink.
+    stub_norm = _normalize_title_for_dedup(stub_title_raw) if stub_title_raw else ""
 
-    # Rewrite [[stub_title]] → [[full_title]] in each citing note (bounded to cited_by)
+    # Rewrite the real miss-branch line -> [[full_title]] in each citing note (bounded
+    # to cited_by). Scoped to the ## References section only (Pitfall 7).
     for citing_path in cited_by:
         abs_citing = _resolve_citing_path(citing_path, vault_root)
         if abs_citing is None:
@@ -688,22 +705,43 @@ def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
             citing_content = abs_citing.read_text(encoding="utf-8")
         except OSError:
             continue
-        if stub_link not in citing_content:
-            continue
-        # Scope replacement to ## References section only (Pitfall 7)
+
         refs_match = re.search(
             r"\n## References\n([\s\S]*?)(?=\n## |\Z)", citing_content
         )
-        if refs_match:
-            refs_section = refs_match.group(0).replace(stub_link, full_link)
-            updated = (
-                citing_content[: refs_match.start()]
-                + refs_section
-                + citing_content[refs_match.end() :]
-            )
-        else:
-            # No \n## References marker — global replace as fallback
-            updated = citing_content.replace(stub_link, full_link)
+        if not refs_match:
+            # No \n## References marker — skip rather than corrupt (Pitfall 7 intent)
+            continue
+
+        refs_section = refs_match.group(0)
+        section_lines = refs_section.split("\n")
+        changed = False
+        for i, line in enumerate(section_lines):
+            rstripped = line.rstrip()
+            if not rstripped.endswith(_STUB_MISS_MARKER):
+                continue
+            display_and_prefix = rstripped[: -len(_STUB_MISS_MARKER)]
+            sep_idx = display_and_prefix.find(". ")
+            if sep_idx == -1:
+                continue
+            prefix = display_and_prefix[: sep_idx + 2]
+            display = display_and_prefix[sep_idx + 2 :]
+            display_norm = _normalize_title_for_dedup(display)
+            if stub_norm and (
+                stub_norm in display_norm or stub_norm == display_norm
+            ):
+                section_lines[i] = f"{prefix}[[{full_link_title}]]"
+                changed = True
+
+        if not changed:
+            continue
+
+        updated_refs_section = "\n".join(section_lines)
+        updated = (
+            citing_content[: refs_match.start()]
+            + updated_refs_section
+            + citing_content[refs_match.end() :]
+        )
         vault_relative = abs_citing.relative_to(vault_root).as_posix()
         create_note(vault_relative, updated, config, overwrite=True)
 
