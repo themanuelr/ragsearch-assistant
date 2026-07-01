@@ -170,6 +170,52 @@ def _match_key(ref_or_meta: dict) -> str:
     return "sha256:" + digest[:_TITLE_HASH_PREFIX_LEN]
 
 
+def _normalize_title_for_dedup(title: str) -> str:
+    """Stricter dedup normalizer for the stub-title-index (04-07 / Gap C mode 2).
+
+    Delegates to _normalize_title_for_match (NFKD accent-fold + lowercase +
+    punctuation-to-space collapse) then removes all remaining space characters,
+    so hyphen/space/joined title variants (e.g. 'cation-chloride', 'cation
+    chloride', 'cationchloride') all converge to the same string.
+
+    Used ONLY for stub-dedup convergence via the stub-title-index — _match_key
+    and _normalize_title_for_match are left byte-stable so the stub-upgrade
+    self_key and Layer-2 wikilink matching are unchanged.
+    """
+    normalized = _normalize_title_for_match(title)
+    return normalized.replace(" ", "")
+
+
+def _build_stub_title_index(config: dict) -> dict:
+    """Build a read-only dedup-normalized-title -> stub_key index from Stubs/.
+
+    Scans vault/Stubs/*.md, parsing each stub's `title` and `stub_key`
+    frontmatter fields. Maps _normalize_title_for_dedup(title) -> stub_key for
+    every stub with a non-empty title and stub_key. Read-only over the local
+    Stubs/ directory only — no registry access, no network (D-08). Returns {}
+    when Stubs/ is absent; tolerates per-file OSError by skipping (mirrors
+    _find_stub_by_key).
+    """
+    vault_root = _vault_root(config)
+    stubs_dir = vault_root / "Stubs"
+    index: dict[str, str] = {}
+    if not stubs_dir.is_dir():
+        return index
+    for stub_file in stubs_dir.glob("*.md"):
+        try:
+            content = stub_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        key_match = _FRONTMATTER_KEY_RE.search(content)
+        stub_key = key_match.group(1).strip() if key_match else ""
+        title = _parse_frontmatter_field(content, "title")
+        if title and stub_key:
+            norm = _normalize_title_for_dedup(title)
+            if norm:
+                index[norm] = stub_key
+    return index
+
+
 def _find_stub_by_key(key: str, config: dict) -> str | None:
     """Return vault-relative stub path for key, or None if not found.
 
@@ -295,12 +341,16 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
     Resolution chain (Layer 1 + Layer 2, fully offline):
       - Layer 1: exact DOI registry hit
       - Layer 2: normalized-title index hit (accent-folded, no network)
-      - Miss: dedup-or-create stub using _match_key for stable cross-citer identity
+      - Miss: dedup via stub-title-index (04-07), else create stub keyed by _match_key
     """
     registry_path = config.get("registry_path", "")
 
     # Build the title index ONCE before the per-ref loop (Layer 2 prerequisite)
     title_index = _build_title_index(registry_path) if registry_path else {}
+
+    # Build the stub-title-index ONCE before the per-ref loop (04-07 dedup prerequisite).
+    # Read-only over vault/Stubs/ — updated in-memory below so intra-run duplicates converge.
+    stub_title_index = _build_stub_title_index(config)
 
     lines = []
 
@@ -327,9 +377,15 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
                 lines.append(f"{number}. [[{display_title}]]")
             else:
                 # Registry miss: dedup-or-create stub (D-06 / BIBLIO-03)
-                # Use _match_key for cross-citer dedup (accent-folded, stable identity)
-                stub_key = _match_key(ref)
                 stub_title = title or raw
+
+                # 04-07: consult the stub-title-index BEFORE computing _match_key so a
+                # doiless ref converges onto an existing DOI-keyed stub, and hyphen/
+                # space/joined title variants converge onto each other (Gap C).
+                dedup_norm = _normalize_title_for_dedup(stub_title)
+                indexed_key = stub_title_index.get(dedup_norm) if dedup_norm else None
+                stub_key = indexed_key if indexed_key else _match_key(ref)
+
                 stub_filename = _sanitize_filename(stub_title)
                 stub_path = f"Stubs/{stub_filename}.md"
                 existing_stub = _find_stub_by_key(stub_key, config)
@@ -340,6 +396,9 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
                     # New stub — safe default won't clobber an existing stub (overwrite=False)
                     stub_content = _render_stub(ref, stub_key, citing_path)
                     create_note(stub_path, stub_content, config, overwrite=False)
+                    # Register in-memory so a later ref in the SAME run converges (04-07)
+                    if dedup_norm:
+                        stub_title_index[dedup_norm] = stub_key
 
                 # Markdown-injection guard: emit as numbered list item, never as heading (T-04-04)
                 display_raw = _repair_math_escapes(raw or stub_title)
