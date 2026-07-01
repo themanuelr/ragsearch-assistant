@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -1192,6 +1193,11 @@ _CROSSREF_TITLE_TYPE_FILTER: str = (
     "type:journal-article,type:posted-content,type:proceedings-article,type:book-chapter"
 )
 
+# Backoff slept between bounded retry attempts on a transient transport error
+# (URLError / TimeoutError) in _crossref_title_to_doi. Bounded by crossref_retries
+# (default 1 = no retry, byte-identical to prior single-attempt behavior).
+_CROSSREF_RETRY_BACKOFF_SECONDS: float = 0.5
+
 
 def _crossref_title_to_doi(title: str, config: dict) -> str | None:
     """Search Crossref by bibliographic title and return the top DOI if above threshold.
@@ -1207,13 +1213,20 @@ def _crossref_title_to_doi(title: str, config: dict) -> str | None:
         highest-scoring item (items[0] from the already-sorted Crossref response).
       - Returns the item's DOI when its score >= _CROSSREF_TITLE_MATCH_MIN_SCORE,
         else returns None (T-04-05-02 false-match gate, first layer).
-      - Returns None on empty items list, sub-threshold score, or any
-        (URLError, TimeoutError, JSONDecodeError, KeyError, IndexError, TypeError)
-        — fail-open, one quiet stderr line (T-04-05-03 / mirrors _crossref_journal_full).
+      - Retries a bounded number of times (config["crossref_retries"], default 1 =
+        single attempt, unchanged) ONLY on a transient transport error
+        (URLError / TimeoutError), sleeping _CROSSREF_RETRY_BACKOFF_SECONDS between
+        attempts (Gap E). A malformed JSON body, empty items, sub-threshold score, or
+        KeyError/IndexError/TypeError/ValueError are real "no match" answers and are
+        NOT retried.
+      - Returns None on empty items list, sub-threshold score, malformed JSON body, or
+        exhausted transient-error retries — fail-open, one quiet stderr line
+        (T-04-05-03 / mirrors _crossref_journal_full).
 
     Args:
         title:  Reference title string (LLM-filled; may contain any unicode).
-        config: Loaded config dict; reads crossref_contact_email for User-Agent.
+        config: Loaded config dict; reads crossref_contact_email for User-Agent and
+                crossref_retries for the bounded attempt count (default 1).
 
     Returns:
         DOI string (e.g. "10.1073/pnas.x") or None.
@@ -1235,12 +1248,23 @@ def _crossref_title_to_doi(title: str, config: dict) -> str | None:
         "User-Agent",
         f"ragsearch-assistant/1.3 (mailto:{contact})",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=config.get("crossref_timeout", 30)) as resp:
-            data = json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        _log("crossref title->doi lookup unavailable")
-        return None  # fail-open — one quiet log line; ingest proceeds
+
+    attempts = max(1, int(config.get("crossref_retries", 1)))
+    data = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=config.get("crossref_timeout", 30)) as resp:
+                data = json.loads(resp.read())
+            break  # success — stop retrying
+        except (urllib.error.URLError, TimeoutError):
+            if attempt < attempts - 1:
+                time.sleep(_CROSSREF_RETRY_BACKOFF_SECONDS)
+                continue
+            _log("crossref title->doi lookup unavailable")
+            return None  # fail-open after exhausting bounded retries
+        except json.JSONDecodeError:
+            _log("crossref title->doi lookup unavailable")
+            return None  # malformed body is a real answer — not retried
 
     # Extract top item (Crossref returns items ranked by relevance score)
     try:
