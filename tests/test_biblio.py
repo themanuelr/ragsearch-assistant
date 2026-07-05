@@ -271,26 +271,38 @@ def test_stub_upgrade_moves_to_papers(tmp_vault, config):
 
 
 def test_stub_upgrade_rewrites_backlinks(tmp_vault, config):
-    """BIBLIO-04b: a citing note's [[stub title]] becomes [[full title]] after upgrade."""
+    """BIBLIO-04b: a citing note's real miss-branch line becomes [[full title]] after upgrade.
+
+    Updated for WR-02 (code review): upgrade_stub is now a thin wrapper over
+    _upgrade_stub — the single implementation used by run_biblio — so the citing
+    note fixture uses the ACTUAL miss-branch render form (raw text + marker +
+    <!--stub:{key}--> anchor), never an idealized [[stub title]] wikilink the
+    miss branch never produces (04-09/Gap F bug 2).
+    """
     from scripts import biblio  # noqa: PLC0415
+    stub_key = "sha256:testkey0001xxxx"
     stub_path = tmp_vault / "Stubs" / "Dl Placeholder.md"
     stub_path.write_text(
-        "---\nstatus: stub\nstub_key: \"sha256:testkey0001xxxx\"\ncited_by:\n  - \"Citing Paper A\"\n---\n",
+        f"---\ntitle: \"Dl Placeholder\"\nstatus: stub\nstub_key: \"{stub_key}\"\n"
+        "cited_by:\n  - \"Citing Paper A\"\n---\n",
         encoding="utf-8",
     )
     citing_note = tmp_vault / "Papers" / "Citing Paper A.md"
     citing_note.write_text(
-        "## References\n\n- [[Dl Placeholder]]\n\n## My Notes\n\n",
+        "# Citing Paper A\n\n## References\n\n"
+        f"1. LeCun et al., 2015{biblio._STUB_MISS_MARKER}{biblio._stub_anchor(stub_key)}\n"
+        "\n## My Notes\n\n",
         encoding="utf-8",
     )
     biblio.upgrade_stub(
-        stub_key="sha256:testkey0001xxxx",
+        stub_key=stub_key,
         full_title="Deep Learning",
         vault_path=config["vault_path"],
     )
     updated = citing_note.read_text(encoding="utf-8")
-    assert "[[Deep Learning]]" in updated, "Backlink must be rewritten to [[full title]]"
-    assert "[[Dl Placeholder]]" not in updated, "Old stub wikilink must be removed"
+    assert "1. [[Deep Learning]]" in updated, "Backlink must be rewritten to [[full title]]"
+    assert "(not yet in vault)" not in updated, "Miss marker must be gone after rewrite"
+    assert biblio._stub_anchor(stub_key) not in updated, "Stub anchor must be gone after rewrite"
 
 
 def test_stubs_not_registered(tmp_vault, config):

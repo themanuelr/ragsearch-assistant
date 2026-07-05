@@ -805,8 +805,13 @@ def upgrade_stub(stub_key: str, full_title: str, vault_path: str) -> None:
     Upgrade a stub to a full note: rewrite cited_by backlinks and delete stub.
 
     Called when a previously-stubbed paper is later fully ingested (BIBLIO-04 / D-07).
-    Backlink replacement is scoped to the ## References section of each citing note
-    to avoid accidental replacement in other sections (Pitfall 7).
+
+    Thin wrapper over _upgrade_stub — the single implementation of stub→note
+    promotion (WR-02: the former standalone implementation here diverged from
+    the code path run_biblio actually exercises, so bugfixes applied to one did
+    not reach the other). Resolves the stub path from stub_key, ensures a
+    placeholder Papers/ note exists (ingest will overwrite it with full
+    content), then delegates.
 
     Args:
         stub_key:   The registry key stored in the stub's stub_key frontmatter field.
@@ -814,56 +819,14 @@ def upgrade_stub(stub_key: str, full_title: str, vault_path: str) -> None:
         vault_path: Absolute path to the vault root.
     """
     config = {"vault_path": vault_path}
-    vault_root = _vault_root(config)
 
     # Find stub by scanning stub_key frontmatter
     stub_path = _find_stub_by_key(stub_key, config)
     if not stub_path:
         return  # No stub for this key — nothing to upgrade
 
-    stub_abs = vault_root / stub_path
-    stub_content = stub_abs.read_text(encoding="utf-8")
-
-    # Parse stub title (for old wikilink form) and cited_by list
-    stub_title_raw = _parse_frontmatter_field(stub_content, "title")
-    stub_title = (
-        _sanitize_filename(stub_title_raw) if stub_title_raw else stub_abs.stem
-    )
-    full_link_title = _sanitize_filename(full_title)
-    cited_by = _parse_cited_by(stub_content)
-
-    stub_link = f"[[{stub_title}]]"
-    full_link = f"[[{full_link_title}]]"
-
-    # Rewrite [[stub_title]] → [[full_title]] in each citing note (bounded to cited_by)
-    for citing_path in cited_by:
-        abs_citing = _resolve_citing_path(citing_path, vault_root)
-        if abs_citing is None:
-            continue
-        try:
-            citing_content = abs_citing.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if stub_link not in citing_content:
-            continue
-        # Scope replacement to ## References section (Pitfall 7)
-        refs_match = re.search(
-            r"\n## References\n([\s\S]*?)(?=\n## |\Z)", citing_content
-        )
-        if refs_match:
-            refs_section = refs_match.group(0).replace(stub_link, full_link)
-            updated = (
-                citing_content[: refs_match.start()]
-                + refs_section
-                + citing_content[refs_match.end() :]
-            )
-        else:
-            # No \n## References marker (e.g. section at top of file) — global replace
-            updated = citing_content.replace(stub_link, full_link)
-        vault_relative = abs_citing.relative_to(vault_root).as_posix()
-        create_note(vault_relative, updated, config, overwrite=True)
-
     # Create placeholder Papers/ note (ingest will overwrite with full content)
+    full_link_title = _sanitize_filename(full_title)
     full_note_path = f"Papers/{full_link_title}.md"
     if not note_exists(full_note_path, config):
         create_note(
@@ -873,14 +836,7 @@ def upgrade_stub(stub_key: str, full_title: str, vault_path: str) -> None:
             overwrite=False,
         )
 
-    # Delete stub (not via create_note — actual filesystem deletion)
-    try:
-        stub_abs.unlink()
-    except OSError as e:
-        print(
-            f"[biblio warning: could not delete stub {stub_path}: {e}]",
-            file=sys.stderr,
-        )
+    _upgrade_stub(stub_path, full_note_path, config)
 
 
 # ---------------------------------------------------------------------------
