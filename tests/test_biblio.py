@@ -818,6 +818,34 @@ def test_dedup_normalization_strips_separators(tmp_vault, config):
     ), "_normalize_title_for_dedup must still fold accents"
 
 
+def test_stub_frontmatter_escapes_backslash_in_title(tmp_vault, config):
+    """CR-01 (code review): a title with a trailing backslash must not break the
+    stub's YAML frontmatter — backslashes are escaped BEFORE quotes so the closing
+    quote survives and subsequent keys (cited_by:) are not swallowed."""
+    from scripts import biblio  # noqa: PLC0415
+
+    ref = {
+        "number": 1,
+        "raw": "Evil et al., 2020",
+        "doi": None,
+        "title": "Structure of X\\",  # literal trailing backslash (LaTeX-ish)
+        "year": 2020,
+        "fill_failed": False,
+    }
+    rendered = biblio._render_stub(ref, "sha256:deadbeefdeadbeef", "Papers/Citer.md")
+
+    # The escaped form must double the backslash so it cannot escape the closing quote
+    assert 'title: "Structure of X\\\\"' in rendered, (
+        f"Backslash must be escaped as \\\\ inside the double-quoted title; got:\n{rendered}"
+    )
+    # The frontmatter structure must survive: cited_by block still parseable
+    assert biblio._parse_cited_by(rendered) == ["Papers/Citer.md"], (
+        "cited_by must remain a parseable frontmatter block after backslash escaping"
+    )
+    # And the helper itself escapes in the correct order (backslash first, then quote)
+    assert biblio._yaml_escape('a\\"b') == 'a\\\\\\"b'
+
+
 def test_layer2_wikilink_unregressed_by_dedup(tmp_vault, config):
     """GUARD (04-07): a doiless ref to an in-vault DOI-keyed paper still renders a
     [[wikilink]] and creates NO stub after the dedup change (Layer-2 unregressed)."""

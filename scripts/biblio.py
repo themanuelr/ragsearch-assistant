@@ -78,6 +78,17 @@ def _log(msg: str) -> None:
 # Core helpers
 # ---------------------------------------------------------------------------
 
+def _yaml_escape(value: str) -> str:
+    """Escape a string for safe interpolation into a double-quoted YAML scalar.
+
+    Backslashes MUST be escaped before quotes (order matters): a trailing
+    backslash would otherwise escape the closing quote and swallow subsequent
+    frontmatter keys into the string value (CR-01 — plausible for LaTeX-bearing
+    scientific titles, cf. _repair_math_escapes).
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _ref_key(ref: dict) -> str:
     """Derive the registry/stub key for a single RefEntry dict (D-05).
 
@@ -255,9 +266,9 @@ def _render_stub(ref: dict, stub_key: str, cited_by_path: str) -> str:
     raw = ref.get("raw") or ""
     today = datetime.date.today().isoformat()
 
-    title_esc = title.replace('"', '\\"')
-    key_esc = stub_key.replace('"', '\\"')
-    doi_line = f'doi: "{doi}"' if doi else ""
+    title_esc = _yaml_escape(title)
+    key_esc = _yaml_escape(stub_key)
+    doi_line = f'doi: "{_yaml_escape(doi)}"' if doi else ""
     year_line = f"year: {year}" if year else ""
 
     frontmatter_lines = [
@@ -274,7 +285,7 @@ def _render_stub(ref: dict, stub_key: str, cited_by_path: str) -> str:
         f'stub_key: "{key_esc}"',
         f"date_created: {today}",
         "cited_by:",
-        f'  - "{cited_by_path}"',
+        f'  - "{_yaml_escape(cited_by_path)}"',
         "---",
         "",
     ]
@@ -329,10 +340,10 @@ def _append_cited_by(stub_path: str, citing_path: str, config: dict) -> None:
 
     insert_at = last_entry_idx if last_entry_idx >= 0 else cited_by_idx
     if insert_at >= 0:
-        lines.insert(insert_at + 1, f'  - "{citing_path}"')
+        lines.insert(insert_at + 1, f'  - "{_yaml_escape(citing_path)}"')
     else:
         # cited_by block not found — append (shouldn't happen for well-formed stubs)
-        lines.append(f'  - "{citing_path}"')
+        lines.append(f'  - "{_yaml_escape(citing_path)}"')
 
     updated = "\n".join(lines)
     create_note(stub_path, updated, config, overwrite=True)
@@ -614,7 +625,7 @@ def _merge_cited_by_into_note(full_note_path: str, cited_by: list, config: dict)
     if not new_paths:
         return
 
-    new_entry_lines = [f'  - "{p}"' for p in new_paths]
+    new_entry_lines = [f'  - "{_yaml_escape(p)}"' for p in new_paths]
 
     lines = content.split("\n")
     fm_count = 0
