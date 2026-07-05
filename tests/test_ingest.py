@@ -480,6 +480,7 @@ def _make_ingest_config(tmp_path, extra=None):
         "registry_path": str(tmp_path / "registry.json"),
         "project_name": "test-project",
         "mineru_path": "/fake/mineru",
+        "paperjson_cache_dir": str(tmp_path / ".paperjson_cache"),
     }
     if extra:
         cfg.update(extra)
@@ -1120,6 +1121,7 @@ def _make_ingest_config_with_probe(tmp_path, extra=None):
         "registry_path": str(tmp_path / "registry.json"),
         "project_name": "test-project",
         "mineru_path": "/fake/mineru",
+        "paperjson_cache_dir": str(tmp_path / ".paperjson_cache"),
     }
     if extra:
         cfg.update(extra)

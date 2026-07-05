@@ -2388,7 +2388,9 @@ def _run_fill_cascade(
 
     # Step 11b: PaperJSON cache write (D-06 — surviving, gitignored)
     _log("cache write")
-    cache_path = _write_paperjson_cache(skeleton, cache_stem)
+    cache_path = _write_paperjson_cache(
+        skeleton, cache_stem, cache_dir=config.get("paperjson_cache_dir", ".paperjson_cache")
+    )
 
     # Step 12: Registry write (filelock + atomic, REG-01 / REG-04)
     if registry_path:
