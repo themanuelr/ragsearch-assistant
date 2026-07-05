@@ -918,6 +918,28 @@ def test_cited_by_dedup_scoped_to_frontmatter_block(tmp_vault, config):
     assert biblio._parse_cited_by(content).count("Papers/Second Citer.md") == 1
 
 
+def test_match_key_rejects_malformed_doi(tmp_vault, config):
+    """WR-04 (code review): _match_key must not accept a syntactically invalid
+    'DOI' as a stable identity key — it falls back to the title-hash chain so
+    the key converges with a later valid-DOI cite or real ingest."""
+    from scripts import biblio  # noqa: PLC0415
+
+    title = "Deep Learning"
+    title_hash_key = biblio._match_key({"doi": None, "title": title})
+    assert title_hash_key.startswith("sha256:"), "Precondition: doiless key is a title hash"
+
+    # Malformed DOIs (no 10.<digits>/ prefix, truncated, junk) → title-hash fallback
+    for bad_doi in ["doi:pending", "10./truncated", "not-a-doi", "10.12/short"]:
+        assert biblio._match_key({"doi": bad_doi, "title": title}) == title_hash_key, (
+            f"Malformed DOI {bad_doi!r} must fall back to the title-hash key"
+        )
+
+    # A syntactically valid DOI is still used verbatim
+    assert biblio._match_key({"doi": "10.1038/s41586-019-1438-2", "title": title}) == (
+        "10.1038/s41586-019-1438-2"
+    )
+
+
 def test_stub_frontmatter_escapes_backslash_in_title(tmp_vault, config):
     """CR-01 (code review): a title with a trailing backslash must not break the
     stub's YAML frontmatter — backslashes are escaped BEFORE quotes so the closing

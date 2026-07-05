@@ -33,6 +33,7 @@ from scripts.ingest import (
     _check_registry,
     _read_registry,
     _load_config,
+    _syntactic_doi_valid,
     _TITLE_HASH_PREFIX_LEN,
 )
 from scripts.note import _sanitize_filename, _repair_math_escapes
@@ -182,13 +183,19 @@ def _resolve_ref_in_registry(
 def _match_key(ref_or_meta: dict) -> str:
     """Derive the identity key for stub dedup and upgrade detection.
 
-    DOI if present, else "sha256:<16-hex-chars>" derived from the
-    accent-folded normalized title (via _normalize_title_for_match).
-    Uses _TITLE_HASH_PREFIX_LEN so the format is byte-identical to
-    _registry_key for ASCII-only titles.
+    DOI if present AND syntactically valid, else "sha256:<16-hex-chars>"
+    derived from the accent-folded normalized title (via
+    _normalize_title_for_match). Uses _TITLE_HASH_PREFIX_LEN so the format is
+    byte-identical to _registry_key for ASCII-only titles.
+
+    WR-04: a malformed "DOI" from the reference-batch LLM fill must never
+    become a permanent stub/registry key — it would diverge from the key a
+    later valid-DOI cite or real ingest derives (same gate ingest.py Step 7
+    applies via _syntactic_doi_valid). Malformed DOIs fall back to the
+    title-hash chain.
     """
     doi = ref_or_meta.get("doi")
-    if doi:
+    if doi and _syntactic_doi_valid(doi):
         return doi
     title = ref_or_meta.get("title") or ""
     norm = _normalize_title_for_match(title)
