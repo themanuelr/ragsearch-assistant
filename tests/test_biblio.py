@@ -888,6 +888,36 @@ def test_upgrade_does_not_relink_unrelated_reference(tmp_vault, config):
     assert (tmp_vault / "Stubs" / "Deep Learning.md").exists()
 
 
+def test_cited_by_dedup_scoped_to_frontmatter_block(tmp_vault, config):
+    """WR-03 (code review): the 'already listed' check in _append_cited_by must be
+    scoped to the parsed cited_by block — a quoted occurrence of the citing path
+    in the stub BODY (e.g. inside the raw citation text) must not suppress the
+    append and silently lose the backlink (BIBLIO-03b accumulation guarantee)."""
+    from scripts import biblio  # noqa: PLC0415
+
+    stub_rel = "Stubs/Poisoned Stub.md"
+    (tmp_vault / "Stubs" / "Poisoned Stub.md").write_text(
+        '---\ntitle: "Poisoned Stub"\nauthors: []\nstatus: stub\n'
+        'stub_key: "sha256:poison0000000000"\ncited_by:\n  - "Papers/First Citer.md"\n---\n\n'
+        "**Raw citation:**\n"
+        'See also "Papers/Second Citer.md" in the appendix.\n',  # body collision
+        encoding="utf-8",
+    )
+
+    biblio._append_cited_by(stub_rel, "Papers/Second Citer.md", config)
+
+    content = (tmp_vault / "Stubs" / "Poisoned Stub.md").read_text(encoding="utf-8")
+    assert biblio._parse_cited_by(content) == [
+        "Papers/First Citer.md",
+        "Papers/Second Citer.md",
+    ], "Second citer must be appended despite a quoted body occurrence of its path"
+
+    # Idempotency: a second call with the same path must NOT duplicate the entry
+    biblio._append_cited_by(stub_rel, "Papers/Second Citer.md", config)
+    content = (tmp_vault / "Stubs" / "Poisoned Stub.md").read_text(encoding="utf-8")
+    assert biblio._parse_cited_by(content).count("Papers/Second Citer.md") == 1
+
+
 def test_stub_frontmatter_escapes_backslash_in_title(tmp_vault, config):
     """CR-01 (code review): a title with a trailing backslash must not break the
     stub's YAML frontmatter — backslashes are escaped BEFORE quotes so the closing

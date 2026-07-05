@@ -323,8 +323,10 @@ def _append_cited_by(stub_path: str, citing_path: str, config: dict) -> None:
     abs_path = vault_root / stub_path
     content = abs_path.read_text(encoding="utf-8")
 
-    # Fast check: already listed?
-    if f'"{citing_path}"' in content or f"'{citing_path}'" in content:
+    # Already listed? Scoped to the parsed cited_by frontmatter block — a raw
+    # substring search over the whole file could false-positive on the stub's
+    # body (e.g. the raw citation text) and silently drop the backlink (WR-03).
+    if citing_path in set(_parse_cited_by(content)):
         return
 
     # Find insertion point: after the last "  - " entry in the cited_by block
