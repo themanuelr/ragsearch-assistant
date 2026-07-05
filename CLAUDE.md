@@ -47,7 +47,9 @@ Full architecture reference: .planning/codebase/ARCHITECTURE.md
 
 ## Project Skills
 
-No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skills/`, `.cursor/skills/`, `.github/skills/`, or `.codex/skills/` with a `SKILL.md` index file.
+| Skill | Description | Path |
+| ----- | ----------- | ---- |
+| obsidian-note-format | Authoritative reference for how this project writes Obsidian vault notes — frontmatter, callouts, tags, filenames, encoding, and the direct atomic write mechanism. | `.claude/skills/obsidian-note-format/SKILL.md` |
 <!-- GSD:skills-end -->
 
 <!-- GSD:workflow-start source:GSD defaults -->
