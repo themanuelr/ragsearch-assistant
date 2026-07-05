@@ -940,6 +940,33 @@ def test_match_key_rejects_malformed_doi(tmp_vault, config):
     )
 
 
+def test_missing_citing_note_short_circuits_before_stub_creation(tmp_vault, config):
+    """WR-05 (code review): if the citing note does not exist (e.g. step 12b's
+    note.generate_note failed non-fatally), run_biblio must return a
+    [biblio warning:] BEFORE creating any stubs or mutating cited_by lists —
+    otherwise stubs are left with dangling backlinks a later successful re-run
+    will not repair (the 'already listed' dedup treats them as recorded)."""
+    from scripts import biblio  # noqa: PLC0415
+
+    refs = [
+        {"number": 1, "raw": "LeCun et al., Nature 2015", "doi": None,
+         "title": "Deep Learning", "year": 2015, "fill_failed": False},
+    ]
+    pj = _make_paperjson_with_refs(refs=refs)
+    # Deliberately do NOT pre-write Papers/Test Citing Paper.md
+
+    result = biblio.run_biblio(pj, config)
+
+    assert result.startswith("[biblio warning:"), (
+        f"run_biblio must warn when the citing note is missing; got {result!r}"
+    )
+    stubs = list((tmp_vault / "Stubs").iterdir())
+    assert stubs == [], (
+        f"No stubs may be created when the citing note is missing (non-atomic "
+        f"side effects); got {[s.name for s in stubs]}"
+    )
+
+
 def test_stub_frontmatter_escapes_backslash_in_title(tmp_vault, config):
     """CR-01 (code review): a title with a trailing backslash must not break the
     stub's YAML frontmatter — backslashes are escaped BEFORE quotes so the closing

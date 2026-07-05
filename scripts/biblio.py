@@ -514,6 +514,16 @@ def run_biblio(paperjson: dict, config: dict) -> str:
         )
         citing_path = f"Papers/{_sanitize_filename(title)}.md"
 
+        # WR-05: verify the citing note exists BEFORE _process_refs runs — stub
+        # creation and cited_by mutation are side effects that cannot be rolled
+        # back, so a missing citing note (e.g. step 12b's note.generate_note
+        # failed non-fatally) must short-circuit here rather than leave stubs
+        # with dangling cited_by backlinks after the injection step fails.
+        # Mirrors the FileNotFoundError guard in _inject_references_section.
+        vault_root = _vault_root(config)
+        if not (vault_root / citing_path).exists():
+            return f"[biblio warning: citing note not found: {citing_path}]"
+
         refs_markdown = _process_refs(refs, citing_path, config)
         _inject_references_section(citing_path, refs_markdown, config)
 
