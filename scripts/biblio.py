@@ -62,6 +62,18 @@ _REFS_SECTION_RE = re.compile(r"\n## References\n[\s\S]*?(?=\n## |\Z)")
 _STUB_MISS_MARKER = " *(not yet in vault)*"
 
 
+def _stub_anchor(stub_key: str) -> str:
+    """Invisible HTML-comment anchor tying a rendered miss-branch line to its stub.
+
+    Appended after _STUB_MISS_MARKER at render time and matched EXACTLY at
+    upgrade time, so backlink rewriting never has to infer identity from prose
+    (CR-02: substring matching on normalized titles false-positives across
+    unrelated references, e.g. "Learning" vs "... Deep Learning ...").
+    HTML comments are hidden in Obsidian's reading view.
+    """
+    return f"<!--stub:{stub_key}-->"
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -418,8 +430,13 @@ def _render_references_markdown(refs: list, config: dict, citing_path: str) -> s
                         stub_title_index[dedup_norm] = stub_key
 
                 # Markdown-injection guard: emit as numbered list item, never as heading (T-04-04)
+                # The trailing _stub_anchor carries the EXACT stub_key so the
+                # upgrade-path rewrite can identify this line without fuzzy
+                # title matching (CR-02).
                 display_raw = _repair_math_escapes(raw or stub_title)
-                lines.append(f"{number}. {display_raw}{_STUB_MISS_MARKER}")
+                lines.append(
+                    f"{number}. {display_raw}{_STUB_MISS_MARKER}{_stub_anchor(stub_key)}"
+                )
 
         except Exception as e:
             _log(f"ref {i} failed, emitting raw: {e}")
@@ -694,6 +711,14 @@ def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
     cited_by = _parse_cited_by(stub_content)
     stub_title_raw = _parse_frontmatter_field(stub_content, "title")
 
+    # CR-02: the rendered miss-branch line carries an exact <!--stub:{key}-->
+    # anchor (see _render_references_markdown). Match on that anchor — never on
+    # fuzzy prose — so upgrading one stub can never relink an unrelated
+    # reference whose text happens to contain this stub's title as a substring.
+    key_match = _FRONTMATTER_KEY_RE.search(stub_content)
+    stub_key = key_match.group(1).strip() if key_match else ""
+    anchor = _stub_anchor(stub_key) if stub_key else ""
+
     full_note_abs = vault_root / full_note_path
     full_note_content = full_note_abs.read_text(encoding="utf-8")
     full_title_raw = _parse_frontmatter_field(full_note_content, "title")
@@ -701,9 +726,10 @@ def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
         _sanitize_filename(full_title_raw) if full_title_raw else full_note_abs.stem
     )
 
-    # 04-09/Gap F bug 2: a stub-matched reference is rendered by the miss branch as
-    # PLAIN TEXT ("{number}. {display} *(not yet in vault)*"), never a "[[stub_title]]"
-    # wikilink — so match on the ACTUAL rendered form instead of an idealized wikilink.
+    # Legacy fallback (lines rendered before the anchor scheme): a stub-matched
+    # reference is PLAIN TEXT ("{number}. {display} *(not yet in vault)*"), never
+    # a "[[stub_title]]" wikilink (04-09/Gap F bug 2). For those lines require
+    # EXACT normalized-title equality — substring containment is forbidden (CR-02).
     stub_norm = _normalize_title_for_dedup(stub_title_raw) if stub_title_raw else ""
 
     # Rewrite the real miss-branch line -> [[full_title]] in each citing note (bounded
@@ -729,20 +755,34 @@ def _upgrade_stub(stub_path: str, full_note_path: str, config: dict) -> None:
         changed = False
         for i, line in enumerate(section_lines):
             rstripped = line.rstrip()
-            if not rstripped.endswith(_STUB_MISS_MARKER):
+            if anchor and rstripped.endswith(anchor):
+                # Exact identity via the invisible anchor (CR-02) — strip it,
+                # then strip the miss marker it was appended after.
+                candidate = rstripped[: -len(anchor)]
+                anchor_matched = True
+            elif rstripped.endswith(_STUB_MISS_MARKER):
+                # Legacy line without an anchor — candidate only; identity is
+                # confirmed below by EXACT normalized-title equality.
+                candidate = rstripped
+                anchor_matched = False
+            else:
                 continue
-            display_and_prefix = rstripped[: -len(_STUB_MISS_MARKER)]
+            if not candidate.endswith(_STUB_MISS_MARKER):
+                continue
+            display_and_prefix = candidate[: -len(_STUB_MISS_MARKER)]
             sep_idx = display_and_prefix.find(". ")
             if sep_idx == -1:
                 continue
             prefix = display_and_prefix[: sep_idx + 2]
             display = display_and_prefix[sep_idx + 2 :]
-            display_norm = _normalize_title_for_dedup(display)
-            if stub_norm and (
-                stub_norm in display_norm or stub_norm == display_norm
-            ):
-                section_lines[i] = f"{prefix}[[{full_link_title}]]"
-                changed = True
+            if not anchor_matched:
+                # CR-02: exact equality only — NEVER substring containment,
+                # which false-positives across unrelated references.
+                display_norm = _normalize_title_for_dedup(display)
+                if not stub_norm or display_norm != stub_norm:
+                    continue
+            section_lines[i] = f"{prefix}[[{full_link_title}]]"
+            changed = True
 
         if not changed:
             continue

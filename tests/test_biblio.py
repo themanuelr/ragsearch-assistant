@@ -818,6 +818,64 @@ def test_dedup_normalization_strips_separators(tmp_vault, config):
     ), "_normalize_title_for_dedup must still fold accents"
 
 
+def test_upgrade_does_not_relink_unrelated_reference(tmp_vault, config):
+    """CR-02 (code review): upgrading a stub whose normalized title is a character
+    substring of ANOTHER unresolved reference's text must NOT rewrite that other
+    reference's line. Identity comes from the exact <!--stub:{key}--> anchor
+    rendered by the miss branch, never from fuzzy substring matching
+    (e.g. 'learning' in 'lecunetaldeeplearningnature2015')."""
+    from scripts import biblio  # noqa: PLC0415
+
+    # Citer A cites TWO different not-in-vault papers: the short/generic
+    # "Learning" and "Deep Learning" (whose rendered raw text contains
+    # "Learning" as a substring after normalization).
+    refs = [
+        {"number": 1, "raw": "Short, 2020", "doi": None,
+         "title": "Learning", "year": 2020, "fill_failed": False},
+        {"number": 2, "raw": "LeCun et al., Deep Learning, Nature 2015", "doi": None,
+         "title": "Deep Learning", "year": 2015, "fill_failed": False},
+    ]
+    pj_a = _make_paperjson_with_refs(refs=refs)
+    pj_a["extraction"]["metadata"]["title"] = "Citer A"
+    pj_a["extraction"]["metadata"]["doi"] = "10.9999/citer-a"
+
+    (tmp_vault / "Papers" / "Citer A.md").write_text(
+        "# Citer A\n\n## My Notes\n\n",
+        encoding="utf-8",
+    )
+    result_a = biblio.run_biblio(pj_a, config)
+    assert not result_a.startswith("[biblio warning:"), f"run_biblio (citer A) failed: {result_a}"
+    stubs = sorted(p.name for p in (tmp_vault / "Stubs").iterdir())
+    assert stubs == ["Deep Learning.md", "Learning.md"], f"Setup precondition: two stubs, got {stubs}"
+
+    # Ingest "Learning" itself — its stub upgrades and Citer A's ref 1 relinks.
+    full_note_file = tmp_vault / "Papers" / "Learning.md"
+    full_note_file.write_text(
+        '---\ntitle: "Learning"\n---\n\n# Learning\n\n## My Notes\n\n',
+        encoding="utf-8",
+    )
+    pj_b = _make_paperjson_with_refs(refs=[])
+    pj_b["extraction"]["metadata"]["title"] = "Learning"
+    pj_b["extraction"]["metadata"]["doi"] = None
+    result_b = biblio.run_biblio(pj_b, config)
+    assert not result_b.startswith("[biblio warning:"), f"run_biblio (paper B) failed: {result_b}"
+
+    citer_content = (tmp_vault / "Papers" / "Citer A.md").read_text(encoding="utf-8")
+    assert "1. [[Learning]]" in citer_content, (
+        "Ref 1 ('Learning') must be relinked to [[Learning]] after upgrade"
+    )
+    assert "LeCun et al., Deep Learning, Nature 2015 *(not yet in vault)*" in citer_content, (
+        "Ref 2 ('Deep Learning') is UNRELATED and must remain an unresolved "
+        "miss-branch line — substring matching must not relink it (CR-02)"
+    )
+    assert citer_content.count("[[Learning]]") == 1, (
+        "Exactly one line must be relinked — no cross-reference contamination"
+    )
+    # The upgraded stub is gone; the unrelated stub survives
+    assert not (tmp_vault / "Stubs" / "Learning.md").exists()
+    assert (tmp_vault / "Stubs" / "Deep Learning.md").exists()
+
+
 def test_stub_frontmatter_escapes_backslash_in_title(tmp_vault, config):
     """CR-01 (code review): a title with a trailing backslash must not break the
     stub's YAML frontmatter — backslashes are escaped BEFORE quotes so the closing
