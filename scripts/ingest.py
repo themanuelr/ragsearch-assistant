@@ -2219,6 +2219,7 @@ def _run_fill_cascade(
         # generate_note self-skips when the note already exists (force=False, D-16), so this
         # is idempotent and runs zero LLM fill calls. A note failure never fails the ingest.
         pj_path = cached.get("paperjson_path") or ""
+        _note_regenerated = False
         if pj_path and pathlib.Path(pj_path).exists():
             try:
                 from scripts import note as note
@@ -2227,6 +2228,11 @@ def _run_fill_cascade(
                 _note_result = note.generate_note(_cached_paperjson, config)
                 if isinstance(_note_result, str) and _note_result.startswith("[note error:"):
                     _log(f"registry-hit note generation failed: {_note_result}")
+                else:
+                    # generate_note self-skips existing notes and returns the vault-relative
+                    # path (D-16) — that is still an honest "note present" state, so it
+                    # counts as regenerated for confirmation-line purposes (Todo T-rie-01).
+                    _note_regenerated = True
 
                 # Step 9b: Bibliography linking on the cache-hit path (D-09 — non-fatal
                 # tail stage; gap-closure 04-06 / closes Gap B). Mirrors the Step 12c
@@ -2246,6 +2252,28 @@ def _run_fill_cascade(
                     )
             except Exception as e:
                 print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
+        elif pj_path:
+            # Registry/cache desync (Todo T-rie-01/T-rie-02): the registry claims this
+            # paper is already processed but the PaperJSON analysis artifact it points to
+            # is missing on disk. Note/biblio regeneration is skipped and no vault write
+            # happens — warn loudly so this silent "nothing happened" state is surfaced.
+            print(
+                f"[ingest warning: registry/cache desync for registry_key={registry_key!r} — "
+                f"PaperJSON cache file missing at {pj_path!r}; note/biblio regeneration skipped, "
+                "no vault write performed]",
+                file=sys.stderr,
+            )
+        else:
+            # Registry hit but no paperjson_path was ever recorded for this entry — milder
+            # than a desync (nothing to have regenerated from), just log it.
+            _log(f"registry cache-hit for {registry_key} has no paperjson_path recorded; note/biblio regeneration skipped")
+
+        if not _note_regenerated:
+            # Transient signal keys for main()'s confirmation builder — added AFTER the
+            # only _write_registry call in this branch, so they never reach the registry
+            # file. Popped before _emit_result so -o/--print JSON output stays unchanged.
+            cached["_note_skipped"] = True
+            cached["_note_skip_pj"] = pj_path or ""
         return cached  # cache hit: return immediately, zero fill calls
 
     # Steps 10–12 (miss path): fill → renditions → registry write
@@ -2791,7 +2819,13 @@ if __name__ == "__main__":
                 or "Untitled"
             )
             safe_name = _note_mod._sanitize_filename(title)
-            note_path = f"Papers/{safe_name}.md"
+            if isinstance(result, dict) and result.get("_note_skipped"):
+                # Honest cache-hit skip line (Todo T-rie-01): a note was never
+                # regenerated for this run, so never claim a Papers/<title>.md write.
+                skip_pj = result.get("_note_skip_pj") or "(no cache path recorded)"
+                note_line = f"Note:  [skipped — registry cache-hit, PaperJSON unavailable at {skip_pj}]"
+            else:
+                note_line = f"Note:  Papers/{safe_name}.md"
             # Cache path: derive from pdf stem (PDF) or web cache stem (URL)
             if args.pdf:
                 cache_path = result.get("paperjson_path") or str(
@@ -2801,9 +2835,15 @@ if __name__ == "__main__":
                 cache_path = result.get("paperjson_path") or str(
                     pathlib.Path(".paperjson_cache", _web_cache_stem(args.url) + ".json").resolve()
                 )
-            confirmation = f"Cache: {cache_path}\nNote:  {note_path}"
+            confirmation = f"Cache: {cache_path}\n{note_line}"
         except Exception:
             pass  # fallback to default "[ingest] done." line
+
+        # Pop transient cache-hit skip signal keys before any JSON emission (-o/--print)
+        # so they never leak into on-disk or stdout PaperJSON output.
+        if isinstance(result, dict):
+            result.pop("_note_skipped", None)
+            result.pop("_note_skip_pj", None)
 
         _emit_result(result, args.output, print_json=args.print_json, confirmation=confirmation)
     except SystemExit:

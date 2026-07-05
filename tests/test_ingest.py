@@ -1184,6 +1184,61 @@ def test_ingest_cache_hit_doi_probe_skips_fill(tmp_path):
     )
 
 
+def test_ingest_cache_hit_missing_paperjson_skips_note_and_warns(tmp_path, capsys):
+    """Cache hit whose recorded PaperJSON path is missing must not ghostwrite a Note line.
+
+    Todo T-rie-01/T-rie-02: the returned dict carries a skip signal for main()'s
+    confirmation builder, and a loud stderr desync warning names the missing path.
+    Modeled on test_ingest_cache_hit_doi_probe_skips_fill (same mock chain, same
+    missing paperjson_path="/old/paper.json").
+    """
+    from scripts.ingest import ingest, _write_registry, DoiProbeResult
+
+    cfg = _make_ingest_config_with_probe(tmp_path)
+    reg_path = cfg["registry_path"]
+
+    doi_key = "10.1000/probe.dedup.missing"
+    cached_entry = {
+        "title": "Cached Paper Title",
+        "doi": doi_key,
+        "projects": ["other"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": None, "journal": None, "arxiv_id": None,
+        "source_path": "/old/paper.pdf", "paperjson_path": "/old/paper.json",
+    }
+    _write_registry(cached_entry, reg_path, doi_key)
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake for missing paperjson desync")
+    cl_path = _write_content_list_for_probe(tmp_path)
+
+    probe_result = DoiProbeResult(doi=doi_key, arxiv_id=None, title="Cached Paper Title")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata",
+                    side_effect=AssertionError("_fill_metadata must not be called on cache hit")), \
+         mock.patch("scripts.ingest._fill_section",
+                    side_effect=AssertionError("_fill_section must not be called on cache hit")), \
+         mock.patch("scripts.ingest._fill_references_batched",
+                    side_effect=AssertionError("_fill_references_batched must not be called on cache hit")):
+        result = ingest(str(fake_pdf), cfg)
+
+    assert result.get("_note_skipped") is True, f"Expected _note_skipped=True on missing-PaperJSON cache hit, got: {result}"
+    assert result.get("_note_skip_pj") == "/old/paper.json", (
+        f"Expected _note_skip_pj to carry the missing path, got: {result.get('_note_skip_pj')!r}"
+    )
+
+    captured = capsys.readouterr()
+    assert "desync" in captured.err, f"Expected a registry/cache desync warning on stderr, got: {captured.err!r}"
+    assert "/old/paper.json" in captured.err, (
+        f"Expected the missing PaperJSON path in the desync warning, got: {captured.err!r}"
+    )
+
+
 def test_ingest_normalizations_applied_llm_fill(tmp_path):
     """After ingest(), provenance.normalizations_applied contains ligature_fix and llm_fill (D-10)."""
     from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
