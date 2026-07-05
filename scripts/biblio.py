@@ -29,7 +29,6 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.ingest import (
-    _registry_key,
     _normalize_title,
     _check_registry,
     _read_registry,
@@ -101,12 +100,10 @@ def _yaml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _ref_key(ref: dict) -> str:
-    """Derive the registry/stub key for a single RefEntry dict (D-05).
-
-    Chain: DOI → title-hash only (RefEntry has no arxiv_id field — Pitfall 2).
-    """
-    return _registry_key({"doi": ref.get("doi"), "title": ref.get("title")})
+# NOTE (WR-01): the original `_ref_key` helper (DOI → title-hash-only chain via
+# _registry_key) was deleted — it re-encoded the exact Layer-2 matching bug
+# closed in 04-04 and had no remaining callers. Resolution goes through
+# _resolve_ref_in_registry + _match_key instead.
 
 
 # ---------------------------------------------------------------------------
