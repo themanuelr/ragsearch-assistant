@@ -502,6 +502,23 @@ def _write_real_content_list(tmp_path):
     return str(cl_path)
 
 
+@pytest.fixture(autouse=True)
+def _default_noop_embed(monkeypatch):
+    """Default every ingest() call to a no-op embed stub (Phase 5, 05-04).
+
+    The Step 12d (miss path) and Step 9c (cache-hit path) tail hooks in scripts/ingest.py
+    call scripts.embed.run_embed on every ingest() invocation. Without this fixture, any
+    pre-existing test that reaches the tail (and doesn't itself mock run_embed) makes a
+    REAL Ollama /api/embed call and writes into the real dev-machine repo-root chroma_db/
+    -- the exact same pollution class the paperjson_cache guard (T-rie-03) was built for,
+    except the chroma_db guard only catches brand-new paths, not new *documents* written
+    into an already-existing chroma.sqlite3. Tests that assert on run_embed itself
+    (test_ingest_invokes_embed_on_miss/on_cache_hit/embed_failure_does_not_abort_ingest)
+    override this default via their own `mock.patch("scripts.embed.run_embed", ...)`.
+    """
+    monkeypatch.setattr("scripts.embed.run_embed", lambda *a, **kw: "Papers/_stub.md")
+
+
 def test_dedup_skip_returns_cached(tmp_path):
     """When DOI probe key is already in registry, ingest() returns cached entry (REG-02).
 
@@ -5344,6 +5361,212 @@ def test_registry_cache_hit_biblio_failure_does_not_propagate(tmp_path):
 
     # run_biblio must have been invoked (proving the hook fired and its failure was swallowed)
     mock_run_biblio.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Plan 05-04 (EMBED-01): Step 12d (miss path) + Step 9c (cache-hit path) embed hooks
+# ---------------------------------------------------------------------------
+
+def test_ingest_invokes_embed_on_miss(tmp_path, monkeypatch):
+    """ingest() calls embed.run_embed once with the built skeleton on the miss path
+    (Step 12d, D-10)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={
+        "vault_name": "test-vault",
+        "chroma_db_path": str(tmp_path / "chroma_db"),
+    })
+
+    fake_pdf = tmp_path / "embedmiss.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for embed-miss test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "EmbedMiss Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "EmbedMiss Test Paper", "plain": "EmbedMiss Test Paper"},
+            {"type": "text", "display": "H" * 200, "plain": "H" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "EmbedMiss Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/embedmiss.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/embedmiss.test", arxiv_id=None, title="EmbedMiss Test Paper")
+    metadata_result = PaperMetadata(title="EmbedMiss Test Paper", doi="10.1000/embedmiss.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="EmbedMiss Test Paper " + "H" * 200, fill_failed=False)
+
+    mock_run_embed = mock.MagicMock(return_value="Papers/EmbedMiss Test Paper.md")
+
+    monkeypatch.chdir(tmp_path)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.note.generate_note", return_value="Papers/EmbedMiss Test Paper.md"), \
+         mock.patch("scripts.biblio.run_biblio", return_value="Papers/EmbedMiss Test Paper.md"), \
+         mock.patch("scripts.embed.run_embed", mock_run_embed):
+        result = ingest(str(fake_pdf), cfg)
+
+    mock_run_embed.assert_called_once()
+    call_args = mock_run_embed.call_args
+    pj_arg = call_args[0][0]
+    assert isinstance(pj_arg, dict), "run_embed should receive a dict (the built skeleton)"
+    assert "extraction" in pj_arg, "skeleton arg should have 'extraction' key"
+    assert "analysis" in pj_arg, "skeleton arg should have 'analysis' key"
+    cfg_arg = call_args[0][1]
+    assert isinstance(cfg_arg, dict), "run_embed should receive config as second arg"
+    assert isinstance(result, dict), "ingest() should return the skeleton dict on the miss path"
+
+
+def test_ingest_invokes_embed_on_cache_hit(tmp_path):
+    """On cache HIT with a valid paperjson_path, ingest() calls embed.run_embed with the
+    cached PaperJSON (the SAME dict used for note/biblio regen) — Step 9c, D-13/Gap B."""
+    from scripts.ingest import ingest, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={
+        "vault_name": "test-vault",
+        "chroma_db_path": str(tmp_path / "chroma_db"),
+    })
+    reg_path = cfg["registry_path"]
+
+    cache_file = tmp_path / "cached_paper_for_embed.json"
+    cached_paperjson = {
+        "extraction": {
+            "metadata": {"title": "Cached Paper For Embed", "authors": [], "year": 2024,
+                          "journal": None, "doi": "10.1000/embed.cachehit", "arxiv_id": None,
+                          "accession_codes": []},
+            "sections": [{"heading": "Intro", "body": "Some body text.", "fill_failed": False}],
+            "references": [],
+        },
+        "analysis": {"generated_by": None},
+        "provenance": {"schema_version": 2},
+    }
+    cache_file.write_text(json.dumps(cached_paperjson), encoding="utf-8")
+
+    cached_entry = {
+        "title": "Cached Paper For Embed",
+        "doi": "10.1000/embed.cachehit",
+        "projects": ["other-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/cached_embed.pdf",
+        "paperjson_path": str(cache_file),
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/embed.cachehit")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 embed cache-hit test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    from scripts.ingest import DoiProbeResult
+    probe_result = DoiProbeResult(doi="10.1000/embed.cachehit", arxiv_id=None, title="Cached Paper For Embed")
+
+    mock_gen_note = mock.MagicMock(return_value="Papers/Cached Paper For Embed.md")
+    mock_run_biblio = mock.MagicMock(return_value="Papers/Cached Paper For Embed.md")
+    mock_run_embed = mock.MagicMock(return_value="Papers/Cached Paper For Embed.md")
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value={
+             "title": "Cached Paper For Embed",
+             "sections": [{"heading": "", "level": 0, "blocks": [
+                 {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+             ]}],
+             "references": [],
+             "metadata": {"title": "Cached Paper For Embed", "authors": None, "year": 2024,
+                           "journal": None, "doi": "10.1000/embed.cachehit", "arxiv_id": None, "accession_codes": []},
+         }), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note.generate_note", mock_gen_note), \
+         mock.patch("scripts.biblio.run_biblio", mock_run_biblio), \
+         mock.patch("scripts.embed.run_embed", mock_run_embed):
+        result = ingest(str(fake_pdf), cfg)
+
+    mock_run_embed.assert_called_once()
+    call_args = mock_run_embed.call_args
+    pj_arg = call_args[0][0]
+    assert isinstance(pj_arg, dict), "run_embed should receive a dict (loaded PaperJSON)"
+    assert pj_arg == cached_paperjson, "run_embed should receive the SAME cached PaperJSON used for note/biblio regen"
+    cfg_arg = call_args[0][1]
+    assert isinstance(cfg_arg, dict), "run_embed should receive config as second arg"
+
+    assert result.get("title") == "Cached Paper For Embed"
+    assert result.get("doi") == "10.1000/embed.cachehit"
+
+
+def test_embed_failure_does_not_abort_ingest(tmp_path, monkeypatch):
+    """When embed.run_embed raises, ingest() still returns the built skeleton dict —
+    embedding is a non-fatal tail stage (D-10), mirroring the biblio/note contract."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={
+        "vault_name": "test-vault",
+        "chroma_db_path": str(tmp_path / "chroma_db"),
+    })
+
+    fake_pdf = tmp_path / "embedfail.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for embed-fail test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "EmbedFail Test Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "EmbedFail Test Paper", "plain": "EmbedFail Test Paper"},
+            {"type": "text", "display": "I" * 200, "plain": "I" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "EmbedFail Test Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/embedfail.test",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/embedfail.test", arxiv_id=None, title="EmbedFail Test Paper")
+    metadata_result = PaperMetadata(title="EmbedFail Test Paper", doi="10.1000/embedfail.test", year=2024)
+    section_fill = SectionFillResult(heading="", body="EmbedFail Test Paper " + "I" * 200, fill_failed=False)
+
+    def embed_explodes(*args, **kwargs):
+        raise RuntimeError("Ollama/Chroma exploded!")
+
+    monkeypatch.chdir(tmp_path)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)), \
+         mock.patch("scripts.note.generate_note", return_value="Papers/EmbedFail Test Paper.md"), \
+         mock.patch("scripts.biblio.run_biblio", return_value="Papers/EmbedFail Test Paper.md"), \
+         mock.patch("scripts.embed.run_embed", side_effect=embed_explodes):
+        # Must NOT raise — embed failure is best-effort on the miss path (D-10)
+        result = ingest(str(fake_pdf), cfg)
+
+    assert isinstance(result, dict), "ingest() should still return the skeleton dict when embed fails"
+    assert result["extraction"]["metadata"]["doi"] == "10.1000/embedfail.test"
 
 
 # ---------------------------------------------------------------------------
