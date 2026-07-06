@@ -15,6 +15,7 @@ from mcp.server.fastmcp import FastMCP
 OLLAMA_BASE = "http://localhost:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 INGEST_SCRIPT = pathlib.Path(__file__).parent.parent / "scripts" / "ingest.py"
+EMBED_SCRIPT = pathlib.Path(__file__).parent.parent / "scripts" / "embed.py"
 
 mcp = FastMCP("ollama-local")
 
@@ -268,6 +269,38 @@ def process_pdf(path: str) -> str:
     )
     if result.returncode != 0:
         return f"[process_pdf error: {result.stderr.strip()}]"
+    return result.stdout.strip()
+
+
+
+# ---------------------------------------------------------------------------
+# Semantic search tool
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_similar(query: str, n_results: int = 5) -> str:
+    """
+    Semantically search the vault's embedded papers and return ranked results.
+
+    Runs scripts/embed.py --query as a subprocess argv list (never via a shell),
+    mirroring process_pdf's gateway shape. Returns a JSON string: ranked papers grouped
+    by paper (title, registry_key, status, vault_note, similarity score, and
+    matching sections with per-section scores + excerpts), plus a separate
+    "cited but not yet ingested" stub block — stubs never compete with paper
+    hits for ranked slots. Render the JSON conversationally for the user.
+
+    Args:
+        query: Natural-language search query.
+        n_results: Number of ranked papers to return (default: 5).
+    """
+    result = subprocess.run(
+        [sys.executable, str(EMBED_SCRIPT), "--query", query, "--n-results", str(n_results)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return f"[search_similar error: {result.stderr.strip()}]"
     return result.stdout.strip()
 
 
