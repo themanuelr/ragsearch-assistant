@@ -253,6 +253,66 @@ def run_embed(paperjson: dict, config: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Search path (EMBED-02)
+# ---------------------------------------------------------------------------
+
+def _search(query: str, n_results: int, config: dict) -> dict:
+    """
+    Embed `query`, query the `papers` collection, and return paper-grouped,
+    ranked results.
+
+    D-06: hits are grouped by registry_key; each paper's score is its BEST
+    section score. D-08: excerpt = leading ~300 chars of the Chroma-stored
+    document. D-09: score = round(1 - cosine distance, 4), no relevance cutoff
+    -- up to n_results papers are always returned. The "stubs" block is an
+    empty list here (Plan 03 fills it in, D-15).
+    """
+    embed_model = config.get("embed_model", DEFAULT_EMBED_MODEL)
+    timeout = config.get("embed_timeout", 60)
+
+    query_result = _ollama_embed_call(
+        [f"{QUERY_PREFIX}{query}"], model=embed_model, timeout=timeout
+    )
+    if isinstance(query_result, str):
+        return {"papers": [], "stubs": [], "error": query_result}
+    query_vector = query_result[0]
+
+    collection = _get_collection(config)
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=n_results * 5,  # over-fetch sections so enough distinct papers surface (A3)
+        where={"status": "paper"},
+        include=["documents", "metadatas", "distances"],
+    )
+
+    docs = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    distances = (results.get("distances") or [[]])[0]
+
+    papers: dict = {}
+    for doc, meta, dist in zip(docs, metadatas, distances):
+        score = round(1 - dist, 4)
+        key = meta["registry_key"]
+        entry = papers.setdefault(key, {
+            "title": meta["title"],
+            "registry_key": key,
+            "status": meta["status"],
+            "vault_note": meta["vault_note"],
+            "score": score,
+            "sections": [],
+        })
+        entry["sections"].append({
+            "heading": meta["heading"],
+            "score": score,
+            "excerpt": doc[:300],
+        })
+        entry["score"] = max(entry["score"], score)  # D-06: rank by BEST section score
+
+    ranked = sorted(papers.values(), key=lambda p: p["score"], reverse=True)[:n_results]
+    return {"papers": ranked, "stubs": []}
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -271,16 +331,37 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Embed a PaperJSON v2 cache file's sections into the ChromaDB `papers` "
-            "collection."
+            "collection, or run a semantic search query against it."
         )
     )
     parser.add_argument(
         "paperjson",
+        nargs="?",
+        default=None,
         help="Path to a PaperJSON v2 cache file to embed.",
+    )
+    parser.add_argument(
+        "--query",
+        default=None,
+        help="Run a semantic search query instead of embedding a file.",
+    )
+    parser.add_argument(
+        "--n-results",
+        type=int,
+        default=5,
+        help="Number of ranked papers to return in --query mode (default: 5).",
     )
     args = parser.parse_args()
 
     config = _load_config()
+
+    if args.query is not None:
+        result = _search(args.query, args.n_results, config)
+        print(json.dumps(result))
+        return
+
+    if not args.paperjson:
+        parser.error("either a PaperJSON cache-file path or --query is required")
 
     with open(args.paperjson, encoding="utf-8") as f:
         paperjson = json.load(f)
