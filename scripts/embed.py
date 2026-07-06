@@ -393,13 +393,15 @@ def run_embed(paperjson: dict, config: dict) -> str:
 def _search(query: str, n_results: int, config: dict) -> dict:
     """
     Embed `query`, query the `papers` collection, and return paper-grouped,
-    ranked results.
+    ranked results plus a separate stub-hits block (D-15).
 
-    D-06: hits are grouped by registry_key; each paper's score is its BEST
-    section score. D-08: excerpt = leading ~300 chars of the Chroma-stored
-    document. D-09: score = round(1 - cosine distance, 4), no relevance cutoff
-    -- up to n_results papers are always returned. The "stubs" block is an
-    empty list here (Plan 03 fills it in, D-15).
+    D-06: paper hits are grouped by registry_key; each paper's score is its
+    BEST section score. D-08: excerpt = leading ~300 chars of the
+    Chroma-stored document. D-09: score = round(1 - cosine distance, 4), no
+    relevance cutoff -- up to n_results papers are always returned. Stub hits
+    are queried separately (status=="stub") and returned in "stubs", capped
+    to n_results, so they NEVER compete with paper section hits for ranked
+    slots (D-15) -- the query is embedded once and reused for both queries.
     """
     embed_model = config.get("embed_model", DEFAULT_EMBED_MODEL)
     timeout = config.get("embed_timeout", 60)
@@ -443,7 +445,32 @@ def _search(query: str, n_results: int, config: dict) -> dict:
         entry["score"] = max(entry["score"], score)  # D-06: rank by BEST section score
 
     ranked = sorted(papers.values(), key=lambda p: p["score"], reverse=True)[:n_results]
-    return {"papers": ranked, "stubs": []}
+
+    # Separate stub-hits query (D-15) — never merges into the papers block;
+    # the query embedding is reused, not recomputed.
+    stub_results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=n_results,
+        where={"status": "stub"},
+        include=["documents", "metadatas", "distances"],
+    )
+    stub_docs = (stub_results.get("documents") or [[]])[0]
+    stub_metadatas = (stub_results.get("metadatas") or [[]])[0]
+    stub_distances = (stub_results.get("distances") or [[]])[0]
+
+    stubs = [
+        {
+            "title": meta["title"],
+            "registry_key": meta["registry_key"],
+            "score": round(1 - dist, 4),
+            "excerpt": doc[:300],
+        }
+        for doc, meta, dist in zip(stub_docs, stub_metadatas, stub_distances)
+    ]
+    stubs.sort(key=lambda s: s["score"], reverse=True)
+    stubs = stubs[:n_results]
+
+    return {"papers": ranked, "stubs": stubs}
 
 
 # ---------------------------------------------------------------------------
