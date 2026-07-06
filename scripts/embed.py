@@ -187,12 +187,115 @@ def _delete_paper_entries(collection, registry_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stub sweep + stub-upgrade delete (EMBED-03, D-14/D-15/D-16)
+# ---------------------------------------------------------------------------
+
+_RAW_CITATION_RE = re.compile(r"\*\*Raw citation:\*\*\s*\n(.+?)(?:\n\s*\n|\Z)", re.DOTALL)
+
+
+def _stub_entry(stub_content: str, stub_filename: str, config: dict):
+    """
+    Build (id, doc, metadata) for one stub file's Chroma entry (D-15).
+
+    Reuses biblio.py's frontmatter parsing helpers (_parse_frontmatter_field,
+    _FRONTMATTER_KEY_RE) — never reimplements stub-field parsing. Document =
+    title + raw citation text (richer than title alone, D-15); metadata carries
+    status="stub" so it can never masquerade as a paper-section hit.
+    """
+    from scripts import biblio  # noqa: PLC0415
+
+    title = biblio._parse_frontmatter_field(stub_content, "title")
+    key_match = biblio._FRONTMATTER_KEY_RE.search(stub_content)
+    stub_key = key_match.group(1).strip() if key_match else ""
+    doi = biblio._parse_frontmatter_field(stub_content, "doi") or ""
+    year_raw = biblio._parse_frontmatter_field(stub_content, "year")
+    year = int(year_raw) if year_raw.isdigit() else 0
+
+    raw_match = _RAW_CITATION_RE.search(stub_content)
+    raw_citation = raw_match.group(1).strip() if raw_match else ""
+
+    doc = f"{title}\n{raw_citation}" if raw_citation else title
+    entry_id = f"{stub_key}::title::0"
+    metadata = {
+        "registry_key": stub_key,
+        "title": title,
+        "heading": "(stub)",
+        "part": 0,
+        "doi": doi,
+        "year": year,
+        "status": "stub",
+        "vault_note": f"Stubs/{stub_filename}",
+    }
+    return entry_id, doc, metadata
+
+
+def _sweep_stubs(collection, config: dict) -> list:
+    """
+    Scan vault/Stubs/*.md for stubs not yet embedded (D-14).
+
+    Returns a list of (id, doc, metadata) tuples for stubs pending embedding.
+    Per-stub skip-if-present bounds repeat-sweep cost to a cheap collection.get
+    (T-05-06) — genuinely new stubs only, no unbounded re-embedding.
+    """
+    from scripts import biblio  # noqa: PLC0415
+
+    vault_root = biblio._vault_root(config)
+    stubs_dir = vault_root / "Stubs"
+    pending: list = []
+    if not stubs_dir.is_dir():
+        return pending
+
+    for stub_file in stubs_dir.glob("*.md"):
+        try:
+            content = stub_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        key_match = biblio._FRONTMATTER_KEY_RE.search(content)
+        stub_key = key_match.group(1).strip() if key_match else ""
+        if not stub_key:
+            continue
+        existing = collection.get(
+            where={"$and": [{"registry_key": stub_key}, {"status": "stub"}]},
+            limit=1,
+        )
+        if existing["ids"]:
+            continue  # already embedded — skip-if-present
+        pending.append(_stub_entry(content, stub_file.name, config))
+    return pending
+
+
+def _upgrade_delete(collection, paperjson: dict, config: dict) -> None:
+    """
+    Delete an upgraded stub's Chroma entry in the same embed pass (D-16).
+
+    Re-derives self_key by replicating biblio.run_biblio's exact self_key
+    resolution order (stub-title-index lookup before falling back to
+    _match_key) — RESEARCH.md Pitfall #3 Option 1. NEVER a fresh title
+    normalizer here. The delete is scoped to status=="stub" so it can never
+    clobber the freshly-written paper sections even when self_key equals the
+    paper's own registry_key.
+    """
+    from scripts import biblio  # noqa: PLC0415
+
+    metadata = paperjson.get("extraction", {}).get("metadata", {}) or {}
+    title = metadata.get("title") or ""
+    stub_title_index = biblio._build_stub_title_index(config)
+    dedup_norm = biblio._normalize_title_for_dedup(title) if title else ""
+    indexed_self_key = stub_title_index.get(dedup_norm) if dedup_norm else None
+    self_key = indexed_self_key if indexed_self_key else biblio._match_key(metadata)
+
+    collection.delete(where={"$and": [{"registry_key": self_key}, {"status": "stub"}]})
+
+
+# ---------------------------------------------------------------------------
 # Write path (EMBED-01)
 # ---------------------------------------------------------------------------
 
 def run_embed(paperjson: dict, config: dict) -> str:
     """
-    Non-fatal tail stage: embed a paper's sections into the `papers` collection.
+    Non-fatal tail stage: embed a paper's sections into the `papers` collection,
+    sweep vault/Stubs/ for pending stub embeddings (D-14), and delete any stub
+    entry the paper being embedded upgrades (D-16).
 
     Returns the paper's vault-relative note path on success (or on skip-if-present
     no-op), or "[embed warning: ...]" on any unhandled failure (mirrors
@@ -209,20 +312,47 @@ def run_embed(paperjson: dict, config: dict) -> str:
 
         collection = _get_collection(config)
 
-        # Skip-if-present (D-13): zero Ollama calls, no gemma unload, on an
-        # already-embedded registry_key.
-        existing = collection.get(where={"registry_key": registry_key}, limit=1)
-        if existing["ids"]:
-            _log(f"skip-if-present: {registry_key} already embedded")
+        # Skip-if-present (D-13), status-scoped so a same-keyed stub entry
+        # never masks the need to embed the paper's own sections (05-03: a
+        # paper's registry_key can equal a stub's stub_key on upgrade).
+        existing = collection.get(
+            where={"$and": [{"registry_key": registry_key}, {"status": "paper"}]},
+            limit=1,
+        )
+        paper_needs_embed = not existing["ids"]
+
+        # Sweep vault/Stubs/ for anything not yet embedded (D-14), computed
+        # BEFORE deciding whether to return early.
+        pending_stubs = _sweep_stubs(collection, config)
+
+        # Upgrade-delete always runs — cheap, Ollama-free, idempotent (D-16).
+        _upgrade_delete(collection, paperjson, config)
+
+        if not paper_needs_embed and not pending_stubs:
+            _log(f"skip-if-present: {registry_key} already embedded, no pending stubs")
             return vault_note
 
         # Unload gemma before loading nomic-embed-text (D-11).
         gemma_model = config.get("model_name", DEFAULT_GEMMA_MODEL)
         _unload_model(gemma_model)
 
-        ids, docs, metadatas = _paper_entries(paperjson, config)
+        ids: list = []
+        docs: list = []
+        metadatas: list = []
+
+        if paper_needs_embed:
+            paper_ids, paper_docs, paper_metadatas = _paper_entries(paperjson, config)
+            ids.extend(paper_ids)
+            docs.extend(paper_docs)
+            metadatas.extend(paper_metadatas)
+
+        for stub_id, stub_doc, stub_metadata in pending_stubs:
+            ids.append(stub_id)
+            docs.append(stub_doc)
+            metadatas.append(stub_metadata)
+
         if not ids:
-            _log(f"no non-empty sections to embed for {registry_key}")
+            _log(f"no non-empty sections/stubs to embed for {registry_key}")
             return vault_note
 
         embed_model = config.get("embed_model", DEFAULT_EMBED_MODEL)
@@ -243,10 +373,14 @@ def run_embed(paperjson: dict, config: dict) -> str:
 
         # Delete-then-write per paper (D-17) — always pass explicit embeddings=
         # so Chroma never falls back to its bundled ONNX model (Pitfall #5).
-        _delete_paper_entries(collection, registry_key)
+        if paper_needs_embed:
+            _delete_paper_entries(collection, registry_key)
         collection.upsert(ids=ids, embeddings=vectors, documents=docs, metadatas=metadatas)
 
-        _log(f"embedded {len(ids)} section(s) for {registry_key}")
+        _log(
+            f"embedded {len(ids)} entrie(s) for {registry_key} "
+            f"(paper_sections={paper_needs_embed}, stubs={len(pending_stubs)})"
+        )
         return vault_note
     except Exception as e:
         return f"[embed warning: {e}]"
