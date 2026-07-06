@@ -8,5 +8,10 @@
   "obsidian_exe": "",
   "defuddle_path": "",
   "web_min_body_chars": 2000,
-  "defuddle_timeout": 60
+  "defuddle_timeout": 60,
+  "chroma_db_path": "./chroma_db",
+  "embed_model": "nomic-embed-text",
+  "embed_timeout": 60,
+  "embed_batch_size": 16,
+  "embed_section_max_tokens": 2000
 }
