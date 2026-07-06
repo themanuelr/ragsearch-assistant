@@ -2250,6 +2250,22 @@ def _run_fill_cascade(
                         f"[biblio warning: registry-hit bibliography linking failed: {e}]",
                         file=sys.stderr,
                     )
+
+                # Step 9c: registry-hit semantic embedding (D-13 -- Gap B lesson; Phase 5).
+                # Mirrors the Step 9b biblio hook so a registry-known paper ingested from a
+                # fresh clone (note/biblio regenerated here from _cached_paperjson) also gets
+                # embedded. embed.run_embed's skip-if-present (D-13) makes this cheap on
+                # repeats -- zero Ollama calls once the paper is already embedded.
+                try:
+                    from scripts import embed as embed_mod
+                    _embed_result = embed_mod.run_embed(_cached_paperjson, config)
+                    if isinstance(_embed_result, str) and _embed_result.startswith("[embed warning:"):
+                        _log(f"registry-hit embedding: {_embed_result}")
+                except Exception as e:
+                    print(
+                        f"[embed warning: registry-hit embedding failed: {e}]",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
         elif pj_path:
@@ -2420,6 +2436,15 @@ def _run_fill_cascade(
             _log(f"bibliography linking: {biblio_result}")
     except Exception as e:
         print(f"[biblio warning: bibliography linking failed: {e}]", file=sys.stderr)
+
+    # Step 12d: Semantic embedding (D-10 -- non-fatal tail stage; Phase 5)
+    try:
+        from scripts import embed as embed_mod
+        embed_result = embed_mod.run_embed(skeleton, config)
+        if isinstance(embed_result, str) and embed_result.startswith("[embed warning:"):
+            _log(f"embedding: {embed_result}")
+    except Exception as e:
+        print(f"[embed warning: embedding failed: {e}]", file=sys.stderr)
 
     # Step 13: Warn on partial fill, return skeleton
     if failed_count > 0:
