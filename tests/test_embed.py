@@ -27,7 +27,10 @@ distance/HNSW semantics are exercised; only the Ollama HTTP layer
 Run with: python -m pytest tests/test_embed.py -x
 """
 
+import json
 import math
+import pathlib
+import sys
 from unittest import mock
 
 
@@ -439,3 +442,115 @@ def test_stub_upgrade_deletes_entry(tmp_path):
 
     after_paper = collection.get(where={"$and": [{"registry_key": stub_key}, {"status": "paper"}]})
     assert after_paper["ids"], "the paper's own sections must remain after the upgrade-delete"
+
+
+# ---------------------------------------------------------------------------
+# EMBED-01/EMBED-03: embed.py --all backfill (D-12, Plan 05 Task 2)
+# ---------------------------------------------------------------------------
+
+def test_backfill_all_filters_registry_embeds_cache_and_stubs_idempotently(tmp_path):
+    """D-12: _backfill_all filters registry entries by projects[] membership, embeds
+    each entry's paperjson_path cache, embeds extra cache-dir files not in the
+    registry, embeds pending stubs, skips a desynced missing-cache-file entry, and
+    is idempotent (a second call reports zero newly embedded, zero /api/embed calls)."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts.ingest import _registry_key  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"project_name": "proj-a"})
+    cache_dir = pathlib.Path(config["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    paper_a = _make_paperjson(title="Paper A", doi="10.1111/paperA", year=2020)
+    paper_a_path = cache_dir / "paperA.json"
+    paper_a_path.write_text(json.dumps(paper_a), encoding="utf-8")
+
+    extra_paper = _make_paperjson(title="Extra Paper", doi="10.9999/extra", year=2021)
+    extra_path = cache_dir / "extra.json"
+    extra_path.write_text(json.dumps(extra_paper), encoding="utf-8")
+
+    registry = {
+        "10.1111/paperA": {"projects": ["proj-a"], "paperjson_path": str(paper_a_path)},
+        "10.2222/paperB": {
+            "projects": ["other-proj"],
+            "paperjson_path": str(cache_dir / "paperB_never_created.json"),
+        },
+        "10.3333/paperC": {"projects": ["proj-a"], "paperjson_path": str(cache_dir / "missing.json")},
+    }
+    pathlib.Path(config["registry_path"]).write_text(json.dumps(registry), encoding="utf-8")
+
+    _write_stub(
+        tmp_path, title="Deep Learning", stub_key="10.9999/dl",
+        raw="LeCun et al., Nature 2015", filename="Deep Learning.md",
+    )
+
+    key_a = _registry_key(paper_a["extraction"]["metadata"])
+    key_extra = _registry_key(extra_paper["extraction"]["metadata"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed) as mock_embed, \
+         mock.patch("scripts.embed._unload_model"):
+        counts = embed._backfill_all(config)
+
+    assert mock_embed.called, "first backfill must call /api/embed"
+    assert counts["papers"] == 2, "paperA (registry) + extra.json (cache-dir scan) both newly embedded"
+    assert counts["stubs"] == 1, "the one stub in vault/Stubs/ is newly embedded"
+    assert counts["skipped"] == 1, "paperC's missing cache file is a registry/cache desync skip"
+
+    collection = _get_collection(config["chroma_db_path"])
+    assert collection.get(where={"registry_key": key_a})["ids"], "paperA sections embedded"
+    assert collection.get(where={"registry_key": key_extra})["ids"], "extra.json sections embedded"
+    assert collection.get(where={"registry_key": "10.2222/paperB"})["ids"] == [], (
+        "paperB excluded -- not in this project"
+    )
+    assert collection.get(
+        where={"$and": [{"registry_key": "10.9999/dl"}, {"status": "stub"}]}
+    )["ids"], "stub embedded"
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed) as mock_embed2, \
+         mock.patch("scripts.embed._unload_model"):
+        counts2 = embed._backfill_all(config)
+
+    mock_embed2.assert_not_called()  # zero Ollama calls on a fully-embedded second pass
+    assert counts2 == {"papers": 0, "stubs": 0, "skipped": 1}, (
+        "second run reports zero newly embedded; paperC's desync skip persists"
+    )
+
+
+def test_backfill_all_no_orphan_delete_calls():
+    """Backfill embeds-missing only; it must not introduce any new collection.delete
+    call beyond the existing D-16 (_upgrade_delete) and D-17 (_delete_paper_entries)."""
+    src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "embed.py").read_text(encoding="utf-8")
+    assert src.count("collection.delete(") == 2, (
+        "expected exactly 2 collection.delete call sites (D-16 upgrade-delete, D-17 "
+        "delete-then-write) -- backfill must add no orphan-reconciliation delete"
+    )
+
+
+def test_backfill_all_filters_by_project_name_and_projects_field():
+    """Grep confirmation: _backfill_all's source references both projects[] and
+    config's project_name to build the registry membership filter (D-12)."""
+    src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "embed.py").read_text(encoding="utf-8")
+    backfill_src = src.split("def _backfill_all(")[1]
+    assert "project_name" in backfill_src
+    assert "projects" in backfill_src
+
+
+def test_cli_all_flag_no_crash_on_empty_registry(tmp_path, monkeypatch, capsys):
+    """--all runs without crashing on an empty/nonexistent registry and prints a
+    parseable JSON summary to stdout (--all and --query are separate CLI modes)."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={
+        "project_name": "proj-a",
+        "registry_path": str(tmp_path / "does_not_exist_registry.json"),
+    })
+    monkeypatch.setattr(embed, "_load_config", lambda: config)
+    monkeypatch.setattr(sys, "argv", ["embed.py", "--all"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.main()
+
+    out = capsys.readouterr().out
+    parsed = json.loads(out.strip().splitlines()[-1])
+    assert set(parsed) == {"papers", "stubs", "skipped"}
+    assert parsed == {"papers": 0, "stubs": 0, "skipped": 0}
