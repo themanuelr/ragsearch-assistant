@@ -320,6 +320,91 @@ def test_embed_stub_sweep(tmp_path):
     assert "LeCun et al." in doc, "stub document must contain the raw citation text (D-15)"
 
 
+# ---------------------------------------------------------------------------
+# EMBED-01: oversize-section split into labeled parts (D-02, Plan 05 Task 1)
+# ---------------------------------------------------------------------------
+
+def test_estimate_tokens_and_split_whole_section_unchanged():
+    """A body at or below max_tokens returns unchanged: [(heading, 0, body)]."""
+    from scripts import embed  # noqa: PLC0415
+
+    body = "A short section body."
+    assert embed._estimate_tokens(body) == max(1, len(body) // 4)
+
+    parts = embed._split_section("Methods", body, max_tokens=2000)
+    assert parts == [("Methods", 0, body)]
+
+
+def test_split_section_oversize_produces_labeled_parts():
+    """A body over max_tokens splits on paragraph boundaries into labeled (i/n) parts."""
+    from scripts import embed  # noqa: PLC0415
+
+    # Each paragraph ~40 chars (~10 tokens); max_tokens=15 forces a split after
+    # every paragraph, giving 5 parts from 5 paragraphs.
+    paragraphs = [f"Paragraph number {i} of the body text." for i in range(5)]
+    body = "\n".join(paragraphs)
+    assert embed._estimate_tokens(body) > 15
+
+    parts = embed._split_section("Methods", body, max_tokens=15)
+    assert len(parts) >= 2, "an oversize body must split into 2+ parts"
+
+    n = len(parts)
+    for i, (labeled_heading, part_index, text) in enumerate(parts, start=1):
+        assert labeled_heading == f"Methods ({i}/{n})"
+        assert part_index == i
+        assert text.strip(), "every emitted part must be non-empty"
+        assert embed._estimate_tokens(text) <= 15, "no part may exceed max_tokens"
+
+    # No paragraph text lost, no mid-sentence cut: every paragraph appears
+    # intact in exactly one part.
+    rejoined = "\n".join(text for _, _, text in parts)
+    for para in paragraphs:
+        assert para in rejoined
+
+
+def test_embed_sections_split_oversize_section_into_labeled_parts(tmp_path):
+    """Integration: run_embed splits an oversized section into Chroma entries with
+    ids ending ::1..::n and metadata headings matching the (i/n) label; a
+    <=threshold section still yields a single ::0 unlabeled-heading entry."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts.ingest import _registry_key  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"embed_section_max_tokens": 15})
+    paragraphs = [f"Paragraph number {i} of the body text." for i in range(5)]
+    oversize_body = "\n".join(paragraphs)
+    sections = [
+        {"heading": "Abstract", "body": "Short abstract text.", "fill_failed": False},
+        {"heading": "Methods", "body": oversize_body, "fill_failed": False},
+    ]
+    paperjson = _make_paperjson(sections=sections, title="Split Paper", doi="10.1234/split", year=2022)
+    registry_key = _registry_key(paperjson["extraction"]["metadata"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.run_embed(paperjson, config)
+
+    collection = _get_collection(config["chroma_db_path"])
+    got = collection.get(where={"registry_key": registry_key}, include=["metadatas"])
+    ids_by_meta = dict(zip(got["ids"], got["metadatas"]))
+
+    assert f"{registry_key}::abstract::0" in ids_by_meta, "<=threshold section stays a single ::0 entry"
+    abstract_meta = ids_by_meta[f"{registry_key}::abstract::0"]
+    assert abstract_meta["heading"] == "Abstract", "whole-section heading stays unlabeled"
+    assert abstract_meta["part"] == 0
+
+    methods_ids = sorted(
+        [i for i in got["ids"] if i.startswith(f"{registry_key}::methods::")],
+        key=lambda s: int(s.rsplit("::", 1)[1]),
+    )
+    assert len(methods_ids) >= 2, "oversized Methods section must split into 2+ parts"
+    assert methods_ids[0] == f"{registry_key}::methods::1"
+    n = len(methods_ids)
+    for i, entry_id in enumerate(methods_ids, start=1):
+        meta = ids_by_meta[entry_id]
+        assert meta["heading"] == f"Methods ({i}/{n})"
+        assert meta["part"] == i
+
+
 def test_stub_upgrade_deletes_entry(tmp_path):
     """D-16: after an upgrade embed pass, collection.get() for the OLD stub key + status='stub' is empty."""
     from scripts import embed  # noqa: PLC0415
