@@ -124,6 +124,8 @@ def _get_collection(config: dict):
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+DEFAULT_SECTION_MAX_TOKENS = 2000
+
 
 def _section_slug(heading: str) -> str:
     """Lowercase, non-alnum -> '-', collapse repeats, strip leading/trailing '-'."""
@@ -133,14 +135,75 @@ def _section_slug(heading: str) -> str:
     return slug or "section"
 
 
+def _estimate_tokens(text: str) -> int:
+    """
+    Approximate token count via the ~4 chars/token heuristic (D-02 / Claude's
+    Discretion). Reuses scripts/ingest.py's _estimate_num_ctx ratio verbatim —
+    no new tokenizer/embedding-model dependency is introduced for this estimate.
+    """
+    return max(1, len(text) // 4)
+
+
+def _split_section(heading: str, body: str, max_tokens: int):
+    """
+    Split a section body into labeled parts when it exceeds max_tokens (D-02).
+
+    Returns a list of (labeled_heading, part_index, text) tuples:
+      - body at or below max_tokens: unchanged, [(heading, 0, body)] — Plan 02
+        behavior, byte-identical (whole section, part 0, unlabeled heading).
+      - oversized body: split greedily on "\\n" paragraph boundaries (this
+        project's section bodies use a single newline between paragraphs, per
+        05-RESEARCH.md Open Question #3) so no cut falls mid-sentence,
+        producing n>=2 non-empty parts labeled f"{heading} ({i}/{n})" with a
+        1-based part index.
+
+    A body with only one paragraph (or no paragraph boundary to split on) that
+    still exceeds max_tokens cannot be split further along a paragraph
+    boundary and is returned whole as part 0 — splitting only ever happens at
+    paragraph breaks, never mid-sentence.
+    """
+    if _estimate_tokens(body) <= max_tokens:
+        return [(heading, 0, body)]
+
+    paragraphs = [p for p in body.split("\n") if p.strip()]
+    if len(paragraphs) < 2:
+        return [(heading, 0, body)]
+
+    raw_parts: list = []
+    current: list = []
+    current_tokens = 0
+    for para in paragraphs:
+        para_tokens = _estimate_tokens(para)
+        if current and current_tokens + para_tokens > max_tokens:
+            raw_parts.append("\n".join(current))
+            current = [para]
+            current_tokens = para_tokens
+        else:
+            current.append(para)
+            current_tokens += para_tokens
+    if current:
+        raw_parts.append("\n".join(current))
+
+    if len(raw_parts) < 2:
+        return [(heading, 0, body)]
+
+    n = len(raw_parts)
+    return [
+        (f"{heading} ({i}/{n})", i, part_text)
+        for i, part_text in enumerate(raw_parts, start=1)
+    ]
+
+
 def _paper_entries(paperjson: dict, config: dict):
     """
     Build (ids, docs, metadatas) for every non-empty section of a PaperJSON v2 dict.
 
     Reads section["heading"]/section["body"] from extraction.sections[] — NEVER
     section["blocks"][].plain (Pitfall #1: that structure is overwritten by
-    ingest.py's Step 10b fill cascade before the cache write). Part index is
-    fixed at 0 here; oversize-section splitting is Plan 05.
+    ingest.py's Step 10b fill cascade before the cache write). Sections over
+    config["embed_section_max_tokens"] (default 2000) split into labeled parts
+    via _split_section (D-02); sections at or below the threshold stay a
+    single part-0 entry (Plan 02 behavior, unchanged).
     """
     from scripts.ingest import _registry_key  # noqa: PLC0415
     from scripts.note import _sanitize_filename  # noqa: PLC0415
@@ -153,6 +216,7 @@ def _paper_entries(paperjson: dict, config: dict):
     doi = metadata.get("doi") or ""
     year = metadata.get("year") or 0
     vault_note = f"Papers/{_sanitize_filename(title)}.md"
+    max_tokens = config.get("embed_section_max_tokens", DEFAULT_SECTION_MAX_TOKENS)
 
     ids: list = []
     docs: list = []
@@ -162,20 +226,21 @@ def _paper_entries(paperjson: dict, config: dict):
         body = section.get("body") or ""
         if not body.strip():
             continue
-        part = 0
-        entry_id = f"{registry_key}::{_section_slug(heading)}::{part}"
-        ids.append(entry_id)
-        docs.append(body)
-        metadatas.append({
-            "registry_key": registry_key,
-            "title": title,
-            "heading": heading,
-            "part": part,
-            "doi": doi,
-            "year": year,
-            "status": "paper",
-            "vault_note": vault_note,
-        })
+        slug = _section_slug(heading)
+        for labeled_heading, part, part_text in _split_section(heading, body, max_tokens):
+            entry_id = f"{registry_key}::{slug}::{part}"
+            ids.append(entry_id)
+            docs.append(part_text)
+            metadatas.append({
+                "registry_key": registry_key,
+                "title": title,
+                "heading": labeled_heading,
+                "part": part,
+                "doi": doi,
+                "year": year,
+                "status": "paper",
+                "vault_note": vault_note,
+            })
     return ids, docs, metadatas
 
 
