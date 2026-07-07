@@ -27,7 +27,10 @@ distance/HNSW semantics are exercised; only the Ollama HTTP layer
 Run with: python -m pytest tests/test_embed.py -x
 """
 
+import json
 import math
+import pathlib
+import sys
 from unittest import mock
 
 
@@ -320,6 +323,91 @@ def test_embed_stub_sweep(tmp_path):
     assert "LeCun et al." in doc, "stub document must contain the raw citation text (D-15)"
 
 
+# ---------------------------------------------------------------------------
+# EMBED-01: oversize-section split into labeled parts (D-02, Plan 05 Task 1)
+# ---------------------------------------------------------------------------
+
+def test_estimate_tokens_and_split_whole_section_unchanged():
+    """A body at or below max_tokens returns unchanged: [(heading, 0, body)]."""
+    from scripts import embed  # noqa: PLC0415
+
+    body = "A short section body."
+    assert embed._estimate_tokens(body) == max(1, len(body) // 4)
+
+    parts = embed._split_section("Methods", body, max_tokens=2000)
+    assert parts == [("Methods", 0, body)]
+
+
+def test_split_section_oversize_produces_labeled_parts():
+    """A body over max_tokens splits on paragraph boundaries into labeled (i/n) parts."""
+    from scripts import embed  # noqa: PLC0415
+
+    # Each paragraph ~40 chars (~10 tokens); max_tokens=15 forces a split after
+    # every paragraph, giving 5 parts from 5 paragraphs.
+    paragraphs = [f"Paragraph number {i} of the body text." for i in range(5)]
+    body = "\n".join(paragraphs)
+    assert embed._estimate_tokens(body) > 15
+
+    parts = embed._split_section("Methods", body, max_tokens=15)
+    assert len(parts) >= 2, "an oversize body must split into 2+ parts"
+
+    n = len(parts)
+    for i, (labeled_heading, part_index, text) in enumerate(parts, start=1):
+        assert labeled_heading == f"Methods ({i}/{n})"
+        assert part_index == i
+        assert text.strip(), "every emitted part must be non-empty"
+        assert embed._estimate_tokens(text) <= 15, "no part may exceed max_tokens"
+
+    # No paragraph text lost, no mid-sentence cut: every paragraph appears
+    # intact in exactly one part.
+    rejoined = "\n".join(text for _, _, text in parts)
+    for para in paragraphs:
+        assert para in rejoined
+
+
+def test_embed_sections_split_oversize_section_into_labeled_parts(tmp_path):
+    """Integration: run_embed splits an oversized section into Chroma entries with
+    ids ending ::1..::n and metadata headings matching the (i/n) label; a
+    <=threshold section still yields a single ::0 unlabeled-heading entry."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts.ingest import _registry_key  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"embed_section_max_tokens": 15})
+    paragraphs = [f"Paragraph number {i} of the body text." for i in range(5)]
+    oversize_body = "\n".join(paragraphs)
+    sections = [
+        {"heading": "Abstract", "body": "Short abstract text.", "fill_failed": False},
+        {"heading": "Methods", "body": oversize_body, "fill_failed": False},
+    ]
+    paperjson = _make_paperjson(sections=sections, title="Split Paper", doi="10.1234/split", year=2022)
+    registry_key = _registry_key(paperjson["extraction"]["metadata"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.run_embed(paperjson, config)
+
+    collection = _get_collection(config["chroma_db_path"])
+    got = collection.get(where={"registry_key": registry_key}, include=["metadatas"])
+    ids_by_meta = dict(zip(got["ids"], got["metadatas"]))
+
+    assert f"{registry_key}::abstract::0" in ids_by_meta, "<=threshold section stays a single ::0 entry"
+    abstract_meta = ids_by_meta[f"{registry_key}::abstract::0"]
+    assert abstract_meta["heading"] == "Abstract", "whole-section heading stays unlabeled"
+    assert abstract_meta["part"] == 0
+
+    methods_ids = sorted(
+        [i for i in got["ids"] if i.startswith(f"{registry_key}::methods::")],
+        key=lambda s: int(s.rsplit("::", 1)[1]),
+    )
+    assert len(methods_ids) >= 2, "oversized Methods section must split into 2+ parts"
+    assert methods_ids[0] == f"{registry_key}::methods::1"
+    n = len(methods_ids)
+    for i, entry_id in enumerate(methods_ids, start=1):
+        meta = ids_by_meta[entry_id]
+        assert meta["heading"] == f"Methods ({i}/{n})"
+        assert meta["part"] == i
+
+
 def test_stub_upgrade_deletes_entry(tmp_path):
     """D-16: after an upgrade embed pass, collection.get() for the OLD stub key + status='stub' is empty."""
     from scripts import embed  # noqa: PLC0415
@@ -354,3 +442,115 @@ def test_stub_upgrade_deletes_entry(tmp_path):
 
     after_paper = collection.get(where={"$and": [{"registry_key": stub_key}, {"status": "paper"}]})
     assert after_paper["ids"], "the paper's own sections must remain after the upgrade-delete"
+
+
+# ---------------------------------------------------------------------------
+# EMBED-01/EMBED-03: embed.py --all backfill (D-12, Plan 05 Task 2)
+# ---------------------------------------------------------------------------
+
+def test_backfill_all_filters_registry_embeds_cache_and_stubs_idempotently(tmp_path):
+    """D-12: _backfill_all filters registry entries by projects[] membership, embeds
+    each entry's paperjson_path cache, embeds extra cache-dir files not in the
+    registry, embeds pending stubs, skips a desynced missing-cache-file entry, and
+    is idempotent (a second call reports zero newly embedded, zero /api/embed calls)."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts.ingest import _registry_key  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"project_name": "proj-a"})
+    cache_dir = pathlib.Path(config["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    paper_a = _make_paperjson(title="Paper A", doi="10.1111/paperA", year=2020)
+    paper_a_path = cache_dir / "paperA.json"
+    paper_a_path.write_text(json.dumps(paper_a), encoding="utf-8")
+
+    extra_paper = _make_paperjson(title="Extra Paper", doi="10.9999/extra", year=2021)
+    extra_path = cache_dir / "extra.json"
+    extra_path.write_text(json.dumps(extra_paper), encoding="utf-8")
+
+    registry = {
+        "10.1111/paperA": {"projects": ["proj-a"], "paperjson_path": str(paper_a_path)},
+        "10.2222/paperB": {
+            "projects": ["other-proj"],
+            "paperjson_path": str(cache_dir / "paperB_never_created.json"),
+        },
+        "10.3333/paperC": {"projects": ["proj-a"], "paperjson_path": str(cache_dir / "missing.json")},
+    }
+    pathlib.Path(config["registry_path"]).write_text(json.dumps(registry), encoding="utf-8")
+
+    _write_stub(
+        tmp_path, title="Deep Learning", stub_key="10.9999/dl",
+        raw="LeCun et al., Nature 2015", filename="Deep Learning.md",
+    )
+
+    key_a = _registry_key(paper_a["extraction"]["metadata"])
+    key_extra = _registry_key(extra_paper["extraction"]["metadata"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed) as mock_embed, \
+         mock.patch("scripts.embed._unload_model"):
+        counts = embed._backfill_all(config)
+
+    assert mock_embed.called, "first backfill must call /api/embed"
+    assert counts["papers"] == 2, "paperA (registry) + extra.json (cache-dir scan) both newly embedded"
+    assert counts["stubs"] == 1, "the one stub in vault/Stubs/ is newly embedded"
+    assert counts["skipped"] == 1, "paperC's missing cache file is a registry/cache desync skip"
+
+    collection = _get_collection(config["chroma_db_path"])
+    assert collection.get(where={"registry_key": key_a})["ids"], "paperA sections embedded"
+    assert collection.get(where={"registry_key": key_extra})["ids"], "extra.json sections embedded"
+    assert collection.get(where={"registry_key": "10.2222/paperB"})["ids"] == [], (
+        "paperB excluded -- not in this project"
+    )
+    assert collection.get(
+        where={"$and": [{"registry_key": "10.9999/dl"}, {"status": "stub"}]}
+    )["ids"], "stub embedded"
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed) as mock_embed2, \
+         mock.patch("scripts.embed._unload_model"):
+        counts2 = embed._backfill_all(config)
+
+    mock_embed2.assert_not_called()  # zero Ollama calls on a fully-embedded second pass
+    assert counts2 == {"papers": 0, "stubs": 0, "skipped": 1}, (
+        "second run reports zero newly embedded; paperC's desync skip persists"
+    )
+
+
+def test_backfill_all_no_orphan_delete_calls():
+    """Backfill embeds-missing only; it must not introduce any new collection.delete
+    call beyond the existing D-16 (_upgrade_delete) and D-17 (_delete_paper_entries)."""
+    src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "embed.py").read_text(encoding="utf-8")
+    assert src.count("collection.delete(") == 2, (
+        "expected exactly 2 collection.delete call sites (D-16 upgrade-delete, D-17 "
+        "delete-then-write) -- backfill must add no orphan-reconciliation delete"
+    )
+
+
+def test_backfill_all_filters_by_project_name_and_projects_field():
+    """Grep confirmation: _backfill_all's source references both projects[] and
+    config's project_name to build the registry membership filter (D-12)."""
+    src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "embed.py").read_text(encoding="utf-8")
+    backfill_src = src.split("def _backfill_all(")[1]
+    assert "project_name" in backfill_src
+    assert "projects" in backfill_src
+
+
+def test_cli_all_flag_no_crash_on_empty_registry(tmp_path, monkeypatch, capsys):
+    """--all runs without crashing on an empty/nonexistent registry and prints a
+    parseable JSON summary to stdout (--all and --query are separate CLI modes)."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={
+        "project_name": "proj-a",
+        "registry_path": str(tmp_path / "does_not_exist_registry.json"),
+    })
+    monkeypatch.setattr(embed, "_load_config", lambda: config)
+    monkeypatch.setattr(sys, "argv", ["embed.py", "--all"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.main()
+
+    out = capsys.readouterr().out
+    parsed = json.loads(out.strip().splitlines()[-1])
+    assert set(parsed) == {"papers", "stubs", "skipped"}
+    assert parsed == {"papers": 0, "stubs": 0, "skipped": 0}

@@ -124,6 +124,8 @@ def _get_collection(config: dict):
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+DEFAULT_SECTION_MAX_TOKENS = 2000
+
 
 def _section_slug(heading: str) -> str:
     """Lowercase, non-alnum -> '-', collapse repeats, strip leading/trailing '-'."""
@@ -133,14 +135,75 @@ def _section_slug(heading: str) -> str:
     return slug or "section"
 
 
+def _estimate_tokens(text: str) -> int:
+    """
+    Approximate token count via the ~4 chars/token heuristic (D-02 / Claude's
+    Discretion). Reuses scripts/ingest.py's _estimate_num_ctx ratio verbatim —
+    no new tokenizer/embedding-model dependency is introduced for this estimate.
+    """
+    return max(1, len(text) // 4)
+
+
+def _split_section(heading: str, body: str, max_tokens: int):
+    """
+    Split a section body into labeled parts when it exceeds max_tokens (D-02).
+
+    Returns a list of (labeled_heading, part_index, text) tuples:
+      - body at or below max_tokens: unchanged, [(heading, 0, body)] — Plan 02
+        behavior, byte-identical (whole section, part 0, unlabeled heading).
+      - oversized body: split greedily on "\\n" paragraph boundaries (this
+        project's section bodies use a single newline between paragraphs, per
+        05-RESEARCH.md Open Question #3) so no cut falls mid-sentence,
+        producing n>=2 non-empty parts labeled f"{heading} ({i}/{n})" with a
+        1-based part index.
+
+    A body with only one paragraph (or no paragraph boundary to split on) that
+    still exceeds max_tokens cannot be split further along a paragraph
+    boundary and is returned whole as part 0 — splitting only ever happens at
+    paragraph breaks, never mid-sentence.
+    """
+    if _estimate_tokens(body) <= max_tokens:
+        return [(heading, 0, body)]
+
+    paragraphs = [p for p in body.split("\n") if p.strip()]
+    if len(paragraphs) < 2:
+        return [(heading, 0, body)]
+
+    raw_parts: list = []
+    current: list = []
+    current_tokens = 0
+    for para in paragraphs:
+        para_tokens = _estimate_tokens(para)
+        if current and current_tokens + para_tokens > max_tokens:
+            raw_parts.append("\n".join(current))
+            current = [para]
+            current_tokens = para_tokens
+        else:
+            current.append(para)
+            current_tokens += para_tokens
+    if current:
+        raw_parts.append("\n".join(current))
+
+    if len(raw_parts) < 2:
+        return [(heading, 0, body)]
+
+    n = len(raw_parts)
+    return [
+        (f"{heading} ({i}/{n})", i, part_text)
+        for i, part_text in enumerate(raw_parts, start=1)
+    ]
+
+
 def _paper_entries(paperjson: dict, config: dict):
     """
     Build (ids, docs, metadatas) for every non-empty section of a PaperJSON v2 dict.
 
     Reads section["heading"]/section["body"] from extraction.sections[] — NEVER
     section["blocks"][].plain (Pitfall #1: that structure is overwritten by
-    ingest.py's Step 10b fill cascade before the cache write). Part index is
-    fixed at 0 here; oversize-section splitting is Plan 05.
+    ingest.py's Step 10b fill cascade before the cache write). Sections over
+    config["embed_section_max_tokens"] (default 2000) split into labeled parts
+    via _split_section (D-02); sections at or below the threshold stay a
+    single part-0 entry (Plan 02 behavior, unchanged).
     """
     from scripts.ingest import _registry_key  # noqa: PLC0415
     from scripts.note import _sanitize_filename  # noqa: PLC0415
@@ -153,6 +216,7 @@ def _paper_entries(paperjson: dict, config: dict):
     doi = metadata.get("doi") or ""
     year = metadata.get("year") or 0
     vault_note = f"Papers/{_sanitize_filename(title)}.md"
+    max_tokens = config.get("embed_section_max_tokens", DEFAULT_SECTION_MAX_TOKENS)
 
     ids: list = []
     docs: list = []
@@ -162,20 +226,21 @@ def _paper_entries(paperjson: dict, config: dict):
         body = section.get("body") or ""
         if not body.strip():
             continue
-        part = 0
-        entry_id = f"{registry_key}::{_section_slug(heading)}::{part}"
-        ids.append(entry_id)
-        docs.append(body)
-        metadatas.append({
-            "registry_key": registry_key,
-            "title": title,
-            "heading": heading,
-            "part": part,
-            "doi": doi,
-            "year": year,
-            "status": "paper",
-            "vault_note": vault_note,
-        })
+        slug = _section_slug(heading)
+        for labeled_heading, part, part_text in _split_section(heading, body, max_tokens):
+            entry_id = f"{registry_key}::{slug}::{part}"
+            ids.append(entry_id)
+            docs.append(part_text)
+            metadatas.append({
+                "registry_key": registry_key,
+                "title": title,
+                "heading": labeled_heading,
+                "part": part,
+                "doi": doi,
+                "year": year,
+                "status": "paper",
+                "vault_note": vault_note,
+            })
     return ids, docs, metadatas
 
 
@@ -387,6 +452,155 @@ def run_embed(paperjson: dict, config: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# --all backfill (D-12)
+# ---------------------------------------------------------------------------
+
+def _distinct_registry_keys(collection, status: str) -> set:
+    """Return the set of distinct registry_key values for entries with the given
+    status (paper|stub) — used to derive newly-embedded counts via before/after
+    snapshots rather than per-entry bookkeeping duplicated from run_embed."""
+    got = collection.get(where={"status": status}, include=["metadatas"])
+    return {m["registry_key"] for m in (got.get("metadatas") or [])}
+
+
+def _embed_stub_entries(collection, pending_stubs: list, config: dict) -> None:
+    """
+    Batch-embed a list of pending (id, doc, metadata) stub tuples and upsert them.
+
+    Used by _backfill_all's standalone stub pass (D-12) to guarantee stub
+    coverage even when zero papers are processed (so run_embed's own
+    stub-sweep side effect never fires). Always passes explicit embeddings=
+    (Pitfall #5) — never lets Chroma fall back to its bundled embedding function.
+    """
+    if not pending_stubs:
+        return
+    ids = [p[0] for p in pending_stubs]
+    docs = [p[1] for p in pending_stubs]
+    metadatas = [p[2] for p in pending_stubs]
+
+    embed_model = config.get("embed_model", DEFAULT_EMBED_MODEL)
+    timeout = config.get("embed_timeout", 60)
+    batch_size = config.get("embed_batch_size", 16) or len(docs)
+
+    vectors: list = []
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i:i + batch_size]
+        batch_vectors = _ollama_embed_call(
+            [f"{DOC_PREFIX}{text}" for text in batch], model=embed_model, timeout=timeout
+        )
+        if isinstance(batch_vectors, str):
+            _log(f"backfill: stub embedding failed: {batch_vectors}")
+            return
+        vectors.extend(batch_vectors)
+
+    collection.upsert(ids=ids, embeddings=vectors, documents=docs, metadatas=metadatas)
+
+
+def _backfill_all(config: dict) -> dict:
+    """
+    D-12: backfill this project's existing library into ChromaDB, idempotently.
+
+    Scans three sources and embeds everything missing:
+      1. The registry at config["registry_path"], filtered to entries whose
+         projects[] contains config["project_name"] — each entry's
+         paperjson_path cache is loaded and passed to run_embed (which itself
+         does skip-if-present, D-13). A registry entry whose paperjson_path is
+         missing on disk is a registry/cache desync (Todo T-rie-01/T-rie-02
+         precedent) — logged as a warning and counted in "skipped", never a
+         crash.
+      2. config["paperjson_cache_dir"] for any *.json not already handled via
+         the registry loop (papers cached locally but not — or no longer —
+         registry-tracked).
+      3. vault/Stubs/ via the Plan-03 stub sweep (_sweep_stubs), invoked
+         directly so stubs are covered even when zero papers are processed
+         (run_embed's own stub-sweep side effect never fires with an empty
+         registry/cache).
+
+    Idempotency is inherited entirely from run_embed's skip-if-present +
+    deterministic IDs — no extra dedup logic is added here. Newly-embedded
+    counts are derived from before/after distinct-registry_key snapshots
+    (paper and stub status scopes), so a second call against an unchanged
+    library reports zero for both.
+
+    Never deletes orphaned collection entries — sweep-based orphan
+    reconciliation is a deferred idea (CONTEXT.md Deferred Ideas), not
+    implemented by this backfill.
+
+    Returns {"papers": int, "stubs": int, "skipped": int}.
+    """
+    from scripts.ingest import _read_registry  # noqa: PLC0415
+
+    registry_path = config.get("registry_path") or ""
+    project_name = config.get("project_name")
+
+    try:
+        registry = _read_registry(registry_path) if registry_path else {}
+    except ValueError as e:
+        _log(f"backfill: {e}")
+        registry = {}
+
+    collection = _get_collection(config)
+    before_papers = _distinct_registry_keys(collection, "paper")
+    before_stubs = _distinct_registry_keys(collection, "stub")
+
+    skipped = 0
+    handled_paths: set = set()
+
+    for registry_key, entry in (registry or {}).items():
+        projects = entry.get("projects") or []
+        if project_name not in projects:
+            continue
+        pj_path = entry.get("paperjson_path")
+        if not pj_path or not pathlib.Path(pj_path).exists():
+            _log(
+                f"backfill: registry/cache desync for registry_key={registry_key!r} — "
+                f"PaperJSON cache file missing at {pj_path!r}; skipping"
+            )
+            skipped += 1
+            continue
+        handled_paths.add(str(pathlib.Path(pj_path).resolve()))
+        try:
+            with open(pj_path, encoding="utf-8") as f:
+                paperjson = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            _log(f"backfill: failed to load {pj_path!r}: {e}")
+            skipped += 1
+            continue
+        run_embed(paperjson, config)
+
+    cache_dir = config.get("paperjson_cache_dir")
+    if cache_dir:
+        cache_path = pathlib.Path(cache_dir)
+        if cache_path.is_dir():
+            for cache_file in cache_path.glob("*.json"):
+                resolved = str(cache_file.resolve())
+                if resolved in handled_paths:
+                    continue
+                try:
+                    with open(cache_file, encoding="utf-8") as f:
+                        paperjson = json.load(f)
+                except (OSError, json.JSONDecodeError) as e:
+                    _log(f"backfill: failed to load cache file {cache_file}: {e}")
+                    skipped += 1
+                    continue
+                run_embed(paperjson, config)
+
+    # Guarantee stub coverage even when zero papers were processed above (D-14's
+    # sweep is a run_embed side effect and never fires on an empty registry/cache).
+    pending_stubs = _sweep_stubs(collection, config)
+    _embed_stub_entries(collection, pending_stubs, config)
+
+    after_papers = _distinct_registry_keys(collection, "paper")
+    after_stubs = _distinct_registry_keys(collection, "stub")
+
+    return {
+        "papers": len(after_papers - before_papers),
+        "stubs": len(after_stubs - before_stubs),
+        "skipped": skipped,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Search path (EMBED-02)
 # ---------------------------------------------------------------------------
 
@@ -492,7 +706,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Embed a PaperJSON v2 cache file's sections into the ChromaDB `papers` "
-            "collection, or run a semantic search query against it."
+            "collection, run a semantic search query against it, or backfill this "
+            "project's existing registry/cache/stubs with --all (D-12)."
         )
     )
     parser.add_argument(
@@ -512,9 +727,23 @@ def main() -> None:
         default=5,
         help="Number of ranked papers to return in --query mode (default: 5).",
     )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Backfill: idempotently embed every not-yet-embedded registry paper "
+            "(this project's entries), .paperjson_cache/ file, and vault/Stubs/ "
+            "stub (D-12). A separate mode from --query/positional embed."
+        ),
+    )
     args = parser.parse_args()
 
     config = _load_config()
+
+    if args.all:
+        counts = _backfill_all(config)
+        print(json.dumps(counts))
+        return
 
     if args.query is not None:
         result = _search(args.query, args.n_results, config)
@@ -522,7 +751,7 @@ def main() -> None:
         return
 
     if not args.paperjson:
-        parser.error("either a PaperJSON cache-file path or --query is required")
+        parser.error("either a PaperJSON cache-file path, --query, or --all is required")
 
     with open(args.paperjson, encoding="utf-8") as f:
         paperjson = json.load(f)
