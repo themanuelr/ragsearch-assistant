@@ -30,8 +30,12 @@ Run with: python -m pytest tests/test_embed.py -x
 import json
 import math
 import pathlib
+import subprocess
 import sys
 from unittest import mock
+
+_REPO_ROOT_FOR_SUBPROCESS = pathlib.Path(__file__).resolve().parent.parent
+_EMBED_PY = _REPO_ROOT_FOR_SUBPROCESS / "scripts" / "embed.py"
 
 
 # ---------------------------------------------------------------------------
@@ -552,5 +556,91 @@ def test_cli_all_flag_no_crash_on_empty_registry(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     parsed = json.loads(out.strip().splitlines()[-1])
+    assert set(parsed) == {"papers", "stubs", "skipped"}
+    assert parsed == {"papers": 0, "stubs": 0, "skipped": 0}
+
+
+# ---------------------------------------------------------------------------
+# Live-subprocess regression tests (05-06 gap closure): embed.py invoked as a
+# real top-level process via subprocess.run([sys.executable, ...]) -- NOT an
+# in-process embed.main() call -- so pytest's own sys.path augmentation can
+# never mask a broken standalone-CLI sys.path bootstrap again. Every config
+# written here points chroma_db_path/vault_path/registry_path/
+# paperjson_cache_dir under tmp_path (conftest._guard_real_chroma_db /
+# _guard_real_paperjson_cache safety nets). Neither test requires a live
+# Ollama -- the sys.path failure this regression-guards manifests before any
+# /api/embed call is ever made.
+# ---------------------------------------------------------------------------
+
+def _write_subprocess_config(tmp_path):
+    """Write a tmp config.json for a live embed.py subprocess run, with every
+    path anchored under tmp_path so the real repo-root stores are never touched."""
+    (tmp_path / "Papers").mkdir(exist_ok=True)
+    (tmp_path / "Stubs").mkdir(exist_ok=True)
+    cfg = {
+        "chroma_db_path": str(tmp_path / "chroma_db"),
+        "vault_path": str(tmp_path),
+        "registry_path": str(tmp_path / "does_not_exist_registry.json"),
+        "embed_model": "nomic-embed-text",
+        "embed_timeout": 5,
+        "embed_batch_size": 16,
+        "embed_section_max_tokens": 2000,
+        "paperjson_cache_dir": str(tmp_path / "does_not_exist_paperjson_cache"),
+    }
+    cfg_path = tmp_path / "subprocess_config.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    return cfg_path
+
+
+def test_cli_embed_file_subprocess_resolves_imports(tmp_path):
+    """The FAILED 05-VERIFICATION must-have, restated for live-subprocess
+    semantics: `python scripts/embed.py <cache_file>` run as a real subprocess
+    resolves its scripts.ingest / scripts.note / scripts.biblio imports and
+    reaches the embed path -- combined stdout+stderr must never contain the
+    phrase 'No module named'. (With Ollama unreachable the run legitimately
+    ends in an "[embed warning: ...]" Ollama-error/timeout line -- that is
+    expected and NOT what this test guards; only module-resolution failure
+    is asserted against.)"""
+    cfg_path = _write_subprocess_config(tmp_path)
+    paperjson = _make_paperjson()
+    cache_file = tmp_path / "paper.json"
+    cache_file.write_text(json.dumps(paperjson), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(_EMBED_PY), "--config", str(cfg_path), str(cache_file)],
+        cwd=str(_REPO_ROOT_FOR_SUBPROCESS),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    combined = result.stdout + result.stderr
+    assert "No module named" not in combined, (
+        f"embed.py subprocess failed to resolve scripts.* imports:\n{combined}"
+    )
+
+
+def test_cli_all_subprocess_no_crash_on_empty_registry(tmp_path):
+    """The second FAILED 05-VERIFICATION must-have, restated for
+    live-subprocess semantics: `python scripts/embed.py --all` run as a real
+    subprocess against an empty/nonexistent registry exits 0 and prints a
+    parseable JSON summary whose keys are exactly papers/stubs/skipped -- no
+    ModuleNotFoundError traceback, no exit code 1."""
+    cfg_path = _write_subprocess_config(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, str(_EMBED_PY), "--config", str(cfg_path), "--all"],
+        cwd=str(_REPO_ROOT_FOR_SUBPROCESS),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, (
+        f"embed.py --all subprocess exited nonzero:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    assert lines, f"expected at least one non-empty stdout line, got: {result.stdout!r}"
+    parsed = json.loads(lines[-1])
     assert set(parsed) == {"papers", "stubs", "skipped"}
     assert parsed == {"papers": 0, "stubs": 0, "skipped": 0}
