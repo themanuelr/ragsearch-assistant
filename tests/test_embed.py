@@ -645,6 +645,58 @@ def test_backfill_all_filters_registry_embeds_cache_and_stubs_idempotently(tmp_p
     )
 
 
+def test_backfill_counts_failed_embed_as_skipped(tmp_path):
+    """WR-03: a run_embed call that returns an [embed warning: ...] string mid-run
+    must be counted in 'skipped', never reported as a clean 'papers' success."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"project_name": "proj-a"})
+    cache_dir = pathlib.Path(config["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    paper = _make_paperjson(title="Failing Paper", doi="10.1234/fail", year=2020)
+    paper_path = cache_dir / "failing.json"
+    paper_path.write_text(json.dumps(paper), encoding="utf-8")
+
+    registry = {
+        "10.1234/fail": {"projects": ["proj-a"], "paperjson_path": str(paper_path)},
+    }
+    pathlib.Path(config["registry_path"]).write_text(json.dumps(registry), encoding="utf-8")
+
+    with mock.patch("scripts.embed.run_embed", return_value="[embed warning: simulated failure]"):
+        counts = embed._backfill_all(config)
+
+    assert counts["skipped"] >= 1, "a warning-string return from run_embed must be counted as skipped"
+    assert counts["papers"] == 0, "a failed embed must never be counted as a clean paper success"
+
+
+def test_backfill_cache_dir_default(tmp_path, monkeypatch):
+    """WR-04: when config omits paperjson_cache_dir (the shipped-config shape),
+    the cache-dir backfill source still resolves via the .paperjson_cache
+    default, mirroring ingest's write default -- it is not dead code."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"project_name": "proj-a"})
+    del config["paperjson_cache_dir"]
+
+    monkeypatch.chdir(tmp_path)
+    default_cache_dir = tmp_path / ".paperjson_cache"
+    default_cache_dir.mkdir()
+    paper = _make_paperjson(title="Default Cache Paper", doi="10.5555/defcache", year=2022)
+    (default_cache_dir / "defcache.json").write_text(json.dumps(paper), encoding="utf-8")
+
+    pathlib.Path(config["registry_path"]).write_text(json.dumps({}), encoding="utf-8")
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        counts = embed._backfill_all(config)
+
+    assert counts["papers"] == 1, (
+        "a cache file under the default .paperjson_cache dir must be embedded when "
+        "paperjson_cache_dir is absent from config (WR-04)"
+    )
+
+
 def test_backfill_preserves_orphan_entries(tmp_path):
     """IN-04 (replaces the brittle test_backfill_all_no_orphan_delete_calls source
     grep): behaviorally proves backfill performs no orphan-reconciliation delete --

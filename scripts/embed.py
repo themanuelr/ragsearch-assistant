@@ -639,9 +639,12 @@ def _backfill_all(config: dict) -> dict:
             _log(f"backfill: failed to load {pj_path!r}: {e}")
             skipped += 1
             continue
-        run_embed(paperjson, config)
+        embed_result = run_embed(paperjson, config)
+        if isinstance(embed_result, str) and embed_result.startswith("[embed warning:"):
+            _log(f"backfill: registry embed failed for {pj_path!r}: {embed_result}")
+            skipped += 1
 
-    cache_dir = config.get("paperjson_cache_dir")
+    cache_dir = config.get("paperjson_cache_dir", ".paperjson_cache")
     if cache_dir:
         cache_path = pathlib.Path(cache_dir)
         if cache_path.is_dir():
@@ -656,7 +659,10 @@ def _backfill_all(config: dict) -> dict:
                     _log(f"backfill: failed to load cache file {cache_file}: {e}")
                     skipped += 1
                     continue
-                run_embed(paperjson, config)
+                embed_result = run_embed(paperjson, config)
+                if isinstance(embed_result, str) and embed_result.startswith("[embed warning:"):
+                    _log(f"backfill: cache-dir embed failed for {cache_file}: {embed_result}")
+                    skipped += 1
 
     # Guarantee stub coverage even when zero papers were processed above (D-14's
     # sweep is a run_embed side effect and never fires on an empty registry/cache).
