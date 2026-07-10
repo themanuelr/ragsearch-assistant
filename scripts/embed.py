@@ -28,6 +28,10 @@ import sys
 import urllib.error
 import urllib.request
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 OLLAMA_BASE = "http://localhost:11434"
 COLLECTION_NAME = "papers"
 DOC_PREFIX = "search_document: "
@@ -111,7 +115,9 @@ def _get_collection(config: dict):
     HNSW space if it doesn't exist yet (Pitfall #4 — un-updatable after creation)."""
     import chromadb  # noqa: PLC0415
 
-    client = chromadb.PersistentClient(path=config.get("chroma_db_path", "./chroma_db"))
+    client = chromadb.PersistentClient(
+        path=config.get("chroma_db_path") or str(_REPO_ROOT / "chroma_db")
+    )
     return client.get_or_create_collection(
         name=COLLECTION_NAME,
         configuration={"hnsw": {"space": "cosine"}},
@@ -526,9 +532,18 @@ def _backfill_all(config: dict) -> dict:
     reconciliation is a deferred idea (CONTEXT.md Deferred Ideas), not
     implemented by this backfill.
 
-    Returns {"papers": int, "stubs": int, "skipped": int}.
+    Returns {"papers": int, "stubs": int, "skipped": int}. On an ImportError
+    resolving scripts.ingest (defense-in-depth against a broken sys.path in a
+    pathological invocation), degrades to an all-zero summary with an "error"
+    key instead of an uncaught traceback -- the normal bootstrapped path never
+    hits this branch, so the existing papers/stubs/skipped summary shape is
+    unchanged when the import succeeds.
     """
-    from scripts.ingest import _read_registry  # noqa: PLC0415
+    try:
+        from scripts.ingest import _read_registry  # noqa: PLC0415
+    except ImportError as e:
+        _log(f"backfill: failed to import scripts.ingest: {e}")
+        return {"papers": 0, "stubs": 0, "skipped": 0, "error": str(e)}
 
     registry_path = config.get("registry_path") or ""
     project_name = config.get("project_name")
@@ -691,14 +706,23 @@ def _search(query: str, n_results: int, config: dict) -> dict:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def _load_config() -> dict:
-    """Read config.json from the repo root (parent of scripts/) with UTF-8 encoding."""
-    cfg_path = pathlib.Path(__file__).parent.parent / "config.json"
+def _load_config(config_path=None) -> dict:
+    """Read config.json (UTF-8) from `config_path` if given, else from the repo
+    root (parent of scripts/). WR-01: a relative chroma_db_path is anchored
+    under _REPO_ROOT after expanduser() so the store always resolves to the
+    same real directory regardless of the process's current working
+    directory -- registry_path and vault_path resolution are unchanged
+    (anchoring those is a separate, out-of-scope open todo)."""
+    cfg_path = pathlib.Path(config_path) if config_path else (_REPO_ROOT / "config.json")
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
     for key in ("registry_path", "vault_path", "chroma_db_path"):
         if key in cfg and cfg[key]:
             cfg[key] = str(pathlib.Path(cfg[key]).expanduser())
+    if cfg.get("chroma_db_path"):
+        chroma_path = pathlib.Path(cfg["chroma_db_path"])
+        if not chroma_path.is_absolute():
+            cfg["chroma_db_path"] = str(_REPO_ROOT / chroma_path)
     return cfg
 
 
@@ -736,9 +760,17 @@ def main() -> None:
             "stub (D-12). A separate mode from --query/positional embed."
         ),
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to an alternate config.json (dev/test seam). Default: the "
+            "repo-root config.json."
+        ),
+    )
     args = parser.parse_args()
 
-    config = _load_config()
+    config = _load_config(args.config) if args.config else _load_config()
 
     if args.all:
         counts = _backfill_all(config)
