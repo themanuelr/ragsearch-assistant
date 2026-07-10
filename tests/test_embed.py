@@ -149,9 +149,9 @@ def test_embed_sections(tmp_path):
     got = collection.get(where={"registry_key": registry_key}, include=["metadatas"])
 
     assert set(got["ids"]) == {
-        f"{registry_key}::abstract::0",
-        f"{registry_key}::methods::0",
-    }, f"expected deterministic {{registry_key}}::{{slug}}::{{part}} ids, got {got['ids']}"
+        f"{registry_key}::0-abstract::0",
+        f"{registry_key}::1-methods::0",
+    }, f"expected deterministic {{registry_key}}::{{idx}}-{{slug}}::{{part}} ids, got {got['ids']}"
 
     for meta in got["metadatas"]:
         assert meta["registry_key"] == registry_key
@@ -187,6 +187,38 @@ def test_embed_no_explicit_abstract(tmp_path):
     collection = _get_collection(config["chroma_db_path"])
     got = collection.get(where={"registry_key": registry_key})
     assert len(got["ids"]) == 2, "both non-abstract sections should embed uniformly with no special-case crash"
+
+
+def test_embed_duplicate_heading_sections(tmp_path):
+    """CR-03 regression: two sections that slugify identically (e.g. two 'Results'
+    headings) must both embed as distinct Chroma entries -- no DuplicateIDError
+    swallowed into a silent [embed warning: ...] that would exclude the whole
+    paper from search."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts.ingest import _registry_key  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+    sections = [
+        {"heading": "Results", "body": "First results block.", "fill_failed": False},
+        {"heading": "Results", "body": "Second results block, distinct content.", "fill_failed": False},
+    ]
+    paperjson = _make_paperjson(sections=sections, title="Duplicate Heading Paper", doi="10.1234/dup", year=2023)
+    registry_key = _registry_key(paperjson["extraction"]["metadata"])
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        result = embed.run_embed(paperjson, config)
+
+    assert not result.startswith("[embed warning:"), (
+        f"a DuplicateIDError must never be swallowed into a silent warning: {result}"
+    )
+
+    collection = _get_collection(config["chroma_db_path"])
+    got = collection.get(where={"registry_key": registry_key}, include=["metadatas"])
+    assert set(got["ids"]) == {
+        f"{registry_key}::0-results::0",
+        f"{registry_key}::1-results::0",
+    }, f"both same-heading sections must embed as distinct idx-prefixed entries, got {got['ids']}"
 
 
 def test_embed_skip_if_present(tmp_path):
@@ -394,17 +426,17 @@ def test_embed_sections_split_oversize_section_into_labeled_parts(tmp_path):
     got = collection.get(where={"registry_key": registry_key}, include=["metadatas"])
     ids_by_meta = dict(zip(got["ids"], got["metadatas"]))
 
-    assert f"{registry_key}::abstract::0" in ids_by_meta, "<=threshold section stays a single ::0 entry"
-    abstract_meta = ids_by_meta[f"{registry_key}::abstract::0"]
+    assert f"{registry_key}::0-abstract::0" in ids_by_meta, "<=threshold section stays a single ::0 entry"
+    abstract_meta = ids_by_meta[f"{registry_key}::0-abstract::0"]
     assert abstract_meta["heading"] == "Abstract", "whole-section heading stays unlabeled"
     assert abstract_meta["part"] == 0
 
     methods_ids = sorted(
-        [i for i in got["ids"] if i.startswith(f"{registry_key}::methods::")],
+        [i for i in got["ids"] if i.startswith(f"{registry_key}::1-methods::")],
         key=lambda s: int(s.rsplit("::", 1)[1]),
     )
     assert len(methods_ids) >= 2, "oversized Methods section must split into 2+ parts"
-    assert methods_ids[0] == f"{registry_key}::methods::1"
+    assert methods_ids[0] == f"{registry_key}::1-methods::1"
     n = len(methods_ids)
     for i, entry_id in enumerate(methods_ids, start=1):
         meta = ids_by_meta[entry_id]

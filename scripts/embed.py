@@ -227,14 +227,14 @@ def _paper_entries(paperjson: dict, config: dict):
     ids: list = []
     docs: list = []
     metadatas: list = []
-    for section in sections:
+    for idx, section in enumerate(sections):
         heading = section.get("heading") or ""
         body = section.get("body") or ""
         if not body.strip():
             continue
         slug = _section_slug(heading)
         for labeled_heading, part, part_text in _split_section(heading, body, max_tokens):
-            entry_id = f"{registry_key}::{slug}::{part}"
+            entry_id = f"{registry_key}::{idx}-{slug}::{part}"
             ids.append(entry_id)
             docs.append(part_text)
             metadatas.append({
