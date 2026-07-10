@@ -21,6 +21,7 @@ config-overridable) — see PROJECT.md constraints and the phase threat model
 
 import argparse
 import datetime
+import http.client
 import json
 import pathlib
 import re
@@ -80,6 +81,12 @@ def _ollama_embed_call(
     except urllib.error.URLError as e:
         if isinstance(e.reason, TimeoutError):
             return f"[Ollama timeout: no response within {timeout}s]"
+        return f"[Ollama error: {e}]"
+    except (json.JSONDecodeError, http.client.HTTPException, OSError) as e:
+        # WR-05: a malformed/interrupted response body (JSONDecodeError), a
+        # broken HTTP framing (HTTPException), or a reset connection
+        # (ConnectionResetError, an OSError subclass) must never escape --
+        # the never-raises contract holds for these failure modes too.
         return f"[Ollama error: {e}]"
     try:
         return data["embeddings"]
@@ -704,66 +711,77 @@ def _search(query: str, n_results: int, config: dict) -> dict:
     )
     if isinstance(query_result, str):
         return {"papers": [], "stubs": [], "error": query_result}
+    if not query_result:
+        # WR-05: an empty embeddings list (malformed/empty Ollama response that
+        # isn't already a string sentinel) must never reach an unguarded [0]
+        # index access -- return the structured error dict instead.
+        return {"papers": [], "stubs": [], "error": "[Ollama error: empty embeddings response]"}
     query_vector = query_result[0]
 
-    collection = _get_collection(config)
-    results = collection.query(
-        query_embeddings=[query_vector],
-        n_results=n_results * 5,  # over-fetch sections so enough distinct papers surface (A3)
-        where={"status": "paper"},
-        include=["documents", "metadatas", "distances"],
-    )
+    # WR-05: any internal failure below (Chroma query error, malformed
+    # metadata, etc.) must surface as the structured papers/stubs/error dict
+    # -- never a raw traceback to the --query CLI / MCP search_similar caller.
+    try:
+        collection = _get_collection(config)
+        results = collection.query(
+            query_embeddings=[query_vector],
+            n_results=n_results * 5,  # over-fetch sections so enough distinct papers surface (A3)
+            where={"status": "paper"},
+            include=["documents", "metadatas", "distances"],
+        )
 
-    docs = (results.get("documents") or [[]])[0]
-    metadatas = (results.get("metadatas") or [[]])[0]
-    distances = (results.get("distances") or [[]])[0]
+        docs = (results.get("documents") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
 
-    papers: dict = {}
-    for doc, meta, dist in zip(docs, metadatas, distances):
-        score = round(1 - dist, 4)
-        key = meta["registry_key"]
-        entry = papers.setdefault(key, {
-            "title": meta["title"],
-            "registry_key": key,
-            "status": meta["status"],
-            "vault_note": meta["vault_note"],
-            "score": score,
-            "sections": [],
-        })
-        entry["sections"].append({
-            "heading": meta["heading"],
-            "score": score,
-            "excerpt": doc[:300],
-        })
-        entry["score"] = max(entry["score"], score)  # D-06: rank by BEST section score
+        papers: dict = {}
+        for doc, meta, dist in zip(docs, metadatas, distances):
+            score = round(1 - dist, 4)
+            key = meta["registry_key"]
+            entry = papers.setdefault(key, {
+                "title": meta["title"],
+                "registry_key": key,
+                "status": meta["status"],
+                "vault_note": meta["vault_note"],
+                "score": score,
+                "sections": [],
+            })
+            entry["sections"].append({
+                "heading": meta["heading"],
+                "score": score,
+                "excerpt": doc[:300],
+            })
+            entry["score"] = max(entry["score"], score)  # D-06: rank by BEST section score
 
-    ranked = sorted(papers.values(), key=lambda p: p["score"], reverse=True)[:n_results]
+        ranked = sorted(papers.values(), key=lambda p: p["score"], reverse=True)[:n_results]
 
-    # Separate stub-hits query (D-15) — never merges into the papers block;
-    # the query embedding is reused, not recomputed.
-    stub_results = collection.query(
-        query_embeddings=[query_vector],
-        n_results=n_results,
-        where={"status": "stub"},
-        include=["documents", "metadatas", "distances"],
-    )
-    stub_docs = (stub_results.get("documents") or [[]])[0]
-    stub_metadatas = (stub_results.get("metadatas") or [[]])[0]
-    stub_distances = (stub_results.get("distances") or [[]])[0]
+        # Separate stub-hits query (D-15) — never merges into the papers block;
+        # the query embedding is reused, not recomputed.
+        stub_results = collection.query(
+            query_embeddings=[query_vector],
+            n_results=n_results,
+            where={"status": "stub"},
+            include=["documents", "metadatas", "distances"],
+        )
+        stub_docs = (stub_results.get("documents") or [[]])[0]
+        stub_metadatas = (stub_results.get("metadatas") or [[]])[0]
+        stub_distances = (stub_results.get("distances") or [[]])[0]
 
-    stubs = [
-        {
-            "title": meta["title"],
-            "registry_key": meta["registry_key"],
-            "score": round(1 - dist, 4),
-            "excerpt": doc[:300],
-        }
-        for doc, meta, dist in zip(stub_docs, stub_metadatas, stub_distances)
-    ]
-    stubs.sort(key=lambda s: s["score"], reverse=True)
-    stubs = stubs[:n_results]
+        stubs = [
+            {
+                "title": meta["title"],
+                "registry_key": meta["registry_key"],
+                "score": round(1 - dist, 4),
+                "excerpt": doc[:300],
+            }
+            for doc, meta, dist in zip(stub_docs, stub_metadatas, stub_distances)
+        ]
+        stubs.sort(key=lambda s: s["score"], reverse=True)
+        stubs = stubs[:n_results]
 
-    return {"papers": ranked, "stubs": stubs}
+        return {"papers": ranked, "stubs": stubs}
+    except Exception as e:
+        return {"papers": [], "stubs": [], "error": f"[search error: {e}]"}
 
 
 # ---------------------------------------------------------------------------

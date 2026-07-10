@@ -328,6 +328,35 @@ def test_search_similar_scoring(tmp_path):
     assert len(result["papers"]) == 3, "all 3 requested papers returned regardless of score (D-09 no cutoff)"
 
 
+def test_search_structured_error_on_malformed_response(tmp_path):
+    """WR-05: _search must always emit the structured papers/stubs/error dict --
+    never a raw traceback -- when Ollama returns an error string (malformed
+    body escalated by _ollama_embed_call's widened except clause) or an empty
+    embeddings list."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+
+    with mock.patch(
+        "scripts.embed._ollama_embed_call",
+        return_value="[Ollama error: Expecting value: line 1 column 1 (char 0)]",
+    ):
+        result = embed._search("some query", 5, config)
+
+    assert isinstance(result, dict)
+    assert result["papers"] == []
+    assert result["stubs"] == []
+    assert result.get("error"), "an Ollama-error string must surface as a non-empty error message"
+
+    with mock.patch("scripts.embed._ollama_embed_call", return_value=[]):
+        result_empty = embed._search("some query", 5, config)
+
+    assert isinstance(result_empty, dict)
+    assert result_empty["papers"] == []
+    assert result_empty["stubs"] == []
+    assert result_empty.get("error"), "an empty embeddings list must also surface a structured error"
+
+
 # ---------------------------------------------------------------------------
 # EMBED-03: stub sweep + stub-upgrade delete (D-14, D-15, D-16)
 # ---------------------------------------------------------------------------
