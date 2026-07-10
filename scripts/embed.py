@@ -335,27 +335,72 @@ def _sweep_stubs(collection, config: dict) -> list:
     return pending
 
 
-def _upgrade_delete(collection, paperjson: dict, config: dict) -> None:
+def _self_key_candidates(paperjson: dict, config: dict) -> set:
     """
-    Delete an upgraded stub's Chroma entry in the same embed pass (D-16).
+    Return the set of candidate self-keys a stub of the paper being embedded
+    could be stored under (CR-02 fix, EMBED-03).
 
-    Re-derives self_key by replicating biblio.run_biblio's exact self_key
-    resolution order (stub-title-index lookup before falling back to
-    _match_key) — RESEARCH.md Pitfall #3 Option 1. NEVER a fresh title
-    normalizer here. The delete is scoped to status=="stub" so it can never
-    clobber the freshly-written paper sections even when self_key equals the
-    paper's own registry_key.
+    biblio.run_biblio's real pipeline order (Step 12c/9b) unlinks a stub's
+    .md file BEFORE embed's tail hook (Step 12d/9c) runs, so the
+    stub-title-index lookup a single-key resolution relies on can miss even
+    though a matching stub entry still lives in Chroma. Rather than resolve
+    ONE self_key, this collects every key a doiless-or-DOI-bearing citer
+    could plausibly have assigned to that stub — computed entirely via
+    biblio's own identity helpers (never a reimplemented title normalizer,
+    RESEARCH Pitfall #3):
+
+      1. the stub-title-index hit (biblio._build_stub_title_index) — the key
+         a DOI-bearing citer registered first for this dedup-normalized title;
+      2. biblio._match_key(metadata) — the DOI-or-title-hash key this paper's
+         own metadata resolves to;
+      3. biblio._match_key({"title": title}) — the FORCED title-hash key (no
+         "doi" field to consult), i.e. the key a doiless citer would have
+         assigned to a stub for this title.
+
+    Returns the set of all non-empty candidates (may be empty if the paper
+    has no title).
     """
     from scripts import biblio  # noqa: PLC0415
 
     metadata = paperjson.get("extraction", {}).get("metadata", {}) or {}
     title = metadata.get("title") or ""
-    stub_title_index = biblio._build_stub_title_index(config)
-    dedup_norm = biblio._normalize_title_for_dedup(title) if title else ""
-    indexed_self_key = stub_title_index.get(dedup_norm) if dedup_norm else None
-    self_key = indexed_self_key if indexed_self_key else biblio._match_key(metadata)
 
-    collection.delete(where={"$and": [{"registry_key": self_key}, {"status": "stub"}]})
+    candidates: set = set()
+
+    if title:
+        stub_title_index = biblio._build_stub_title_index(config)
+        dedup_norm = biblio._normalize_title_for_dedup(title)
+        indexed_self_key = stub_title_index.get(dedup_norm) if dedup_norm else None
+        if indexed_self_key:
+            candidates.add(indexed_self_key)
+
+    match_key = biblio._match_key(metadata)
+    if match_key:
+        candidates.add(match_key)
+
+    if title:
+        title_hash_key = biblio._match_key({"title": title})
+        if title_hash_key:
+            candidates.add(title_hash_key)
+
+    return candidates
+
+
+def _upgrade_delete(collection, paperjson: dict, config: dict) -> None:
+    """
+    Delete an upgraded stub's Chroma entry in the same embed pass (D-16).
+
+    CR-02: a single self_key resolution misses when biblio.run_biblio has
+    already unlinked the stub .md file before this tail hook runs (the
+    stub-title-index then misses, and _match_key(metadata) alone returns the
+    paper's DOI while the stub's real Chroma entry was keyed by a sha256
+    title-hash). Deletes EVERY candidate in _self_key_candidates, each scoped
+    to status=="stub" so the delete can never clobber the freshly-written
+    paper sections even when a candidate equals the paper's own registry_key.
+    """
+    self_keys = _self_key_candidates(paperjson, config)
+    for self_key in self_keys:
+        collection.delete(where={"$and": [{"registry_key": self_key}, {"status": "stub"}]})
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +440,19 @@ def run_embed(paperjson: dict, config: dict) -> str:
         # Sweep vault/Stubs/ for anything not yet embedded (D-14), computed
         # BEFORE deciding whether to return early.
         pending_stubs = _sweep_stubs(collection, config)
+
+        # WR-02: a pending self-stub still on disk (CLI embed, --all backfill,
+        # or a failed biblio unlink) must never be re-embedded alongside this
+        # paper's own sections. Filters out any swept stub whose registry_key
+        # is one of this paper's self-key candidates -- the SAME candidate
+        # set _upgrade_delete uses below, so both agree on one definition of
+        # "self".
+        self_keys_for_filter = _self_key_candidates(paperjson, config)
+        pending_stubs = [
+            (stub_id, stub_doc, stub_metadata)
+            for stub_id, stub_doc, stub_metadata in pending_stubs
+            if stub_metadata.get("registry_key") not in self_keys_for_filter
+        ]
 
         # Upgrade-delete always runs — cheap, Ollama-free, idempotent (D-16).
         _upgrade_delete(collection, paperjson, config)
