@@ -298,6 +298,7 @@ def search_similar(query: str, n_results: int = 5) -> str:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        cwd=str(pathlib.Path(__file__).parent.parent),
     )
     if result.returncode != 0:
         return f"[search_similar error: {result.stderr.strip()}]"
