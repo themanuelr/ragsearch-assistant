@@ -448,6 +448,100 @@ def test_stub_upgrade_deletes_entry(tmp_path):
     assert after_paper["ids"], "the paper's own sections must remain after the upgrade-delete"
 
 
+def test_upgrade_delete_titlehash_stub_after_unlink(tmp_path):
+    """CR-02 pipeline-ordering regression: biblio.run_biblio's real Step 12c/9b
+    unlinks the stub .md file BEFORE embed's tail hook (Step 12d/9c) runs, so the
+    stub-title-index lookup a single-key resolution relies on MISSES. The stub's
+    Chroma entry is keyed by a sha256 title-hash (the key a doiless citer would
+    have assigned it) -- the old single-key _upgrade_delete missed this stub
+    forever. The multi-candidate delete must still find and remove it."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts import biblio  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+    title = "Attention Is All You Need"
+    # Derive the exact title-hash stub_key a doiless citer would have assigned
+    # (a title-only dict has no "doi" field to consult, so _match_key falls
+    # straight to the title-hash chain).
+    titlehash_key = biblio._match_key({"title": title})
+    assert titlehash_key.startswith("sha256:"), "precondition: a genuine title-hash key, not a DOI"
+
+    stub_path = _write_stub(
+        tmp_path, title=title, stub_key=titlehash_key,
+        raw="Vaswani et al., NeurIPS 2017", filename="Attention Is All You Need.md",
+    )
+
+    # Embed the stub first (sweep picks it up on an unrelated paper's run_embed).
+    unrelated = _make_paperjson(title="Unrelated Paper", doi="10.7777/unrelated", year=2018)
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.run_embed(unrelated, config)
+
+    collection = _get_collection(config["chroma_db_path"])
+    before = collection.get(where={"$and": [{"registry_key": titlehash_key}, {"status": "stub"}]})
+    assert before["ids"], "precondition: title-hash stub must be embedded before the unlink+upgrade pass"
+
+    # Simulate biblio's Step 12c/9b unlink -- happens BEFORE embed's tail hook
+    # in the real pipeline -- so the stub-title-index will now MISS.
+    stub_path.unlink()
+
+    # The full paper (matching title, now WITH a DOI) is embedded next.
+    doi = "10.6666/attn"
+    full_paper = _make_paperjson(title=title, doi=doi, year=2017)
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.run_embed(full_paper, config)
+
+    after_stub = collection.get(where={"$and": [{"registry_key": titlehash_key}, {"status": "stub"}]})
+    assert not after_stub["ids"], (
+        "the stale title-hash stub entry must be deleted even though its file was "
+        "unlinked before the upgrade pass ran (CR-02)"
+    )
+
+    after_paper = collection.get(where={"$and": [{"registry_key": doi}, {"status": "paper"}]})
+    assert after_paper["ids"], "the paper's own sections must be present after the upgrade"
+
+
+def test_self_stub_not_reembedded_with_paper(tmp_path):
+    """WR-02: a self-stub still on disk (never pre-embedded, e.g. CLI embed,
+    --all backfill, or a failed biblio unlink) must be filtered out of the
+    pending-stub sweep before upsert, so it's never re-embedded alongside the
+    paper's own sections in the same run_embed pass."""
+    from scripts import embed  # noqa: PLC0415
+    from scripts import biblio  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+    title = "Attention Is All You Need"
+    doi = "10.6666/attn"
+
+    paper = _make_paperjson(title=title, doi=doi, year=2017)
+    registry_key = biblio._match_key(paper["extraction"]["metadata"])
+
+    # Self-stub still on disk with stub_key == the paper's own DOI-derived
+    # registry_key -- written but NEVER pre-embedded (unlike the CR-02 test
+    # above, which embeds the stub first). This is the WR-02 scenario: a
+    # pending self-stub swept in the SAME run_embed pass as its own paper.
+    _write_stub(
+        tmp_path, title=title, stub_key=registry_key,
+        raw="Vaswani et al., NeurIPS 2017", filename="Attention Is All You Need.md",
+    )
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed.run_embed(paper, config)
+
+    collection = _get_collection(config["chroma_db_path"])
+
+    after_paper = collection.get(where={"$and": [{"registry_key": registry_key}, {"status": "paper"}]})
+    assert after_paper["ids"], "the paper's own sections must be embedded"
+
+    after_stub = collection.get(where={"$and": [{"registry_key": registry_key}, {"status": "stub"}]})
+    assert not after_stub["ids"], (
+        "the pending self-stub must be filtered out of the sweep, not upserted "
+        "alongside the paper's own sections (WR-02)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # EMBED-01/EMBED-03: embed.py --all backfill (D-12, Plan 05 Task 2)
 # ---------------------------------------------------------------------------
@@ -519,14 +613,40 @@ def test_backfill_all_filters_registry_embeds_cache_and_stubs_idempotently(tmp_p
     )
 
 
-def test_backfill_all_no_orphan_delete_calls():
-    """Backfill embeds-missing only; it must not introduce any new collection.delete
-    call beyond the existing D-16 (_upgrade_delete) and D-17 (_delete_paper_entries)."""
-    src = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "embed.py").read_text(encoding="utf-8")
-    assert src.count("collection.delete(") == 2, (
-        "expected exactly 2 collection.delete call sites (D-16 upgrade-delete, D-17 "
-        "delete-then-write) -- backfill must add no orphan-reconciliation delete"
+def test_backfill_preserves_orphan_entries(tmp_path):
+    """IN-04 (replaces the brittle test_backfill_all_no_orphan_delete_calls source
+    grep): behaviorally proves backfill performs no orphan-reconciliation delete --
+    a Chroma entry whose registry_key is absent from the registry, cache dir, and
+    Stubs/ survives a backfill pass untouched."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path, extra={"project_name": "proj-a"})
+    pathlib.Path(config["registry_path"]).write_text(json.dumps({}), encoding="utf-8")
+
+    collection = _get_collection(config["chroma_db_path"])
+    orphan_key = "10.0000/orphan-not-in-registry-cache-or-stubs"
+    collection.upsert(
+        ids=[f"{orphan_key}::title::0"],
+        embeddings=[_fixed_vector(0)],
+        documents=["Orphan Paper"],
+        metadatas=[{
+            "registry_key": orphan_key,
+            "title": "Orphan Paper",
+            "heading": "(stub)",
+            "part": 0,
+            "doi": orphan_key,
+            "year": 2000,
+            "status": "paper",
+            "vault_note": "Papers/Orphan Paper.md",
+        }],
     )
+
+    with mock.patch("scripts.embed._ollama_embed_call", side_effect=_auto_embed), \
+         mock.patch("scripts.embed._unload_model"):
+        embed._backfill_all(config)
+
+    after = collection.get(where={"registry_key": orphan_key})
+    assert after["ids"], "an orphaned Chroma entry must survive a backfill pass untouched"
 
 
 def test_backfill_all_filters_by_project_name_and_projects_field():
