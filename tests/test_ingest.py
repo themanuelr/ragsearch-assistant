@@ -6074,3 +6074,211 @@ def test_enrich_assigns_doi_only_on_same_paper_confirmation():
     assert skeleton_b["extraction"]["references"][0].get("doi") is None, (
         "Expected doi=None when _crossref_validate raises RuntimeError (confirmed mismatch)"
     )
+
+
+# ---------------------------------------------------------------------------
+# REG-03: ingest.py --doi flag (D-15..D-18) -- Wave-0 RED contract (06-01-PLAN.md)
+#
+# All 4 tests below name symbols in scripts.ingest that do not exist yet
+# (`_ingest_by_doi`, `_resolve_doi_arg`) -- authored in 06-04-PLAN.md. Every
+# test imports `scripts.ingest` LAZILY inside the body and points
+# paperjson_cache_dir/chroma_db_path at tmp_path (conftest.py pollution
+# guards). Do NOT pytest.importorskip -- these must be RED, not skipped.
+#
+#   - test_doi_flag_not_in_registry_errors (D-18): registry miss -> clear
+#     error, no note, no network call
+#   - test_doi_flag_title_fallback_resolution (D-17): --doi accepts a
+#     normalized-title form via the biblio title-index fallback
+#   - test_doi_flag_cache_present_reuses_step9 (D-15/D-16): cache intact ->
+#     full note, zero LLM fill/analysis calls
+#   - test_doi_flag_cache_absent_fallback_note (D-16): cache missing ->
+#     non-ghost fallback note from registry fields with an honest callout
+# ---------------------------------------------------------------------------
+
+def _make_doi_flag_config(tmp_path, extra=None):
+    """Build an ingest config for REG-03 --doi tests.
+
+    Points registry_path/paperjson_cache_dir/chroma_db_path/vault_path at
+    tmp_path (conftest.py T-rie-03 / Phase 5 pollution guards) and pre-creates
+    the vault's Papers/ and Stubs/ folders.
+    """
+    cfg = {
+        "registry_path": str(tmp_path / "registry.json"),
+        "project_name": "test-project",
+        "vault_path": str(tmp_path / "vault"),
+        "paperjson_cache_dir": str(tmp_path / ".paperjson_cache"),
+        "chroma_db_path": str(tmp_path / "chroma_db"),
+    }
+    if extra:
+        cfg.update(extra)
+    (tmp_path / "vault" / "Papers").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "vault" / "Stubs").mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+def test_doi_flag_not_in_registry_errors(tmp_path, capsys):
+    """REG-03 D-18: --doi for a DOI NOT in the registry exits with a clear
+    error, writes no note, and makes no network call."""
+    from scripts import ingest  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    pathlib.Path(cfg["registry_path"]).write_text("{}", encoding="utf-8")
+
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=AssertionError("no network calls allowed on a --doi registry miss"),
+    ):
+        ingest._ingest_by_doi("10.9999/absent-from-registry", cfg)
+
+    captured = capsys.readouterr()
+    assert "[ingest error:" in captured.err, (
+        f"Expected an '[ingest error:' message on stderr, got "
+        f"stdout={captured.out!r} stderr={captured.err!r}"
+    )
+    papers_dir = pathlib.Path(cfg["vault_path"]) / "Papers"
+    assert list(papers_dir.glob("*.md")) == [], (
+        "Expected no note written to Papers/ on a registry miss"
+    )
+
+
+def test_doi_flag_title_fallback_resolution(tmp_path):
+    """REG-03 D-17: --doi accepts an arXiv-id / normalized-title form via the
+    biblio title-index fallback, not just a raw DOI."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _registry_key, _write_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    title = "Nested Fallback Paper Title"
+    title_key = _registry_key({"title": title})
+    entry = {
+        "title": title, "doi": None, "arxiv_id": None, "authors": None,
+        "year": 2023, "journal": None, "projects": ["test-project"],
+        "source_path": "/old/paper.pdf", "paperjson_path": "/old/paper.json",
+        "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], title_key)
+
+    resolved = ingest._resolve_doi_arg(title, cfg["registry_path"])
+
+    assert resolved is not None, (
+        "Expected the title-index fallback to resolve a title-keyed registry entry"
+    )
+    assert resolved.get("title") == title, f"Expected resolved entry title={title!r}, got {resolved!r}"
+
+
+def test_doi_flag_cache_present_reuses_step9(tmp_path):
+    """REG-03 D-15/D-16: --doi with an intact .paperjson_cache produces the
+    full note via the existing Step 9 cache-hit branch and makes ZERO LLM
+    fill/analysis calls.
+
+    Pre-creates the note (note.py generate_note's self-skip -- verified in
+    06-RESEARCH.md -- is the exact mechanism the Step 9 cache-hit branch
+    relies on for a zero-LLM-call regeneration) so the assertion holds
+    regardless of which internal helper 06-04 wires the --doi dispatch
+    through.
+    """
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry  # noqa: PLC0415
+    from scripts.note import _sanitize_filename  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/cached-paper"
+    title = "Cached Paper With Note"
+
+    pj = {
+        "extraction": {"metadata": {
+            "title": title, "doi": doi, "authors": None, "year": 2024,
+            "journal": None, "arxiv_id": None,
+        }},
+        "analysis": {
+            "summary": "Existing summary.", "claims": ["Existing claim."],
+            "methods_overview": "Existing methods.", "results": "Existing results.",
+            "limitations": ["Existing limitation."], "open_questions": [], "topics": [],
+            "generated_by": "gemma4:e4b",
+        },
+        "provenance": {},
+    }
+    cache_dir = pathlib.Path(cfg["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "cached-paper.json"
+    cache_path.write_text(json.dumps(pj), encoding="utf-8")
+
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None, "authors": None, "year": 2024,
+        "journal": None, "projects": ["test-project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(cache_path), "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    filename = _sanitize_filename(title)
+    note_path = pathlib.Path(cfg["vault_path"]) / "Papers" / f"{filename}.md"
+    note_path.write_text(
+        f'---\ntitle: "{title}"\nstatus: ingested\n---\n\n# {title}\n\n## My Notes\n\n',
+        encoding="utf-8",
+    )
+
+    with mock.patch(
+        "scripts.ingest._fill_metadata",
+        side_effect=AssertionError("fill must not run on --doi cache-present"),
+    ), mock.patch(
+        "scripts.ingest._fill_section",
+        side_effect=AssertionError("fill must not run on --doi cache-present"),
+    ), mock.patch(
+        "scripts.ingest._fill_references_batched",
+        side_effect=AssertionError("fill must not run on --doi cache-present"),
+    ), mock.patch(
+        "scripts.note._analysis_call",
+        side_effect=AssertionError("analysis must not run on --doi cache-present"),
+    ), mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=AssertionError("no network calls allowed on a --doi cache-present run"),
+    ):
+        ingest._ingest_by_doi(doi, cfg)
+
+    assert note_path.exists(), "Expected the full note to remain present in Papers/"
+    content = note_path.read_text(encoding="utf-8")
+    assert content.strip(), "Expected a non-empty note body"
+
+
+def test_doi_flag_cache_absent_fallback_note(tmp_path):
+    """REG-03 D-16: --doi with the PaperJSON cache MISSING writes a NON-ghost
+    note built from registry fields, with an honest callout naming the
+    sections not reconstructable from the registry."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/cache-absent-paper"
+    title = "Cache Absent Paper"
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None,
+        "authors": ["Jane Researcher"], "year": 2022, "journal": "Journal of Examples",
+        "projects": ["test-project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(pathlib.Path(cfg["paperjson_cache_dir"]) / "missing.json"),
+        "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    with mock.patch(
+        "scripts.ingest.urllib.request.urlopen",
+        side_effect=AssertionError("no network calls allowed on a --doi cache-absent run"),
+    ):
+        ingest._ingest_by_doi(doi, cfg)
+
+    papers_dir = pathlib.Path(cfg["vault_path"]) / "Papers"
+    written = list(papers_dir.glob("*.md"))
+    assert len(written) == 1, f"Expected exactly one fallback note written, got {written}"
+    content = written[0].read_text(encoding="utf-8")
+
+    # Non-ghost: body must contain more than the frontmatter block alone.
+    body = content.split("---", 2)[-1]
+    assert body.strip(), "Expected a non-empty body -- never a ghost/empty note (D-16)"
+
+    import yaml  # noqa: PLC0415
+    fm_text = content.split("---", 2)[1]
+    parsed_fm = yaml.safe_load(fm_text)
+    assert parsed_fm.get("title") == title, f"Expected frontmatter title={title!r}, got {parsed_fm!r}"
+
+    assert "[!warning]" in content, (
+        "Expected an honest [!warning] callout naming the non-reconstructable analysis sections"
+    )
