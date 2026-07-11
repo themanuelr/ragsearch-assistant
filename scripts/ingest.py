@@ -2779,6 +2779,241 @@ def ingest_url(url: str, config: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# REG-03: --doi flag -- DOI/arXiv/title -> note materialization without
+# re-processing the PDF (D-15..D-18, Phase 6 Plan 04)
+# ---------------------------------------------------------------------------
+
+def _resolve_doi_arg(doi_arg: str, registry_path: str) -> dict | None:
+    """
+    Resolve a --doi CLI argument to a registry entry (D-17).
+
+    Resolution chain: an exact registry-key hit first (DOI, arXiv ID, or
+    sha256:<title-hash> via _check_registry — no fuzzy matching); on miss,
+    fall back to a normalized-title lookup via biblio's title index. The
+    biblio import is LAZY (function-local) because biblio.py already imports
+    scripts.ingest at module level — a module-level import here would create
+    a circular import (06-RESEARCH.md Anti-Patterns).
+
+    Args:
+        doi_arg:       The raw --doi CLI value (a DOI, arXiv id, or title).
+        registry_path: Absolute path to the registry JSON file.
+
+    Returns:
+        The matched registry entry dict, or None if no match (D-18).
+    """
+    entry = _check_registry(doi_arg, registry_path)
+    if entry is not None:
+        return entry
+
+    from scripts.biblio import _build_title_index, _normalize_title_for_match  # noqa: PLC0415 (lazy import -- circular-import guard)
+    title_index = _build_title_index(registry_path)
+    norm = _normalize_title_for_match(doi_arg)
+    matched_key = title_index.get(norm)
+    if matched_key:
+        return _check_registry(matched_key, registry_path)
+    return None
+
+
+def _render_registry_fallback_note(entry: dict) -> str:
+    """
+    Render a non-ghost REG-03 fallback note from registry fields only (D-16).
+
+    Used when --doi resolves a registry entry whose .paperjson_cache is
+    missing, so the analysis sections (Summary/Key Findings/Methodology/
+    Results/Limitations/Related Topics) cannot be reconstructed. Per
+    06-RESEARCH.md Pitfall 1 recommendation (a), the registry does not
+    persist tags/summary/key_findings — this renderer never reads those keys
+    as if populated, and _registry_entry() stays unchanged this phase.
+
+    Frontmatter quoting/omission mirrors note.py's _render_frontmatter
+    (double-quoted strings, nullable doi/arxiv_id omitted when absent) so the
+    output passes yaml.safe_load() unchanged (SC2).
+
+    Args:
+        entry: A registry entry dict (title/authors/year/journal/doi/arxiv_id).
+
+    Returns:
+        Full note content: YAML frontmatter + H1 + an honest [!warning]
+        callout naming the non-reconstructable sections + "## My Notes".
+    """
+    title = entry.get("title") or "Untitled"
+    escaped_title = str(title).replace('"', '\\"')
+
+    lines = ["---"]
+    lines.append(f'title: "{escaped_title}"')
+
+    authors = entry.get("authors") or []
+    if authors:
+        lines.append("authors:")
+        for a in authors:
+            escaped = str(a).replace('"', '\\"')
+            lines.append(f'  - "{escaped}"')
+
+    year = entry.get("year")
+    if year is not None:
+        lines.append(f"year: {year}")
+
+    journal = entry.get("journal")
+    if journal:
+        escaped = str(journal).replace('"', '\\"')
+        lines.append(f'journal: "{escaped}"')
+
+    # Nullable fields -- omit when None/absent, never emit "doi: null" (skill: obsidian-note-format)
+    doi = entry.get("doi")
+    if doi:
+        lines.append(f'doi: "{doi}"')
+
+    arxiv_id = entry.get("arxiv_id")
+    if arxiv_id:
+        lines.append(f'arxiv_id: "{arxiv_id}"')
+
+    lines.append("status: ingested")
+    lines.append(f"date_ingested: {datetime.date.today().isoformat()}")
+    lines.append("---")
+    lines.append("")  # mirrors note.py _render_frontmatter -- no blank line before the H1
+
+    frontmatter = "\n".join(lines)
+
+    body_lines = [
+        f"# {title}",
+        "",
+        "> [!warning] Registry-Metadata-Only Note",
+        "> This note was reconstructed from papers_registry.json metadata only "
+        "-- the source PaperJSON cache is unavailable, so the following "
+        "sections could not be regenerated: Summary, Key Findings, "
+        "Methodology, Results, Limitations, Related Topics.",
+        "> Re-ingest with --pdf or --url to restore the full analysis.",
+        "",
+        "## My Notes",
+        "",
+    ]
+
+    return frontmatter + "\n".join(body_lines)
+
+
+def _write_doi_fallback_note(entry: dict, config: dict) -> dict:
+    """
+    Write the D-16 registry-metadata fallback note for a --doi cache-absent hit.
+
+    Replaces the honest "skipped -- no vault write" behaviour with a real,
+    non-ghost note write, reusing the same obsidian_cli.create_note
+    chokepoint as note.py/biblio.py/link.py. No LLM call, no network call,
+    no PDF re-processing.
+
+    Args:
+        entry:  The resolved registry entry (title/authors/year/journal/doi/arxiv_id).
+        config: Loaded config.json dict.
+
+    Returns:
+        The registry entry, unchanged (mirrors the cache-hit path's return contract).
+    """
+    from scripts.obsidian_cli import create_note, _validate_vault_path  # noqa: PLC0415
+    from scripts.note import _sanitize_filename  # noqa: PLC0415
+
+    title = entry.get("title") or "Untitled"
+    filename = _sanitize_filename(title)
+    path = f"Papers/{filename}.md"
+
+    try:
+        _validate_vault_path(path, config)
+    except ValueError as e:
+        print(f"[ingest warning: --doi fallback note failed: {e}]", file=sys.stderr)
+        return entry
+
+    content = _render_registry_fallback_note(entry)
+    try:
+        create_note(path, content, config, overwrite=False)
+        print(
+            f"Note:  Papers/{filename}.md (registry-metadata fallback -- "
+            "PaperJSON cache unavailable)"
+        )
+    except Exception as e:
+        print(f"[ingest warning: --doi fallback note failed: {e}]", file=sys.stderr)
+
+    return entry
+
+
+def _ingest_by_doi(doi_arg: str, config: dict) -> dict | None:
+    """
+    Materialize a note for a paper already in the registry, without
+    re-processing the PDF (REG-03 / SC4 / D-15..D-18).
+
+    Resolves doi_arg via _resolve_doi_arg (DOI / arXiv id / title forms,
+    D-17). Not-in-registry: prints a clear "[ingest error: ...]" to stderr,
+    writes no note, makes no network/PDF call, and returns None (D-18).
+    Cache present (.paperjson_cache intact): regenerates the complete note by
+    directly reusing the same note/biblio/embed/link machinery as the Step 9
+    cache-hit branch in _run_fill_cascade — zero LLM fill/analysis calls
+    (D-15). Deliberately does NOT call _warmup_ollama/_doi_probe (those are
+    miss-path-only steps in _run_fill_cascade, not part of the cache-hit
+    note-generation branch being reused here).
+    Cache absent: writes a non-ghost registry-metadata fallback note with an
+    honest callout naming the sections that could not be reconstructed (D-16).
+
+    Args:
+        doi_arg: Raw --doi CLI value (a DOI, arXiv id, or title).
+        config:  Loaded config.json dict.
+
+    Returns:
+        The cached PaperJSON dict (cache-present path) or the registry entry
+        dict (cache-absent fallback path) on success; None on a registry miss.
+    """
+    registry_path = config.get("registry_path", "")
+    entry = _resolve_doi_arg(doi_arg, registry_path)
+    if entry is None:
+        print(
+            f"[ingest error: DOI/paper '{doi_arg}' not in registry -- ingest "
+            "it first with --pdf or --url]",
+            file=sys.stderr,
+        )
+        return None
+
+    pj_path = entry.get("paperjson_path") or ""
+    if not (pj_path and pathlib.Path(pj_path).exists()):
+        # D-16: cache absent -- new code path, never a ghost/empty note.
+        return _write_doi_fallback_note(entry, config)
+
+    # D-15: cache present -- reuse the Step 9 cache-hit branch's note/biblio/
+    # embed/link machinery directly.
+    with open(pj_path, "r", encoding="utf-8") as f:
+        cached_paperjson = json.load(f)
+
+    try:
+        from scripts import note as note_mod  # noqa: PLC0415
+        note_result = note_mod.generate_note(cached_paperjson, config)
+        if isinstance(note_result, str) and note_result.startswith("[note error:"):
+            _log(f"--doi note generation failed: {note_result}")
+    except Exception as e:
+        print(f"[ingest warning: --doi note generation failed: {e}]", file=sys.stderr)
+
+    try:
+        from scripts import biblio as biblio_mod  # noqa: PLC0415
+        biblio_result = biblio_mod.run_biblio(cached_paperjson, config)
+        if isinstance(biblio_result, str) and biblio_result.startswith("[biblio warning:"):
+            _log(f"--doi bibliography linking: {biblio_result}")
+    except Exception as e:
+        print(f"[biblio warning: --doi bibliography linking failed: {e}]", file=sys.stderr)
+
+    try:
+        from scripts import embed as embed_mod  # noqa: PLC0415
+        embed_result = embed_mod.run_embed(cached_paperjson, config)
+        if isinstance(embed_result, str) and embed_result.startswith("[embed warning:"):
+            _log(f"--doi embedding: {embed_result}")
+    except Exception as e:
+        print(f"[embed warning: --doi embedding failed: {e}]", file=sys.stderr)
+
+    try:
+        from scripts import link as link_mod  # noqa: PLC0415
+        link_result = link_mod.run_link(cached_paperjson, config)
+        if isinstance(link_result, str) and link_result.startswith("[link warning:"):
+            _log(f"--doi topic linking: {link_result}")
+    except Exception as e:
+        print(f"[link warning: --doi topic linking failed: {e}]", file=sys.stderr)
+
+    return cached_paperjson
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -2803,6 +3038,13 @@ if __name__ == "__main__":
     source_group.add_argument(
         "--url",
         help="URL of the paper to ingest (arXiv, PubMed, or journal).",
+    )
+    source_group.add_argument(
+        "--doi",
+        help=(
+            "Materialize a note for a paper already in papers_registry.json "
+            "(by DOI, arXiv id, or title) without re-processing the PDF."
+        ),
     )
     parser.add_argument(
         "--force-extract",
@@ -2859,6 +3101,10 @@ if __name__ == "__main__":
             result = ingest(args.pdf, config, force_extract=args.force_extract, refill=args.refill)
         elif args.url:
             result = ingest_url(args.url, config)
+        elif args.doi:
+            result = _ingest_by_doi(args.doi, config)
+            if result is None:
+                sys.exit(1)  # D-18: registry miss -- error already printed, no note, no fetch
 
         # Build a short confirmation: cache path + written note path.
         # Used by the default (non --print) stdout branch; never aborts the run on failure.
@@ -2878,15 +3124,19 @@ if __name__ == "__main__":
                 note_line = f"Note:  [skipped — registry cache-hit, PaperJSON unavailable at {skip_pj}]"
             else:
                 note_line = f"Note:  Papers/{safe_name}.md"
-            # Cache path: derive from pdf stem (PDF) or web cache stem (URL)
+            # Cache path: derive from pdf stem (PDF) or web cache stem (URL);
+            # --doi always has a recorded (or honestly absent) paperjson_path
+            # already on the resolved registry entry -- no stem to derive.
             if args.pdf:
                 cache_path = result.get("paperjson_path") or str(
                     pathlib.Path(".paperjson_cache", pathlib.Path(args.pdf).stem + ".json").resolve()
                 )
-            else:
+            elif args.url:
                 cache_path = result.get("paperjson_path") or str(
                     pathlib.Path(".paperjson_cache", _web_cache_stem(args.url) + ".json").resolve()
                 )
+            else:
+                cache_path = result.get("paperjson_path") or "(no cache path recorded)"
             confirmation = f"Cache: {cache_path}\n{note_line}"
         except Exception:
             pass  # fallback to default "[ingest] done." line
