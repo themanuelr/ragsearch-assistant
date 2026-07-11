@@ -3,8 +3,8 @@ scripts/link.py — Topic-graph linking for ingested papers (Phase 6, GRAPH-01/0
 
 Stateless nuclear-task script: reads the LIVE Papers/ note's ``tags:`` frontmatter
 (D-02 — the note on disk, never the registry snapshot) and maintains
-``Topics/<slug>.md`` index notes (GRAPH-01). Related Topics footer injection
-(GRAPH-02) is added in Task 2.
+``Topics/<slug>.md`` index notes (GRAPH-01), then injects a ``## Related Topics``
+footer section with alias-piped wikilinks on the paper note itself (GRAPH-02).
 
 Zero LLM calls. Runnable standalone or auto-invoked at ingest Step 12e (miss
 path) / Step 9d (cache-hit path).
@@ -38,6 +38,15 @@ from scripts.obsidian_cli import create_note, _vault_root
 # multi-section skeleton the way a paper note does, so a comment-anchor pair
 # is used instead of a heading-based regex.
 _MANAGED_BLOCK_RE = re.compile(r"<!--link:members:start-->[\s\S]*?<!--link:members:end-->")
+
+# Regex for stripping an existing ## Related Topics section on re-link
+# (idempotency). Cross-reference: scripts/biblio.py::_REFS_SECTION_RE /
+# _inject_references_section — this is the same strip-and-reinject shape,
+# reused verbatim with the heading literal swapped (Pitfall 4: note.py's
+# _render_note always places ## My Notes last, so both modules anchor on the
+# identical "\n## My Notes" marker string; a future note.py section-order
+# change must be caught by both).
+_RELATED_TOPICS_RE = re.compile(r"\n## Related Topics\n[\s\S]*?(?=\n## |\Z)")
 
 
 # ---------------------------------------------------------------------------
@@ -202,14 +211,56 @@ def _build_topic_membership(
 
 
 # ---------------------------------------------------------------------------
+# Related Topics injection on the paper note itself (GRAPH-02, D-07/D-08/D-09/D-10)
+# ---------------------------------------------------------------------------
+
+def _inject_related_topics(note_path: str, topics_markdown: str, config: dict) -> None:
+    """Inject, replace, or strip the ``## Related Topics`` section on a note.
+
+    Modeled verbatim on scripts/biblio.py::_inject_references_section (see the
+    module-level cross-reference comment on ``_RELATED_TOPICS_RE`` above).
+    Idempotency: any existing ``## Related Topics`` section is stripped before
+    re-insertion, so a second ``run_link`` call produces exactly one section.
+    Per D-10, when ``topics_markdown`` is empty the stripped content is
+    written back as-is — NO empty header is ever (re-)added. Otherwise the
+    section is inserted immediately before the literal ``"\\n## My Notes"``
+    marker (copied, not retyped, from biblio.py — Pitfall 4), or appended at
+    end-of-file when that marker is absent.
+    """
+    vault_root = _vault_root(config)
+    abs_path = vault_root / note_path
+    if not abs_path.exists():
+        raise FileNotFoundError(f"note not found: {note_path}")
+    content = abs_path.read_text(encoding="utf-8")
+
+    if "\n## Related Topics" in content:
+        content = _RELATED_TOPICS_RE.sub("", content)
+
+    if not topics_markdown:
+        # D-10: zero-tag paper gets no header at all — write the stripped
+        # content back (removes any stale section) and stop.
+        create_note(note_path, content, config, overwrite=True)
+        return
+
+    marker = "\n## My Notes"
+    if marker in content:
+        idx = content.index(marker)
+        updated = content[:idx] + "\n\n## Related Topics\n\n" + topics_markdown + content[idx:]
+    else:
+        updated = content.rstrip("\n") + "\n\n## Related Topics\n\n" + topics_markdown + "\n"
+
+    create_note(note_path, updated, config, overwrite=True)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def run_link(paperjson: dict, config: dict) -> str:
     """
     Non-fatal tail stage: maintain Topics/<slug>.md index notes for this
-    paper's live tags (GRAPH-01). Related Topics footer injection (GRAPH-02)
-    is added by Task 2.
+    paper's live tags (GRAPH-01) and inject/strip the paper note's
+    ## Related Topics section (GRAPH-02).
 
     Returns the paper's vault-relative note path on success, or
     "[link warning: ...]" on any unhandled failure (verbatim contract shape
@@ -249,6 +300,20 @@ def run_link(paperjson: dict, config: dict) -> str:
                 )
                 rendered = _render_topic_note(slug, member_names, existing)
                 create_note(topic_path, rendered, config, overwrite=True)
+
+            # D-08: strictly THIS paper's own topics, no co-topic paper links.
+            # D-09: alias-piped [[flat-basename|Readable Name]], sorted for
+            # determinism.
+            topics_markdown = "\n".join(
+                f"- [[{_topic_flat_basename(slug)}|{_topic_alias(slug)}]]"
+                for slug in this_papers_slugs
+            )
+        else:
+            # D-10: no tags -> _inject_related_topics strips any stale section
+            # and adds no header.
+            topics_markdown = ""
+
+        _inject_related_topics(paper_note_path, topics_markdown, config)
 
         return paper_note_path
     except Exception as e:
