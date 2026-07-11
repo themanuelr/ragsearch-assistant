@@ -11,6 +11,14 @@ Phase 5 (Common Pitfall #8, todo 2026-06-25 / quick-task 260705-rie precedent):
 the same class of bug applies to the real repo-root ``chroma_db/`` ChromaDB store.
 Every tests/test_embed.py test should point ``chroma_db_path`` at ``tmp_path`` (see
 ``_make_embed_config``); ``_guard_real_chroma_db`` below is the safety net.
+
+Phase 6 (06-03, GRAPH-03): the same class of bug applies to the vault root itself.
+``scripts/link.py::_vault_root`` resolves a missing/empty ``vault_path`` to the
+repo root, so any ingest test whose config omits ``vault_path`` and whose paper
+note write is real (not mocked) risks writing a stray ``_Papers.base`` (or
+``Papers/``/``Topics/`` note) straight into the repo root. Every test config that
+reaches the link tail stage should point ``vault_path`` at ``tmp_path``;
+``_guard_real_vault_root`` below is the safety net.
 """
 
 import pathlib
@@ -20,6 +28,9 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _REAL_CACHE_DIR = _REPO_ROOT / ".paperjson_cache"
 _REAL_CHROMA_DIR = _REPO_ROOT / "chroma_db"
+_REAL_PAPERS_BASE = _REPO_ROOT / "_Papers.base"
+_REAL_PAPERS_DIR = _REPO_ROOT / "Papers"
+_REAL_TOPICS_DIR = _REPO_ROOT / "Topics"
 
 
 def _snapshot_cache_files():
@@ -79,4 +90,32 @@ def _guard_real_chroma_db():
         "Test run polluted the real repo-root chroma_db/ with new path(s): "
         f"{sorted(new_paths)}. Point the offending test's config at "
         "'chroma_db_path': str(tmp_path / 'chroma_db') instead."
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_vault_root():
+    """Fail the test session if a stray _Papers.base/Papers//Topics/ lands at repo root.
+
+    A config dict missing ``vault_path`` resolves to the repo root itself
+    (``scripts/obsidian_cli.py::_vault_root``'s empty-string fallback), so any
+    ingest test reaching ``scripts/link.py``'s tail stage with a real (unmocked)
+    paper-note write and no ``vault_path`` override risks writing vault
+    artifacts directly into the repo working tree (06-03 regression class).
+    """
+    before_base = _REAL_PAPERS_BASE.exists()
+    before_papers = _REAL_PAPERS_DIR.exists()
+    before_topics = _REAL_TOPICS_DIR.exists()
+    yield
+    assert before_base or not _REAL_PAPERS_BASE.exists(), (
+        "Test run polluted the real repo root with a stray _Papers.base file. "
+        "Point the offending test's config at 'vault_path': str(tmp_path / 'vault') instead."
+    )
+    assert before_papers or not _REAL_PAPERS_DIR.exists(), (
+        "Test run polluted the real repo root with a stray Papers/ directory. "
+        "Point the offending test's config at 'vault_path': str(tmp_path / 'vault') instead."
+    )
+    assert before_topics or not _REAL_TOPICS_DIR.exists(), (
+        "Test run polluted the real repo root with a stray Topics/ directory. "
+        "Point the offending test's config at 'vault_path': str(tmp_path / 'vault') instead."
     )

@@ -1,10 +1,12 @@
 """
-scripts/link.py — Topic-graph linking for ingested papers (Phase 6, GRAPH-01/02).
+scripts/link.py — Topic-graph linking for ingested papers (Phase 6, GRAPH-01/02/03).
 
 Stateless nuclear-task script: reads the LIVE Papers/ note's ``tags:`` frontmatter
 (D-02 — the note on disk, never the registry snapshot) and maintains
 ``Topics/<slug>.md`` index notes (GRAPH-01), then injects a ``## Related Topics``
 footer section with alias-piped wikilinks on the paper note itself (GRAPH-02).
+Also ensures a static, write-once ``_Papers.base`` Obsidian Bases table view
+exists at the vault root (GRAPH-03).
 
 Zero LLM calls. Runnable standalone or auto-invoked at ingest Step 12e (miss
 path) / Step 9d (cache-hit path).
@@ -13,6 +15,11 @@ Public API:
   run_link(paperjson, config) -> str
       Returns the paper's vault-relative note path on success, or
       "[link warning: ...]" on any unhandled failure — never raises.
+  ensure_papers_base(config) -> str
+      Writes vault/_Papers.base once (write-if-absent, D-13); returns its path.
+  run_backfill(config) -> dict
+      --all/--refresh backfill: rebuilds every topic note + Related Topics
+      section from live Papers/*.md frontmatter (never the registry, D-02/D-06).
 """
 
 import datetime
@@ -26,7 +33,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from scripts.note import _sanitize_filename, _slugify_tag
-from scripts.obsidian_cli import create_note, _vault_root
+from scripts.obsidian_cli import create_note, note_exists, _vault_root
 
 # ---------------------------------------------------------------------------
 # Module constants
@@ -253,6 +260,72 @@ def _inject_related_topics(note_path: str, topics_markdown: str, config: dict) -
 
 
 # ---------------------------------------------------------------------------
+# _Papers.base — static Obsidian Bases database view (GRAPH-03, D-11/D-12/D-13)
+# ---------------------------------------------------------------------------
+
+# Copy-ready YAML pinned in 06-RESEARCH.md against the official Obsidian Bases
+# docs. Scope filter is a POSITIVE or:-of-file.inFolder(...) only -- never a
+# negated condition (Pitfall 3: a negated filter against an optional property
+# silently drops rows whose property is null/missing, which would hide every
+# sparse Stubs/ row, D-14). Tag/year/author/status "filtering" (SC3) is
+# delegated to Obsidian's built-in per-column Filter UI at read time -- no
+# filter YAML is required for that requirement.
+_PAPERS_BASE_CONTENT = """filters:
+  or:
+    - file.inFolder("Papers")
+    - file.inFolder("Stubs")
+
+views:
+  - type: table
+    name: "All Papers"
+    order:
+      - file.name
+      - title
+      - authors
+      - year
+      - journal
+      - status
+      - tags
+
+properties:
+  file.name:
+    displayName: File
+  title:
+    displayName: Title
+  authors:
+    displayName: Authors
+  year:
+    displayName: Year
+  journal:
+    displayName: Journal
+  status:
+    displayName: Status
+  tags:
+    displayName: Topics
+"""
+
+
+def ensure_papers_base(config: dict) -> str:
+    """Write ``_Papers.base`` at the vault root once, if it does not already
+    exist (GRAPH-03, D-13).
+
+    A cheap ``note_exists`` check short-circuits every call after the first
+    write, so re-running this (e.g. once per ingest via ``run_link``, or
+    repeatedly via the ``--all`` backfill) never regenerates or clobbers a
+    user's live Obsidian-UI filter/sort edits to the file. The write itself
+    also goes through ``create_note(..., overwrite=False)`` as a second,
+    authoritative guard against a clobber.
+
+    Returns the absolute path to the (possibly pre-existing) ``_Papers.base``
+    file.
+    """
+    path = "_Papers.base"
+    if note_exists(path, config):
+        return str(_vault_root(config) / path)
+    return create_note(path, _PAPERS_BASE_CONTENT, config, overwrite=False)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -278,9 +351,17 @@ def run_link(paperjson: dict, config: dict) -> str:
         paper_note_path = f"Papers/{_sanitize_filename(title)}.md"
 
         vault_root = _vault_root(config)
+
         abs_note_path = vault_root / paper_note_path
         if not abs_note_path.exists():
             return f"[link warning: paper note not found: {paper_note_path}]"
+
+        # GRAPH-03/D-13: cheap write-if-absent check; a normal ingest also
+        # ensures _Papers.base exists without ever regenerating it. Placed
+        # after the note-found guard so a config/note-write mismatch (e.g. an
+        # ingest test with a mocked-out note write and no vault_path override)
+        # never triggers a stray vault-root write.
+        ensure_papers_base(config)
 
         content = abs_note_path.read_text(encoding="utf-8")
         raw_tags = _parse_tags(content)
