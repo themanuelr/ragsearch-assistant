@@ -22,6 +22,7 @@ Public API:
       section from live Papers/*.md frontmatter (never the registry, D-02/D-06).
 """
 
+import argparse
 import datetime
 import os
 import pathlib
@@ -32,6 +33,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from scripts.ingest import _load_config
 from scripts.note import _sanitize_filename, _slugify_tag
 from scripts.obsidian_cli import create_note, note_exists, _vault_root
 
@@ -399,3 +401,120 @@ def run_link(paperjson: dict, config: dict) -> str:
         return paper_note_path
     except Exception as e:
         return f"[link warning: {e}]"
+
+
+# ---------------------------------------------------------------------------
+# --all/--refresh backfill (D-02/D-06)
+# ---------------------------------------------------------------------------
+
+def run_backfill(config: dict) -> dict:
+    """
+    Standalone backfill entrypoint for ``--all``/``--refresh`` (D-02/D-06):
+    rebuilds EVERY topic note's managed member block and re-injects EVERY
+    paper's ``## Related Topics`` section from current LIVE ``Papers/*.md``
+    tag frontmatter, then ensures ``_Papers.base`` exists.
+
+    Reads live note frontmatter only -- NEVER the registry or
+    ``.paperjson_cache`` (D-02 source-of-truth; the registry/cache can lag or
+    diverge from hand-edited vault tags, which is exactly the pre-existing-vault
+    case this backfill exists to repair).
+
+    Mirrors scripts/embed.py::_backfill_all's shape (before/after-style
+    summary counts, ``_log(...)`` progress lines, small dict return). Never
+    raises -- a failure on an individual topic or paper note is logged and
+    counted in "skipped"; the loop continues. Idempotent: re-running produces
+    no duplicate member entries or Related Topics sections (inherited from
+    ``_render_topic_note``'s and ``_inject_related_topics``'s strip-and-reinject
+    mechanics).
+
+    Returns {"topics": int, "papers": int, "skipped": int}.
+    """
+    vault_root = _vault_root(config)
+    skipped = 0
+
+    membership = _build_topic_membership(vault_root, tags_filter=None)
+    _log(f"backfill: found {len(membership)} topic(s) across the live vault")
+
+    for slug, member_names in membership.items():
+        try:
+            topic_path = _topic_note_path(slug)
+            abs_topic_path = vault_root / topic_path
+            existing = (
+                abs_topic_path.read_text(encoding="utf-8") if abs_topic_path.exists() else None
+            )
+            rendered = _render_topic_note(slug, member_names, existing)
+            create_note(topic_path, rendered, config, overwrite=True)
+        except Exception as e:
+            _log(f"backfill: failed to rebuild topic note for {slug!r}: {e}")
+            skipped += 1
+
+    papers_dir = vault_root / "Papers"
+    papers_processed = 0
+    if papers_dir.is_dir():
+        for note_path in papers_dir.glob("*.md"):
+            try:
+                content = note_path.read_text(encoding="utf-8")
+                raw_tags = _parse_tags(content)
+                this_papers_slugs = sorted(
+                    {slug for slug in (_slugify_tag(t) for t in raw_tags) if slug is not None}
+                )
+                topics_markdown = "\n".join(
+                    f"- [[{_topic_flat_basename(slug)}|{_topic_alias(slug)}]]"
+                    for slug in this_papers_slugs
+                )
+                rel_path = f"Papers/{note_path.stem}.md"
+                _inject_related_topics(rel_path, topics_markdown, config)
+                papers_processed += 1
+            except Exception as e:
+                _log(f"backfill: failed to update Related Topics for {note_path.name}: {e}")
+                skipped += 1
+
+    ensure_papers_base(config)
+
+    _log(
+        f"backfill: rebuilt {len(membership)} topic note(s), updated "
+        f"{papers_processed} paper note(s), skipped {skipped}"
+    )
+    return {"topics": len(membership), "papers": papers_processed, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Windows cp1252 guard (Pitfall 5) — mirrors note.py/biblio.py/embed.py.
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rebuild the topic graph (Topics/ index notes, every paper's "
+            "Related Topics section, and _Papers.base) from live vault note "
+            "frontmatter -- never the registry or .paperjson_cache (D-02/D-06)."
+        )
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Backfill the whole topic graph from live Papers/*.md tags.",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Alias for --all.",
+    )
+    args = parser.parse_args()
+
+    if not (args.all or args.refresh):
+        parser.error("either --all or --refresh is required")
+
+    try:
+        cfg = _load_config()
+        summary = run_backfill(cfg)
+        print(summary)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[link error: {e}]", file=sys.stderr)
+        sys.exit(1)
