@@ -2266,6 +2266,22 @@ def _run_fill_cascade(
                         f"[embed warning: registry-hit embedding failed: {e}]",
                         file=sys.stderr,
                     )
+
+                # Step 9d: registry-hit topic-graph linking (non-fatal tail stage;
+                # Phase 6). Mirrors the Step 9b/9c hooks -- lazy function-local import
+                # (biblio.py imports scripts.ingest at module level, so a module-level
+                # link import here would trip the same circular-import trap) -- and
+                # reuses _cached_paperjson (never re-reads the cache file).
+                try:
+                    from scripts import link as link_mod
+                    _link_result = link_mod.run_link(_cached_paperjson, config)
+                    if isinstance(_link_result, str) and _link_result.startswith("[link warning:"):
+                        _log(f"registry-hit topic linking: {_link_result}")
+                except Exception as e:
+                    print(
+                        f"[link warning: registry-hit topic linking failed: {e}]",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(f"[ingest warning: registry-hit note generation failed: {e}]", file=sys.stderr)
         elif pj_path:
@@ -2445,6 +2461,15 @@ def _run_fill_cascade(
             _log(f"embedding: {embed_result}")
     except Exception as e:
         print(f"[embed warning: embedding failed: {e}]", file=sys.stderr)
+
+    # Step 12e: Topic-graph linking (non-fatal tail stage; Phase 6)
+    try:
+        from scripts import link as link_mod
+        link_result = link_mod.run_link(skeleton, config)
+        if isinstance(link_result, str) and link_result.startswith("[link warning:"):
+            _log(f"topic linking: {link_result}")
+    except Exception as e:
+        print(f"[link warning: topic linking failed: {e}]", file=sys.stderr)
 
     # Step 13: Warn on partial fill, return skeleton
     if failed_count > 0:
