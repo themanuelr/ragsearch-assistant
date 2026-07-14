@@ -397,6 +397,151 @@ def _slugify_tag(topic) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Tag canonicalization at ingest (260714-dpl)
+# ---------------------------------------------------------------------------
+#
+# Immediately after topics are generated and before rendering, each proposed
+# tag slug is canonicalized against the LIVE vault tag vocabulary via a local
+# LLM judgment call (gemma4:e4b, think:false). A true synonym is replaced by
+# the existing canonical slug (the pre-existing vault tag always wins);
+# distinct-but-related topics are left unchanged. The whole step is
+# fail-open: any error, empty vocabulary, or parse failure returns the
+# proposed slugs unchanged so ingest never breaks.
+
+class _TagMap(BaseModel):
+    new: str = Field(..., description="The proposed (new) tag slug")
+    canonical: str = Field(
+        ...,
+        description=(
+            "The existing canonical slug this proposed slug should map to when it "
+            "is a true synonym/duplicate; otherwise the proposed slug itself."
+        ),
+    )
+
+class _TagCanon(BaseModel):
+    mappings: list[_TagMap] = Field(
+        ..., description="One mapping entry per proposed slug"
+    )
+
+
+def _existing_tag_vocabulary(config: dict) -> set[str]:
+    """Return the set of existing tag slugs from the LIVE vault.
+
+    Reuses ``scripts.link._build_topic_membership`` (Papers/*.md live
+    frontmatter) as the vocabulary source -- NOT the registry/
+    ``.paperjson_cache`` (D-02 source-of-truth). Imported lazily to avoid an
+    import cycle / keep the dependency optional. Fail-open: returns an empty
+    set on ANY exception (missing vault_path, unreadable vault, etc.).
+    """
+    try:
+        vault_path = config.get("vault_path")
+        if not vault_path:
+            return set()
+        import pathlib as _pathlib
+        from scripts.link import _build_topic_membership
+        membership = _build_topic_membership(_pathlib.Path(vault_path))
+        return set(membership.keys())
+    except Exception:
+        return set()
+
+
+def _tag_canonicalization_call(proposed: list[str], existing: set[str]) -> dict[str, str] | None:
+    """Ask the local LLM to map each proposed slug to an existing canonical slug.
+
+    Mirrors ``_analysis_call``'s Ollama usage (``_ollama_extraction_call`` +
+    ``_parse_extraction_response``, think:false) but MUST fail open: any
+    Ollama-unreachable/timeout/parse-failure returns None instead of raising
+    (unlike ``_analysis_call``, which raises RuntimeError on unreachable --
+    D-13 -- for the main analysis pipeline).
+
+    Returns:
+        ``{proposed_slug: canonical_slug}`` mapping, or None on any failure.
+    """
+    system = (
+        "You are a tag deduplication assistant for a research paper vault. "
+        "You are given the EXISTING tag vocabulary already used in the vault and "
+        "a list of NEWLY PROPOSED tag slugs for a paper just ingested. "
+        "For each proposed slug, decide whether it is a TRUE SYNONYM or DUPLICATE "
+        "of an existing tag (same concept, just phrased/abbreviated differently). "
+        "If it is a true synonym/duplicate, map it to that EXISTING slug exactly "
+        "as given. If it is a genuinely distinct topic -- even if related to an "
+        "existing tag -- map it to itself unchanged. Do NOT merge distinct-but-"
+        "related topics (e.g. a general topic and a more specific sub-topic are "
+        "DISTINCT, not synonyms). Only ever output existing vocabulary slugs or "
+        "the proposed slug itself -- never invent a new slug. "
+        "Return ONLY valid JSON matching the schema."
+    )
+    prompt = (
+        f"Existing tag vocabulary:\n{sorted(existing)}\n\n"
+        f"Newly proposed tag slugs:\n{proposed}\n\n"
+        "For each proposed slug, return a mapping entry with 'new' set to the "
+        "proposed slug and 'canonical' set to the existing slug it duplicates, "
+        "or to itself if it is distinct."
+    )
+    schema = _TagCanon.model_json_schema()
+    num_ctx = _estimate_num_ctx(prompt, overhead=2048, output_ratio=0.5)
+
+    try:
+        raw = _ollama_extraction_call(
+            prompt, system, schema,
+            num_ctx=num_ctx,
+            timeout=_SECTION_TIMEOUT,
+        )
+    except Exception:
+        return None
+
+    if raw.startswith("[Ollama error:") or raw.startswith("[Ollama timeout:"):
+        return None
+
+    result = _parse_extraction_response(raw, _TagCanon)
+    if result is None:
+        return None
+
+    return {m.new: m.canonical for m in result.mappings}
+
+
+def _canonicalize_tags(topics: list[str], config: dict) -> list[str]:
+    """Canonicalize proposed topic slugs against the live vault tag vocabulary.
+
+    Slugifies ``topics`` (dropping None), then -- if there is an existing
+    vocabulary to compare against -- asks the local LLM which proposed slugs
+    are true synonyms of existing slugs. Every applied replacement is logged
+    (``old -> canonical``). A replacement is applied ONLY when the target is
+    actually present in the existing vocabulary (safety guard against a
+    hallucinated/invented target). Result is deduped, order-preserving.
+
+    Fails open at every stage: empty proposed list, empty vocabulary, a
+    failed/None LLM call, or ANY unexpected exception all return the
+    slugified proposed topics unchanged. Never raises.
+    """
+    proposed = [s for s in (_slugify_tag(t) for t in (topics or [])) if s is not None]
+    try:
+        if not proposed:
+            return proposed
+
+        existing = _existing_tag_vocabulary(config)
+        if not existing:
+            return proposed
+
+        mapping = _tag_canonicalization_call(proposed, existing)
+        if mapping is None:
+            return proposed
+
+        result: list[str] = []
+        for slug in proposed:
+            target = mapping.get(slug, slug)
+            if target != slug and target in existing:
+                _log(f"[note tag-canonicalized: {slug} -> {target}]")
+            else:
+                target = slug
+            if target not in result:
+                result.append(target)
+        return result
+    except Exception:
+        return proposed
+
+
+# ---------------------------------------------------------------------------
 # YAML frontmatter rendering (D-17, D-18, SC2, Pitfall 6)
 # ---------------------------------------------------------------------------
 
@@ -591,6 +736,11 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
 
     # Run analysis generation (7 LLM calls)
     _generate_analysis(paperjson)
+
+    # Tag canonicalization (260714-dpl): merge true-synonym proposed tag slugs
+    # into the existing live-vault canonical slug before rendering (fail-open).
+    analysis = paperjson["analysis"]
+    analysis["topics"] = _canonicalize_tags(analysis.get("topics") or [], config)
 
     # Render the note
     rendered = _render_note(paperjson)
