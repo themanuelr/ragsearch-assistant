@@ -1,0 +1,32 @@
+filters:
+  or:
+    - file.inFolder("Papers")
+    - file.inFolder("Stubs")
+
+views:
+  - type: table
+    name: "All Papers"
+    order:
+      - file.name
+      - title
+      - authors
+      - year
+      - journal
+      - status
+      - tags
+
+properties:
+  file.name:
+    displayName: File
+  title:
+    displayName: Title
+  authors:
+    displayName: Authors
+  year:
+    displayName: Year
+  journal:
+    displayName: Journal
+  status:
+    displayName: Status
+  tags:
+    displayName: Topics
