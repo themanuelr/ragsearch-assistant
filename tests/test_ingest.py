@@ -6282,3 +6282,178 @@ def test_doi_flag_cache_absent_fallback_note(tmp_path):
     assert "[!warning]" in content, (
         "Expected an honest [!warning] callout naming the non-reconstructable analysis sections"
     )
+
+
+# ---------------------------------------------------------------------------
+# Quick task 260714-t1o: universal shared mineru_output_dir / paperjson_cache_dir
+# ---------------------------------------------------------------------------
+
+def test_mineru_output_dir_from_config_drives_out_dir(tmp_path):
+    """config['mineru_output_dir'] drives the MinerU out_dir base (was hardcoded .mineru_output)."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"mineru_output_dir": str(tmp_path / "shared_mineru")})
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for mineru_output_dir test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Shared Mineru Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "Shared Mineru Paper", "plain": "Shared Mineru Paper"},
+            {"type": "text", "display": "C" * 200, "plain": "C" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Shared Mineru Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/shared.mineru",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/shared.mineru", arxiv_id=None, title="Shared Mineru Paper")
+    metadata_result = PaperMetadata(title="Shared Mineru Paper", doi="10.1000/shared.mineru", year=2024)
+    section_fill = SectionFillResult(heading="", body="Shared Mineru Paper " + "C" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru") as mock_run, \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    assert mock_run.call_args.args[1] == str(pathlib.Path(cfg["mineru_output_dir"]) / fake_pdf.stem), (
+        f"Expected MinerU out_dir under configured mineru_output_dir, got {mock_run.call_args.args[1]!r}"
+    )
+
+
+def test_paperjson_cache_dir_from_config_drives_cache_write(tmp_path):
+    """config['paperjson_cache_dir'] drives the PaperJSON cache write location."""
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    cfg = _make_ingest_config(tmp_path, extra={"paperjson_cache_dir": str(tmp_path / "shared_cache")})
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for paperjson_cache_dir test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Shared Cache Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "Shared Cache Paper", "plain": "Shared Cache Paper"},
+            {"type": "text", "display": "D" * 200, "plain": "D" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Shared Cache Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/shared.cache",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/shared.cache", arxiv_id=None, title="Shared Cache Paper")
+    metadata_result = PaperMetadata(title="Shared Cache Paper", doi="10.1000/shared.cache", year=2024)
+    section_fill = SectionFillResult(heading="", body="Shared Cache Paper " + "D" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), cfg)
+
+    assert list((tmp_path / "shared_cache").glob("*.json")), (
+        "expected PaperJSON cache under configured paperjson_cache_dir"
+    )
+
+
+def test_expanduser_applies_to_new_dir_keys():
+    """_load_config expands ~/ for both mineru_output_dir and paperjson_cache_dir."""
+    import scripts.ingest
+
+    cfg_json = json.dumps({
+        "mineru_output_dir": "~/research/mineru_output",
+        "paperjson_cache_dir": "~/research/paperjson_cache",
+    })
+    with mock.patch("builtins.open", mock.mock_open(read_data=cfg_json)):
+        cfg = scripts.ingest._load_config()
+
+    home = str(pathlib.Path.home())
+    assert cfg["mineru_output_dir"].startswith(home) and "~" not in cfg["mineru_output_dir"], (
+        f"Expected home-anchored absolute path, got {cfg['mineru_output_dir']!r}"
+    )
+    assert cfg["paperjson_cache_dir"].startswith(home) and "~" not in cfg["paperjson_cache_dir"], (
+        f"Expected home-anchored absolute path, got {cfg['paperjson_cache_dir']!r}"
+    )
+
+
+def test_absent_dir_keys_fall_back_to_legacy_defaults(tmp_path):
+    """Absent mineru_output_dir/paperjson_cache_dir keys resolve to legacy defaults (back-compat)."""
+    import scripts.ingest
+    from scripts.ingest import ingest, DoiProbeResult, PaperMetadata, SectionFillResult
+
+    # (i) Structural: _load_config on a config missing both keys -- .get() fallback matches legacy.
+    with mock.patch("builtins.open", mock.mock_open(read_data=json.dumps({}))):
+        cfg = scripts.ingest._load_config()
+    assert cfg.get("mineru_output_dir", ".mineru_output") == ".mineru_output"
+    assert cfg.get("paperjson_cache_dir", ".paperjson_cache") == ".paperjson_cache"
+
+    # (ii) Behavioral: an ingest() run with mineru_output_dir OMITTED from config
+    # must still resolve out_dir under the legacy ".mineru_output" base.
+    behavior_cfg = _make_ingest_config(tmp_path)
+    behavior_cfg.pop("mineru_output_dir", None)
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 fake content for legacy fallback test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    mock_parsed = {
+        "title": "Legacy Fallback Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "Legacy Fallback Paper", "plain": "Legacy Fallback Paper"},
+            {"type": "text", "display": "E" * 200, "plain": "E" * 200},
+        ]}],
+        "references": [],
+        "metadata": {
+            "title": "Legacy Fallback Paper",
+            "authors": None,
+            "year": 2024,
+            "journal": None,
+            "doi": "10.1000/legacy.fallback",
+            "arxiv_id": None,
+            "accession_codes": [],
+        },
+    }
+    probe_result = DoiProbeResult(doi="10.1000/legacy.fallback", arxiv_id=None, title="Legacy Fallback Paper")
+    metadata_result = PaperMetadata(title="Legacy Fallback Paper", doi="10.1000/legacy.fallback", year=2024)
+    section_fill = SectionFillResult(heading="", body="Legacy Fallback Paper " + "E" * 200, fill_failed=False)
+
+    with mock.patch("scripts.ingest._run_mineru") as mock_run, \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=mock_parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.ingest._fill_metadata", return_value=metadata_result), \
+         mock.patch("scripts.ingest._fill_section", return_value=section_fill), \
+         mock.patch("scripts.ingest._fill_references_batched", return_value=([], 0)):
+        ingest(str(fake_pdf), behavior_cfg)
+
+    assert mock_run.call_args.args[1] == str(pathlib.Path(".mineru_output") / fake_pdf.stem), (
+        f"Expected legacy .mineru_output base when mineru_output_dir absent, got {mock_run.call_args.args[1]!r}"
+    )
