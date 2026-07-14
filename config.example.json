@@ -13,5 +13,11 @@
   "embed_model": "nomic-embed-text",
   "embed_timeout": 60,
   "embed_batch_size": 16,
-  "embed_section_max_tokens": 2000
+  "embed_section_max_tokens": 2000,
+  "crossref_validate": false,
+  "crossref_contact_email": "",
+  "crossref_timeout": 30,
+  "crossref_retries": 1,
+  "ollama_num_ctx_cap": 65536,
+  "ollama_section_timeout": 300
 }
