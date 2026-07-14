@@ -855,3 +855,263 @@ class TestRenderFrontmatterTagSlugification:
         assert "cation-chloride-cotransporter-ccc" in tags
         assert "calcium-sodium-chloride" in tags
         assert "input/output-gating" in tags
+
+
+# ---------------------------------------------------------------------------
+# 260714-dpl: Tag canonicalization at ingest (dedupe near-duplicate tags)
+# ---------------------------------------------------------------------------
+#
+# _canonicalize_tags(topics, config) canonicalizes proposed topic slugs
+# against the LIVE vault tag vocabulary (scripts.link._build_topic_membership)
+# via a local-LLM judgment call (_tag_canonicalization_call), auto-replacing
+# true synonyms with the existing canonical slug, logging every merge, and
+# failing open (returning proposed slugs unchanged) on any error / empty
+# vocab / parse failure / non-vocab target.
+
+
+class TestExistingTagVocabulary:
+    """_existing_tag_vocabulary(config) — live-vault vocab source (D-02)."""
+
+    def test_uses_build_topic_membership_keys(self, monkeypatch):
+        """Returns the set of keys from scripts.link._build_topic_membership."""
+        from scripts.note import _existing_tag_vocabulary
+
+        def _fake_build_topic_membership(vault_root):
+            return {"topic-a": ["paper1"], "topic-b": ["paper2"]}
+
+        monkeypatch.setattr(
+            "scripts.link._build_topic_membership", _fake_build_topic_membership
+        )
+        result = _existing_tag_vocabulary({"vault_path": "./.local/test-vault"})
+        assert result == {"topic-a", "topic-b"}
+
+    def test_fail_open_no_vault_path(self):
+        """Missing vault_path -> empty set (fail-open), no raise."""
+        from scripts.note import _existing_tag_vocabulary
+
+        assert _existing_tag_vocabulary({}) == set()
+
+    def test_fail_open_on_exception(self, monkeypatch):
+        """Any exception from _build_topic_membership -> empty set (fail-open)."""
+        from scripts.note import _existing_tag_vocabulary
+
+        def _raise(vault_root):
+            raise OSError("boom")
+
+        monkeypatch.setattr("scripts.link._build_topic_membership", _raise)
+        result = _existing_tag_vocabulary({"vault_path": "./.local/test-vault"})
+        assert result == set()
+
+
+class TestCanonicalizeTags:
+    """_canonicalize_tags(topics, config) — merge synonyms, preserve distinct,
+    safety guard, fail-open, dedupe (260714-dpl)."""
+
+    def test_merges_synonym(self, monkeypatch, capsys):
+        """A true synonym proposed slug is replaced by the existing canonical slug,
+        and the merge is logged (old -> canonical)."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {
+                "cryo-electron-microscopy",
+                "ion-transporters",
+                "structural-biology",
+            },
+        )
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call",
+            lambda proposed, existing: {
+                "cryo-electron-microscopy-cryo-em": "cryo-electron-microscopy"
+            },
+        )
+
+        result = _canonicalize_tags(
+            ["cryo-electron-microscopy-cryo-em"], {"vault_path": "x"}
+        )
+
+        assert result == ["cryo-electron-microscopy"]
+        captured = capsys.readouterr()
+        assert "tag-canonicalized" in captured.err, (
+            f"Expected a merge log line on stderr, got: {captured.err!r}"
+        )
+        assert "cryo-electron-microscopy-cryo-em" in captured.err
+        assert "cryo-electron-microscopy" in captured.err
+
+    def test_preserves_distinct_topic(self, monkeypatch):
+        """A genuinely distinct-but-related topic is NOT merged (LLM maps it to itself)."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {"structural-biology"},
+        )
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call",
+            lambda proposed, existing: {
+                "structural-biology-of-transporters": "structural-biology-of-transporters"
+            },
+        )
+
+        result = _canonicalize_tags(
+            ["structural-biology-of-transporters"], {"vault_path": "x"}
+        )
+
+        assert result == ["structural-biology-of-transporters"]
+
+    def test_safety_guard_rejects_non_vocab_target(self, monkeypatch):
+        """Even if the LLM returns a target NOT in the existing vocab, the proposed
+        slug is kept unchanged (never apply a hallucinated/invented target)."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {"ion-transporters"},
+        )
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call",
+            lambda proposed, existing: {"ion-cotransporters": "hallucinated-tag"},
+        )
+
+        result = _canonicalize_tags(["ion-cotransporters"], {"vault_path": "x"})
+
+        assert result == ["ion-cotransporters"]
+
+    def test_fail_open_on_llm_call_error(self, monkeypatch):
+        """When the canonicalization call raises (simulated Ollama down), the
+        proposed slugs are returned unchanged and no exception propagates."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {"cryo-electron-microscopy"},
+        )
+
+        def _raise(proposed, existing):
+            raise RuntimeError("[Ollama error: connection refused]")
+
+        monkeypatch.setattr("scripts.note._tag_canonicalization_call", _raise)
+
+        result = _canonicalize_tags(
+            ["cryo-electron-microscopy-cryo-em"], {"vault_path": "x"}
+        )
+
+        assert result == ["cryo-electron-microscopy-cryo-em"]
+
+    def test_fail_open_on_none_from_llm_call(self, monkeypatch):
+        """When the canonicalization call returns None (parse failure), the
+        proposed slugs are returned unchanged."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {"cryo-electron-microscopy"},
+        )
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call",
+            lambda proposed, existing: None,
+        )
+
+        result = _canonicalize_tags(
+            ["cryo-electron-microscopy-cryo-em"], {"vault_path": "x"}
+        )
+
+        assert result == ["cryo-electron-microscopy-cryo-em"]
+
+    def test_fail_open_on_empty_vocab(self, monkeypatch):
+        """When the existing vocabulary is empty, nothing to canonicalize against —
+        proposed slugs returned unchanged (and the LLM call is never made)."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary", lambda config: set()
+        )
+
+        def _fail_if_called(proposed, existing):
+            raise AssertionError("LLM call should not be made with empty vocab")
+
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call", _fail_if_called
+        )
+
+        result = _canonicalize_tags(["some-topic"], {"vault_path": "x"})
+
+        assert result == ["some-topic"]
+
+    def test_dedupes_order_preserving(self, monkeypatch):
+        """Two proposed slugs canonicalizing to the same existing slug collapse to
+        one entry, preserving first-seen order."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {"cryo-electron-microscopy"},
+        )
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call",
+            lambda proposed, existing: {
+                "cryo-em": "cryo-electron-microscopy",
+                "cryo-electron-microscopy-cryo-em": "cryo-electron-microscopy",
+                "other-topic": "other-topic",
+            },
+        )
+
+        result = _canonicalize_tags(
+            ["cryo-em", "other-topic", "cryo-electron-microscopy-cryo-em"],
+            {"vault_path": "x"},
+        )
+
+        assert result == ["cryo-electron-microscopy", "other-topic"]
+
+    def test_empty_topics_returns_empty(self, monkeypatch):
+        """Empty topics list returns an empty list without calling anything else."""
+        from scripts.note import _canonicalize_tags
+
+        result = _canonicalize_tags([], {"vault_path": "x"})
+
+        assert result == []
+
+    def test_slugifies_proposed_topics(self, monkeypatch):
+        """Raw (non-slug) proposed topics are slugified before canonicalization."""
+        from scripts.note import _canonicalize_tags
+
+        monkeypatch.setattr(
+            "scripts.note._existing_tag_vocabulary",
+            lambda config: {"structural-biology"},
+        )
+        monkeypatch.setattr(
+            "scripts.note._tag_canonicalization_call",
+            lambda proposed, existing: {"structural-biology-topic": "structural-biology"},
+        )
+
+        result = _canonicalize_tags(["Structural Biology Topic"], {"vault_path": "x"})
+
+        assert result == ["structural-biology"]
+
+
+class TestGenerateNoteCanonicalizesTags:
+    """generate_note wires _canonicalize_tags between analysis and render."""
+
+    def test_generate_note_calls_canonicalize_tags(self):
+        from scripts.note import generate_note
+
+        pj = _make_paperjson()
+        config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+        with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
+             mock.patch(
+                 "scripts.note._canonicalize_tags", return_value=["canonical-topic"]
+             ) as mock_canon, \
+             mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+             mock.patch("scripts.note.preflight", return_value=True), \
+             mock.patch("scripts.note.note_exists", return_value=False), \
+             mock.patch("scripts.note.create_note", return_value="Created"):
+
+            generate_note(pj, config, force=False)
+
+        mock_canon.assert_called_once()
+        assert pj["analysis"]["topics"] == ["canonical-topic"], (
+            "generate_note must overwrite analysis['topics'] with the "
+            "canonicalization result before rendering"
+        )
