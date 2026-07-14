@@ -341,7 +341,7 @@ def _load_config() -> dict:
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
     # Expand ~ on path fields
-    for key in ("registry_path", "vault_path", "mineru_path"):
+    for key in ("registry_path", "vault_path", "mineru_path", "mineru_output_dir", "paperjson_cache_dir"):
         if key in cfg and cfg[key]:
             cfg[key] = str(pathlib.Path(cfg[key]).expanduser())
     return cfg
@@ -2537,7 +2537,7 @@ def ingest(pdf_path: str, config: dict, force_extract: bool = False, refill: boo
     global _SECTION_TIMEOUT
     _SECTION_TIMEOUT = int(config.get("ollama_section_timeout", DEFAULT_SECTION_TIMEOUT))
 
-    out_dir = str(pathlib.Path(".mineru_output") / pdf.stem)
+    out_dir = str(pathlib.Path(config.get("mineru_output_dir", ".mineru_output")) / pdf.stem)
     timeout = int(config.get("mineru_timeout", DEFAULT_TIMEOUT))
     registry_path = os.path.expanduser(config.get("registry_path", ""))
     project_name = config.get("project_name", "")
@@ -3129,11 +3129,17 @@ if __name__ == "__main__":
             # already on the resolved registry entry -- no stem to derive.
             if args.pdf:
                 cache_path = result.get("paperjson_path") or str(
-                    pathlib.Path(".paperjson_cache", pathlib.Path(args.pdf).stem + ".json").resolve()
+                    pathlib.Path(
+                        config.get("paperjson_cache_dir", ".paperjson_cache"),
+                        pathlib.Path(args.pdf).stem + ".json",
+                    ).resolve()
                 )
             elif args.url:
                 cache_path = result.get("paperjson_path") or str(
-                    pathlib.Path(".paperjson_cache", _web_cache_stem(args.url) + ".json").resolve()
+                    pathlib.Path(
+                        config.get("paperjson_cache_dir", ".paperjson_cache"),
+                        _web_cache_stem(args.url) + ".json",
+                    ).resolve()
                 )
             else:
                 cache_path = result.get("paperjson_path") or "(no cache path recorded)"

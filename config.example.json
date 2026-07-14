@@ -9,6 +9,8 @@
   "web_min_body_chars": 2000,
   "defuddle_timeout": 60,
   "chroma_db_path": "./chroma_db",
+  "mineru_output_dir": "~/research/mineru_output",
+  "paperjson_cache_dir": "~/research/paperjson_cache",
   "embed_model": "nomic-embed-text",
   "embed_timeout": 60,
   "embed_batch_size": 16,

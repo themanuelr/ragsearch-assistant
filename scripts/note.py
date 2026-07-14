@@ -802,7 +802,9 @@ if __name__ == "__main__":
         if args.paperjson:
             pj_path = args.paperjson
         elif args.stem:
-            pj_path = _resolve_paperjson_path(args.stem)
+            pj_path = _resolve_paperjson_path(
+                args.stem, config.get("paperjson_cache_dir", ".paperjson_cache")
+            )
         else:
             parser.error("either --paperjson or --stem is required")
 

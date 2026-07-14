@@ -888,7 +888,8 @@ if __name__ == "__main__":
             pj_path = args.paperjson
         elif args.stem:
             pj_path = str(
-                (pathlib.Path(".paperjson_cache") / f"{args.stem}.json").resolve()
+                (pathlib.Path(config.get("paperjson_cache_dir", ".paperjson_cache"))
+                 / f"{args.stem}.json").resolve()
             )
         else:
             parser.error("either --paperjson or --stem is required")
