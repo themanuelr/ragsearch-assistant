@@ -17,15 +17,26 @@ Reuses already-verified in-repo subsystems rather than re-deriving them:
 Public API (grows across this phase's plans):
   bootstrap_vault(config) -> dict
   check_external_tools(config) -> dict
+  pull_models(config, models=None) -> dict
+  init_chroma(config) -> dict
+  write_config(values, config_path) -> dict
+  ensure_empty_registry(registry_path) -> dict
 """
 
+import json
 import pathlib
 import shutil
+import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+OLLAMA_BASE = "http://localhost:11434"
+REQUIRED_MODELS = ["nomic-embed-text", "gemma4:e4b"]
 
 
 # ---------------------------------------------------------------------------
@@ -123,4 +134,125 @@ def check_external_tools(config: dict) -> dict:
         "step": "check_external_tools",
         "status": "ok" if not warnings else "warning",
         "detail": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ollama model presence / pull (D-09/D-13/D-14, Pitfall 1)
+# ---------------------------------------------------------------------------
+
+def _ollama_model_names() -> list | None:
+    """Returns installed model names (with :tag suffix), or None if Ollama
+    is unreachable."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_BASE}/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read())
+            return [m["name"] for m in data.get("models", [])]
+    except urllib.error.URLError:
+        return None
+
+
+def _model_present(model: str, installed: list) -> bool:
+    """Compare base repo names only, normalizing the ':tag' suffix mismatch
+    (Pitfall 1 — /api/tags echoes 'nomic-embed-text:latest' for a bare pull)."""
+    base = model.split(":")[0]
+    return any(name.split(":")[0] == base for name in installed)
+
+
+def pull_models(config: dict, models: list | None = None) -> dict:
+    """Pull each of `models` (default REQUIRED_MODELS) via list-form argv
+    subprocess (T-07-02, shell=False). Fail-open: returns a structured error
+    result (never raises) when Ollama is unreachable (D-14)."""
+    if models is None:
+        models = REQUIRED_MODELS
+
+    installed = _ollama_model_names()
+    if installed is None:
+        return {
+            "step": "pull_models",
+            "status": "error",
+            "detail": f"Ollama unreachable at {OLLAMA_BASE}",
+        }
+
+    results = []
+    for model in models:
+        if _model_present(model, installed):
+            results.append({"model": model, "status": "already_present"})
+            continue
+        try:
+            proc = subprocess.run(
+                ["ollama", "pull", model],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                shell=False,
+            )
+            results.append(
+                {
+                    "model": model,
+                    "status": "pulled" if proc.returncode == 0 else "error",
+                    "detail": proc.stderr[-500:] if proc.returncode else None,
+                }
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            results.append({"model": model, "status": "error", "detail": str(e)})
+
+    return {"step": "pull_models", "status": "ok", "detail": results}
+
+
+# ---------------------------------------------------------------------------
+# init_chroma (D-11 — delegates to embed._get_collection, no second client)
+# ---------------------------------------------------------------------------
+
+def init_chroma(config: dict) -> dict:
+    """Delegate ChromaDB bootstrap to scripts.embed._get_collection so both
+    modules share the same PersistentClient path anchoring and cosine
+    'papers' collection (D-11)."""
+    from scripts.embed import _get_collection  # noqa: PLC0415
+
+    try:
+        _get_collection(config)
+        return {
+            "step": "init_chroma",
+            "status": "ok",
+            "detail": f"collection ready at {config.get('chroma_db_path')}",
+        }
+    except Exception as e:
+        return {"step": "init_chroma", "status": "error", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# write_config / ensure_empty_registry (D-12/D-13, T-07-03 — never overwrite)
+# ---------------------------------------------------------------------------
+
+def write_config(values: dict, config_path: pathlib.Path) -> dict:
+    """Write values as config.json, never overwriting an existing file
+    (D-13 security invariant)."""
+    config_path = pathlib.Path(config_path)
+    if config_path.exists():
+        return {
+            "step": "write_config",
+            "status": "skipped",
+            "detail": f"{config_path} already exists — not overwritten (D-13)",
+        }
+    config_path.write_text(json.dumps(values, indent=2), encoding="utf-8")
+    return {"step": "write_config", "status": "ok", "detail": f"wrote {config_path}"}
+
+
+def ensure_empty_registry(registry_path: pathlib.Path) -> dict:
+    """Create an empty papers_registry.json ("{}") if absent; never
+    overwrite an existing registry (D-12/D-13)."""
+    registry_path = pathlib.Path(registry_path)
+    if registry_path.exists():
+        return {
+            "step": "ensure_registry",
+            "status": "skipped",
+            "detail": f"{registry_path} already exists",
+        }
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text("{}", encoding="utf-8")
+    return {
+        "step": "ensure_registry",
+        "status": "ok",
+        "detail": f"created empty registry at {registry_path}",
     }
