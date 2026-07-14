@@ -21,6 +21,7 @@ Public API (grows across this phase's plans):
   init_chroma(config) -> dict
   write_config(values, config_path) -> dict
   ensure_empty_registry(registry_path) -> dict
+  run_setup(values, config, config_path=None) -> dict
 """
 
 import json
@@ -256,3 +257,48 @@ def ensure_empty_registry(registry_path: pathlib.Path) -> dict:
         "status": "ok",
         "detail": f"created empty registry at {registry_path}",
     }
+
+
+# ---------------------------------------------------------------------------
+# run_setup orchestrator (D-14 — fail-open aggregation)
+# ---------------------------------------------------------------------------
+
+def run_setup(values: dict, config: dict, config_path: pathlib.Path | None = None) -> dict:
+    """Run every bootstrap step fail-open: a raised exception in any step is
+    caught and converted to a {step, status: "error", detail} entry rather
+    than aborting the run, so e.g. an unreachable Ollama never blocks vault/
+    config/registry provisioning (D-14).
+
+    `values` supplies the user-chosen vault_path/registry_path/project_name
+    (and any other config.example.json keys) written into config.json;
+    `config` is the effective config dict (usually == values) used to drive
+    bootstrap_vault/check_external_tools/pull_models/init_chroma.
+    """
+    if config_path is None:
+        config_path = _REPO_ROOT / "config.json"
+    config_path = pathlib.Path(config_path)
+
+    registry_path = config.get("registry_path") or values.get("registry_path")
+
+    steps = []
+
+    def _run_step(name, fn, *args):
+        try:
+            result = fn(*args)
+        except Exception as e:
+            result = {"step": name, "status": "error", "detail": str(e)}
+        steps.append(result)
+
+    _run_step("bootstrap_vault", bootstrap_vault, config)
+    _run_step("check_external_tools", check_external_tools, config)
+    _run_step("pull_models", pull_models, config)
+    _run_step("init_chroma", init_chroma, config)
+    _run_step("write_config", write_config, values, config_path)
+    _run_step("ensure_registry", ensure_empty_registry, pathlib.Path(registry_path).expanduser())
+
+    summary = {"ok": 0, "skipped": 0, "warning": 0, "error": 0}
+    for step in steps:
+        status = step.get("status", "error")
+        summary[status] = summary.get(status, 0) + 1
+
+    return {"steps": steps, "summary": summary}

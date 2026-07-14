@@ -82,7 +82,6 @@ keys, grouped by area:
 **Core paths**
 - `registry_path` — path to the shared global papers registry JSON (shared across all your project clones)
 - `vault_path` — path to this project's Obsidian vault
-- `vault_name` — name of the Obsidian vault (used for note metadata)
 - `project_name` — slug identifying this project in the global registry's `projects` list
 
 **PDF extraction**
