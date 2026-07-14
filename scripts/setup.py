@@ -24,6 +24,7 @@ Public API (grows across this phase's plans):
   run_setup(values, config, config_path=None) -> dict
 """
 
+import argparse
 import json
 import pathlib
 import shutil
@@ -302,3 +303,133 @@ def run_setup(values: dict, config: dict, config_path: pathlib.Path | None = Non
         summary[status] = summary.get(status, 0) + 1
 
     return {"steps": steps, "summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Thin argparse CLI front-end (D-01/D-03) -- print/input live ONLY here and
+# in the two helpers below. All orchestration stays in run_setup; this
+# section only prompts, validates paths, calls the core, and renders.
+# ---------------------------------------------------------------------------
+
+def _prompt(label: str, default: str) -> str:
+    """Prompt for a value with an Enter-through default (D-03)."""
+    raw = input(f"{label} [{default}]: ").strip()
+    return raw or default
+
+
+def _print_summary(result: dict) -> None:
+    """Pretty-print the aggregated run_setup per-step summary."""
+    print("\nSetup summary:")
+    for step in result["steps"]:
+        status = step.get("status", "error")
+        detail = step.get("detail")
+        print(f"  [{status.upper():>7}] {step.get('step')}: {detail}")
+    counts = result["summary"]
+    print(
+        f"\n{counts.get('ok', 0)} ok, {counts.get('skipped', 0)} skipped, "
+        f"{counts.get('warning', 0)} warning, {counts.get('error', 0)} error"
+    )
+
+
+def _refuse_sensitive(label: str, path_str: str, force: bool) -> pathlib.Path:
+    """Run _resolve_safe_target on a user-supplied path (V5/T-07-01). Aborts
+    the process unless --force is given; returns the resolved path either
+    way so callers can chain further checks."""
+    target = _resolve_safe_target(path_str)
+    if not target["safe"]:
+        if not force:
+            print(f"ERROR: {label} refused -- {target['reason']}", file=sys.stderr)
+            print("Pass --force to override this safety check.", file=sys.stderr)
+            sys.exit(1)
+        print(f"WARNING: {label} -- {target['reason']} (proceeding due to --force)")
+    return target["resolved"]
+
+
+def _validate_vault_target(vault_path_str: str, force: bool) -> pathlib.Path:
+    """Refuse a sensitive vault_path (via _refuse_sensitive) AND refuse a
+    resolved directory that is already non-empty and does not look like an
+    existing vault (no .obsidian/ and no Papers/) -- unless --force is given
+    (V5/T-07-01)."""
+    resolved = _refuse_sensitive("--vault-path", vault_path_str, force)
+
+    if resolved.exists() and resolved.is_dir() and any(resolved.iterdir()):
+        is_vault = (resolved / ".obsidian").exists() or (resolved / "Papers").exists()
+        if not is_vault:
+            if not force:
+                print(
+                    f"ERROR: --vault-path '{resolved}' is a non-empty directory that does "
+                    "not look like an existing vault (no .obsidian/ or Papers/ found) -- "
+                    "refusing to use it as a bootstrap target.",
+                    file=sys.stderr,
+                )
+                print("Pass --force to override this safety check.", file=sys.stderr)
+                sys.exit(1)
+            print(
+                f"WARNING: --vault-path '{resolved}' is non-empty and not a recognized "
+                "vault (proceeding due to --force)"
+            )
+    return resolved
+
+
+if __name__ == "__main__":
+    # Windows cp1252 guard: wrap stdout in UTF-8 before any print (D-PATTERNS,
+    # mirrors ingest.py/embed.py/link.py).
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "One-command clone-and-go bootstrap for a fresh Research Paper "
+            "Intelligence System clone: creates the vault folder structure, "
+            "pulls the required Ollama models, initializes ChromaDB, and "
+            "writes config.json plus an empty papers_registry.json (SETUP-01). "
+            "Run with no flags for interactive prompts (Enter-through defaults), "
+            "or pass flags directly; add --non-interactive to never prompt."
+        )
+    )
+    parser.add_argument("--vault-path", default=None, help="Target Obsidian vault directory.")
+    parser.add_argument(
+        "--registry-path", default=None, help="Path to the shared papers_registry.json."
+    )
+    parser.add_argument("--project-name", default=None, help="Name for this project clone.")
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Never prompt -- use flags (falling back to config.example.json defaults) for any value not given.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed past a path-safety refusal (sensitive location, or a non-empty directory that isn't already a vault).",
+    )
+    args = parser.parse_args()
+
+    defaults = json.loads((_REPO_ROOT / "config.example.json").read_text(encoding="utf-8"))
+
+    if args.non_interactive:
+        vault_path = args.vault_path or defaults["vault_path"]
+        registry_path = args.registry_path or defaults["registry_path"]
+        project_name = args.project_name or defaults["project_name"]
+    else:
+        vault_path = args.vault_path or _prompt("Vault path", defaults["vault_path"])
+        registry_path = args.registry_path or _prompt("Registry path", defaults["registry_path"])
+        project_name = args.project_name or _prompt("Project name", defaults["project_name"])
+
+    _validate_vault_target(vault_path, args.force)
+    _refuse_sensitive("--registry-path", registry_path, args.force)
+
+    values = dict(defaults)
+    values["vault_path"] = vault_path
+    values["registry_path"] = registry_path
+    values["project_name"] = project_name
+
+    result = run_setup(values, values, config_path=_REPO_ROOT / "config.json")
+
+    _print_summary(result)
+
+    # Non-step, one-time manual instruction (Open Question 2) -- never
+    # automated; documents the one GUI action Obsidian itself requires.
+    print(
+        "\nOne-time manual step: in Obsidian, choose 'Open folder as vault' and select:\n"
+        f"  {pathlib.Path(vault_path).expanduser()}"
+    )
