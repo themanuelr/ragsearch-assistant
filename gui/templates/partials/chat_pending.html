@@ -1,7 +1,8 @@
 {# Rendered by POST /chat/send: the just-sent user message plus a pending
    assistant container wired to the SSE stream. Tokens are appended via
    textContent/createTextNode ONLY (T-08-05) -- LLM output is untrusted and
-   must stay XSS-inert; 'innerHTML' must never appear in this file. #}
+   must stay XSS-inert; the DOM inner-markup setter API must never appear in
+   this file. #}
 <div class="chat-message chat-message-user">
   <div class="chat-message-content">{{ message }}</div>
 </div>

@@ -486,3 +486,23 @@ def test_chat_none_scope_calls_no_retrieval(gui_client, gui_config, monkeypatch)
 
     assert resp.status_code == 200
     assert search_calls == []
+
+
+# ---------------------------------------------------------------------------
+# T-08-05 (threat register): the literal innerHTML API is absent from every
+# chat template -- tokens must reach the DOM via textContent/createTextNode
+# only, keeping untrusted LLM output XSS-inert.
+# ---------------------------------------------------------------------------
+
+def test_no_innerhtml_in_chat_templates():
+    chat_templates_dir = _REPO_ROOT / "gui" / "templates"
+    candidates = [
+        chat_templates_dir / "chat.html",
+        chat_templates_dir / "partials" / "chat_pending.html",
+        chat_templates_dir / "partials" / "chat_sidebar.html",
+        chat_templates_dir / "partials" / "chat_sources.html",
+        chat_templates_dir / "partials" / "chat_blocked.html",
+    ]
+    for tpl in candidates:
+        text = tpl.read_text(encoding="utf-8")
+        assert "innerHTML" not in text, f"{tpl} must never use innerHTML (T-08-05)"
