@@ -1,12 +1,13 @@
 """Overview pages (Project + Universal). Project page + drill-down partial
-filled in by 08-02 (D-09 live scan). Universal page remains a stub, filled
-in by 08-06.
+filled in by 08-02 (D-09 live scan). Universal page (D-11: read-only global
+table + the single 'Import into This Project' action, REG-03) and the
+drill-down's per-stage re-run buttons (D-12) filled in by 08-06.
 """
 
 from fastapi import APIRouter, Request
 
 from gui.config import load_gui_config
-from gui.scan import scan_paper, scan_project_papers, scan_uningested
+from gui.scan import scan_paper, scan_project_papers, scan_uningested, scan_universal
 
 router = APIRouter()
 
@@ -64,14 +65,21 @@ def overview_project_paper(request: Request, registry_key: str):
 
 @router.get("/overview/universal")
 def overview_universal(request: Request):
+    """Render the read-only universal registry table (D-11).
+
+    Plain ``def`` (not ``async def``): scan_universal does blocking
+    file/registry I/O, mirroring overview_project's Pitfall 5 rationale.
+    """
     from gui.app import templates
 
+    config = load_gui_config()
+    entries = scan_universal(config)
     return templates.TemplateResponse(
         request,
-        "stub.html",
+        "overview_universal.html",
         {
             "active_page": "overview_universal",
             "page_title": "Overview (Universal)",
-            "coming_soon": "coming soon — filled by plan 08-06",
+            "entries": entries,
         },
     )

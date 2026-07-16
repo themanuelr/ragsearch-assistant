@@ -18,6 +18,11 @@ Public API:
       ``*.pdf`` files directly inside ``config["uningested_dir"]``
       (non-recursive), sorted by name. Missing directory returns ``[]``
       without creating it.
+  scan_universal(config) -> list[dict]
+      One dict per registry entry, regardless of ``projects[]`` membership
+      (Phase 8 Plan 06, D-11) -- title/year/journal/projects,
+      ``in_this_project``, cache-presence booleans (mineru/paperjson), and
+      the vault-note relative path (or ``None`` if no note exists yet).
 """
 
 import json
@@ -104,22 +109,26 @@ def _note_paths(config: dict, title: str) -> tuple[pathlib.Path, str]:
     return pathlib.Path(vault_path) / "Papers" / f"{filename}.md", rel_path
 
 
-def _build_paper_dict(config: dict, registry_key: str, entry: dict) -> dict:
-    """Build the full per-paper dict (metadata + cache paths + seven stages).
-
-    ``stem`` is derived from the registry entry's recorded ``paperjson_path``
-    when present (the exact field name written by
+def _derive_stem(entry: dict, title: str) -> str:
+    """Derive the cache stem from a registry entry's recorded
+    ``paperjson_path`` (the exact field name written by
     scripts/ingest.py::_registry_entry) so cache lookups agree with what
     ingest.py actually wrote; falls back to the sanitized title only for
-    entries with no recorded paperjson_path.
-    """
-    title = entry.get("title") or ""
+    entries with no recorded paperjson_path. Shared by ``_build_paper_dict``
+    and ``scan_universal`` -- one stem-derivation rule for both pages
+    (Don't Hand-Roll)."""
     paperjson_path_str = entry.get("paperjson_path")
-    stem = (
+    return (
         pathlib.Path(paperjson_path_str).stem
         if paperjson_path_str
         else _sanitize_filename(title)
     )
+
+
+def _build_paper_dict(config: dict, registry_key: str, entry: dict) -> dict:
+    """Build the full per-paper dict (metadata + cache paths + seven stages)."""
+    title = entry.get("title") or ""
+    stem = _derive_stem(entry, title)
 
     mineru_output_dir = config.get("mineru_output_dir") or ".mineru_output"
     mineru_dir = str(pathlib.Path(mineru_output_dir) / stem)
@@ -197,6 +206,42 @@ def scan_paper(config: dict, registry_key: str):
     if entry is None:
         return None
     return _build_paper_dict(config, registry_key, entry)
+
+
+def scan_universal(config: dict) -> list:
+    """Return one dict per registry entry, regardless of ``projects[]``
+    membership (Phase 8 Plan 06, D-11).
+
+    Strictly read-only: reuses ``_stage_mineru`` (recursive glob, never
+    creates a path) and a plain ``pathlib.Path.exists()`` check for the
+    PaperJSON cache -- no write, no ChromaDB touch, no vault write.
+    """
+    registry = _read_registry(config.get("registry_path") or "")
+    project_name = config.get("project_name")
+    paperjson_cache_dir = config.get("paperjson_cache_dir") or ".paperjson_cache"
+
+    entries = []
+    for key, entry in registry.items():
+        title = entry.get("title") or ""
+        stem = _derive_stem(entry, title)
+        paperjson_path = pathlib.Path(paperjson_cache_dir) / f"{stem}.json"
+        note_abs_path, note_rel_path = _note_paths(config, title)
+        projects = entry.get("projects") or []
+
+        entries.append(
+            {
+                "registry_key": key,
+                "title": title,
+                "year": entry.get("year"),
+                "journal": entry.get("journal"),
+                "projects": projects,
+                "in_this_project": bool(project_name and project_name in projects),
+                "mineru_present": _stage_mineru(config, stem),
+                "paperjson_present": paperjson_path.exists(),
+                "vault_note": note_rel_path if note_abs_path.is_file() else None,
+            }
+        )
+    return entries
 
 
 def scan_uningested(config: dict) -> list:

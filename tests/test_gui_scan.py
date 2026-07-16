@@ -335,3 +335,140 @@ def test_scan_reuses_write_side_contracts():
 
     assert scan._REFS_SECTION_RE is biblio._REFS_SECTION_RE
     assert scan._RELATED_TOPICS_RE is link._RELATED_TOPICS_RE
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 Plan 06, Task 1: scan_universal (D-11) + Overview (Universal) page
+# ---------------------------------------------------------------------------
+
+def _patch_overview_config(monkeypatch, gui_config):
+    import gui.routes.overview as overview_routes
+
+    monkeypatch.setattr(overview_routes, "load_gui_config", lambda: gui_config)
+
+
+def _capturing_enqueue(monkeypatch):
+    """Monkeypatch gui.jobs.enqueue to capture (action, argv) without spawning
+    a real subprocess; still registers a real JobState so the route's
+    gui_jobs.get(job_id) call and job_status.html render normally (mirrors
+    tests/test_gui_processing.py's pattern)."""
+    import gui.jobs as gui_jobs
+
+    captured = {"calls": []}
+
+    def _fake_enqueue(action, argv, on_success=None):
+        captured["calls"].append({"action": action, "argv": argv})
+        job_id = f"fake-{len(captured['calls'])}-{action}"
+        gui_jobs.JOBS[job_id] = gui_jobs.JobState(
+            id=job_id, action=action, argv=argv, status="queued",
+            created_at="2026-01-01T00:00:00",
+        )
+        return job_id
+
+    monkeypatch.setattr(gui_jobs, "enqueue", _fake_enqueue)
+    monkeypatch.setattr(gui_jobs, "JOBS", {})
+    return captured
+
+
+def test_scan_universal_returns_all_entries_with_membership_and_cache_presence(gui_config):
+    gui_config["project_name"] = "proj-a"
+    entry_a = _registry_entry(
+        "Project A Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "paper-a.json"),
+        ["proj-a"],
+    )
+    entry_b = _registry_entry(
+        "Project B Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "paper-b.json"),
+        ["proj-b"],
+    )
+    _write_registry(gui_config, {"key-a": entry_a, "key-b": entry_b})
+
+    # key-a gets a MinerU output + PaperJSON cache; key-b gets neither.
+    mineru_dir = pathlib.Path(gui_config["mineru_output_dir"]) / "paper-a" / "auto"
+    mineru_dir.mkdir(parents=True, exist_ok=True)
+    (mineru_dir / "content_list.json").write_text("[]", encoding="utf-8")
+    _write_paperjson(gui_config, "paper-a", _EMPTY_ANALYSIS)
+
+    entries = scan.scan_universal(gui_config)
+    by_key = {e["registry_key"]: e for e in entries}
+
+    assert set(by_key) == {"key-a", "key-b"}
+
+    assert by_key["key-a"]["projects"] == ["proj-a"]
+    assert by_key["key-a"]["in_this_project"] is True
+    assert by_key["key-a"]["mineru_present"] is True
+    assert by_key["key-a"]["paperjson_present"] is True
+
+    assert by_key["key-b"]["projects"] == ["proj-b"]
+    assert by_key["key-b"]["in_this_project"] is False
+    assert by_key["key-b"]["mineru_present"] is False
+    assert by_key["key-b"]["paperjson_present"] is False
+
+
+def test_universal_readonly(gui_client, gui_config, monkeypatch, tmp_path):
+    """scan_universal + a full page render must never create a new path under
+    tmp_path, and the page's only POST target must be /jobs/enqueue with
+    action=ingest_doi (D-11 locked rejection: no other action exists)."""
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    entry = _registry_entry(
+        "Readonly Universal Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "readonly-universal.json"),
+        ["proj-b"],
+    )
+    _write_registry(gui_config, {"key-ru": entry})
+
+    before = _snapshot_files(tmp_path)
+    scan.scan_universal(gui_config)
+    resp = gui_client.get("/overview/universal")
+    after = _snapshot_files(tmp_path)
+
+    assert resp.status_code == 200
+    assert after == before, f"scan_universal / page render created new paths: {after - before}"
+
+    assert 'hx-post="/jobs/enqueue"' in resp.text
+    assert 'name="action" value="ingest_doi"' in resp.text
+    assert "/processing/" not in resp.text
+
+
+def test_overview_universal_page_shows_import_cta_only_for_out_of_project_rows(
+    gui_client, gui_config, monkeypatch
+):
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    entry_in = _registry_entry(
+        "In Project Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "in-project.json"),
+        ["proj-a"],
+    )
+    entry_out = _registry_entry(
+        "Out Of Project Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "out-of-project.json"),
+        ["proj-b"],
+    )
+    _write_registry(gui_config, {"key-in": entry_in, "key-out": entry_out})
+
+    resp = gui_client.get("/overview/universal")
+
+    assert resp.status_code == 200
+    assert "In Project Paper" in resp.text
+    assert "Out Of Project Paper" in resp.text
+    # Only the out-of-project row carries the CTA.
+    assert resp.text.count("Import into This Project") == 1
+
+
+def test_overview_universal_import_enqueues_doi_argv(gui_client, gui_config, monkeypatch):
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/jobs/enqueue", data={"action": "ingest_doi", "doi": "10.1234/out-of-project"}
+    )
+
+    assert resp.status_code == 200
+    assert len(captured["calls"]) == 1
+    argv = captured["calls"][0]["argv"]
+    assert "--doi" in argv
+    assert "10.1234/out-of-project" in argv
