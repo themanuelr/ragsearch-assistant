@@ -10,13 +10,18 @@ privacy constraint; T-08-06).
 """
 
 import argparse
+import os
 import sys
 import webbrowser
 
-import uvicorn
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-from gui.app import app
-from gui.config import load_gui_config
+import uvicorn  # noqa: E402
+
+from gui.app import app  # noqa: E402
+from gui.config import load_gui_config  # noqa: E402
 
 
 def main() -> None:
