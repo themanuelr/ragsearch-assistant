@@ -1,0 +1,39 @@
+{% import "partials/_stage_macros.html" as macros %}
+{% if paper is none %}
+<div class="paper-drilldown">
+  <p>Unknown paper: {{ registry_key }}</p>
+</div>
+{% else %}
+<div class="paper-drilldown">
+  <h3>{{ paper.title }}</h3>
+
+  <ul class="stage-checklist">
+    <li>{{ macros.stage_glyph(paper.stages.mineru) }} <span class="stage-label">MinerU</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.registry) }} <span class="stage-label">Registry</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.paperjson_fill) }} <span class="stage-label">PaperJSON Fill</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.note) }} <span class="stage-label">Note</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.biblio) }} <span class="stage-label">Biblio</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.embed) }} <span class="stage-label">Embed</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.topics) }} <span class="stage-label">Topics</span></li>
+  </ul>
+
+  <dl class="paper-metadata">
+    <dt>Authors</dt>
+    <dd>{{ paper.metadata.authors | join(", ") if paper.metadata.authors else "—" }}</dd>
+    <dt>Year</dt>
+    <dd>{{ paper.metadata.year or "—" }}</dd>
+    <dt>Journal</dt>
+    <dd>{{ paper.metadata.journal or "—" }}</dd>
+    <dt>DOI</dt>
+    <dd>{{ paper.metadata.doi or "—" }}</dd>
+    <dt>Tags</dt>
+    <dd>{{ paper.metadata.tags | join(", ") if paper.metadata.tags else "—" }}</dd>
+  </dl>
+
+  <div class="cache-paths">
+    <div class="stage-label">MinerU dir: <code>{{ paper.cache_paths.mineru_dir }}</code></div>
+    <div class="stage-label">PaperJSON: <code>{{ paper.cache_paths.paperjson_path }}</code></div>
+    <div class="stage-label">Vault note: <code>{{ paper.cache_paths.vault_note }}</code></div>
+  </div>
+</div>
+{% endif %}

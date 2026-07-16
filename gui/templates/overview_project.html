@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% import "partials/_stage_macros.html" as macros %}
+{% block title %}Overview (Project) — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Overview</h1>
+
+  <section>
+    <h2>Papers in This Project</h2>
+    {% if papers %}
+    <table>
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Year</th>
+          <th>MinerU</th>
+          <th>Registry</th>
+          <th>PaperJSON Fill</th>
+          <th>Note</th>
+          <th>Biblio</th>
+          <th>Embed</th>
+          <th>Topics</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for paper in papers %}
+        <tr class="paper-row"
+            hx-get="/overview/project/paper/{{ paper.registry_key }}"
+            hx-target="#paper-detail-{{ loop.index0 }}"
+            hx-swap="innerHTML">
+          <td>{{ paper.title }}</td>
+          <td>{{ paper.metadata.year or "" }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.mineru) }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.registry) }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.paperjson_fill) }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.note) }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.biblio) }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.embed) }}</td>
+          <td>{{ macros.stage_glyph(paper.stages.topics) }}</td>
+        </tr>
+        <tr class="paper-detail-row">
+          <td colspan="9" id="paper-detail-{{ loop.index0 }}"></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty-state-heading">No papers yet</p>
+    <p class="empty-state-body">Ingest a PDF or URL from the Processing page to get started.</p>
+    {% endif %}
+  </section>
+
+  <section class="section-gap">
+    <h2>Drop Folder</h2>
+    {% if pending %}
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Size</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for pdf in pending %}
+        <tr>
+          <td>{{ pdf.name }}</td>
+          <td>{{ pdf.size }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty-state-heading">No PDFs waiting</p>
+    <p class="empty-state-body">Drop PDF files into <code>uningestedPDFs/</code> to see them here.</p>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -1,0 +1,15 @@
+{# Shared stage-glyph macro (08-UI-SPEC.md Status Badge Colors addendum).
+
+   Renders the locked three-state glyph set: done (success, checkmark),
+   missing (text-secondary, open circle), unknown (text-secondary, "?").
+   Imported by overview_project.html and partials/paper_row.html so both the
+   table cells and the drill-down checklist agree on the same rendering. #}
+{% macro stage_glyph(value) %}
+{%- if value is sameas true -%}
+<span class="stage-glyph stage-done">&#10003;</span>
+{%- elif value is sameas false -%}
+<span class="stage-glyph stage-missing">&#9675;</span>
+{%- else -%}
+<span class="stage-glyph stage-unknown">?</span>
+{%- endif -%}
+{% endmacro %}
