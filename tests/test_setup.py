@@ -313,6 +313,8 @@ def test_config_example_matches_write_config_keys(tmp_path):
         "web_min_body_chars": 2000,
         "defuddle_timeout": 60,
         "chroma_db_path": str(tmp_path / "chroma_db"),
+        "mineru_output_dir": str(tmp_path / "mineru_output"),
+        "paperjson_cache_dir": str(tmp_path / "paperjson_cache"),
         "embed_model": "nomic-embed-text",
         "embed_timeout": 60,
         "embed_batch_size": 16,
@@ -323,6 +325,8 @@ def test_config_example_matches_write_config_keys(tmp_path):
         "crossref_retries": 1,
         "ollama_num_ctx_cap": 65536,
         "ollama_section_timeout": 300,
+        "gui_port": 8765,
+        "uningested_dir": "./uningestedPDFs",
     }
 
     target = tmp_path / "config.json"
@@ -332,7 +336,8 @@ def test_config_example_matches_write_config_keys(tmp_path):
     assert written_keys == example_keys, (
         f"config.example.json keys {sorted(example_keys)} do not match "
         f"write_config's written keys {sorted(written_keys)} "
-        "(expected to converge once Plan 03 drops legacy 'vault_name' per D-15)"
+        "(a new config key must be added to both config.example.json and "
+        "this representative_values dict)"
     )
 
 
