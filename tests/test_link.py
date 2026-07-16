@@ -21,7 +21,9 @@ Tests cover:
 Run with:  python -m pytest tests/test_link.py -x
 """
 
+import json
 import pathlib
+import sys
 
 import pytest
 
@@ -294,3 +296,86 @@ def test_papers_base_yaml_shape(tmp_vault, config):
         assert forbidden not in raw, (
             f"Found forbidden negated operator {forbidden!r} in _Papers.base (Pitfall 3 stub-safety guard)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 Plan 03: per-paper CLI flags (--paperjson/--stem), parity-map Gap 1
+#
+# link.main() is called in-process (never a real subprocess) so these tests
+# never touch the real repo-root config.json -- link.py has no --config
+# dev/test seam (unlike embed.py). scripts.link._load_config is monkeypatched
+# directly on the already-imported module instead.
+# ---------------------------------------------------------------------------
+
+def test_cli_stem_resolves_cache_and_runs_link(tmp_vault, config, monkeypatch, capsys):
+    """`python scripts/link.py --stem <stem>` resolves
+    <paperjson_cache_dir>/<stem>.json and runs run_link on it."""
+    from scripts import link  # noqa: PLC0415
+
+    _write_paper_note(tmp_vault, "CLI Stem Paper", tags=["cli-stem"])
+    pj = _make_link_paperjson("CLI Stem Paper")
+
+    cache_dir = tmp_vault / ".paperjson_cache"
+    cache_dir.mkdir()
+    (cache_dir / "cli-stem-paper.json").write_text(json.dumps(pj), encoding="utf-8")
+
+    cli_config = dict(config)
+    cli_config["paperjson_cache_dir"] = str(cache_dir)
+    monkeypatch.setattr(link, "_load_config", lambda: cli_config)
+    monkeypatch.setattr(sys, "argv", ["link.py", "--stem", "cli-stem-paper"])
+
+    link.main()
+
+    assert (tmp_vault / "Topics" / "cli-stem.md").exists()
+    out = capsys.readouterr().out
+    assert "Papers/CLI Stem Paper.md" in out
+
+
+def test_cli_paperjson_wins_over_stem(tmp_vault, config, monkeypatch):
+    """When both --paperjson and --stem are given, --paperjson wins (mirrors
+    biblio.py's precedence)."""
+    from scripts import link  # noqa: PLC0415
+
+    _write_paper_note(tmp_vault, "Explicit Paperjson Paper", tags=["explicit-pj"])
+    pj = _make_link_paperjson("Explicit Paperjson Paper")
+
+    explicit_path = tmp_vault / "explicit.json"
+    explicit_path.write_text(json.dumps(pj), encoding="utf-8")
+
+    cli_config = dict(config)
+    cli_config["paperjson_cache_dir"] = str(tmp_vault / ".paperjson_cache")  # empty/nonexistent
+    monkeypatch.setattr(link, "_load_config", lambda: cli_config)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["link.py", "--paperjson", str(explicit_path), "--stem", "wrong-stem-does-not-exist"],
+    )
+
+    link.main()  # must not raise -- --paperjson wins, --stem is ignored
+
+    assert (tmp_vault / "Topics" / "explicit-pj.md").exists()
+
+
+def test_cli_stem_missing_cache_errors_cleanly(tmp_vault, config, monkeypatch):
+    """A missing cache file exits nonzero with a clean [link error: ...] message
+    -- no traceback."""
+    from scripts import link  # noqa: PLC0415
+
+    cli_config = dict(config)
+    cli_config["paperjson_cache_dir"] = str(tmp_vault / ".paperjson_cache")
+    monkeypatch.setattr(link, "_load_config", lambda: cli_config)
+    monkeypatch.setattr(sys, "argv", ["link.py", "--stem", "missing-stem"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        link.main()
+    assert exc_info.value.code != 0
+
+
+def test_cli_no_flags_errors(monkeypatch):
+    """No --all/--refresh/--stem/--paperjson given -- argparse.error (SystemExit,
+    not a traceback)."""
+    from scripts import link  # noqa: PLC0415
+
+    monkeypatch.setattr(sys, "argv", ["link.py"])
+
+    with pytest.raises(SystemExit):
+        link.main()

@@ -24,6 +24,7 @@ Public API:
 
 import argparse
 import datetime
+import json
 import os
 import pathlib
 import re
@@ -482,16 +483,25 @@ def run_backfill(config: dict) -> dict:
 # Standalone CLI entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    # Windows cp1252 guard (Pitfall 5) — mirrors note.py/biblio.py/embed.py.
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+def main() -> None:
+    """Standalone CLI entry point (factored out of ``if __name__ == "__main__"``,
+    mirroring ``scripts/embed.py``'s ``main()`` shape) so it is callable
+    in-process from tests without a real subprocess touching the repo-root
+    ``config.json`` (``link.py`` has no ``--config`` dev/test seam, unlike
+    ``embed.py``).
 
+    Supports the original ``--all``/``--refresh`` whole-vault backfill plus a
+    new per-paper ``--paperjson``/``--stem`` pair (Phase 8 parity-map Gap 1,
+    08-RESEARCH.md), copied from ``scripts/biblio.py``'s CLI shape and
+    dispatching to ``run_link`` instead of ``run_biblio``.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Rebuild the topic graph (Topics/ index notes, every paper's "
             "Related Topics section, and _Papers.base) from live vault note "
-            "frontmatter -- never the registry or .paperjson_cache (D-02/D-06)."
+            "frontmatter -- never the registry or .paperjson_cache (D-02/D-06). "
+            "Alternatively, re-run topic linking for a single paper via "
+            "--paperjson/--stem (Phase 8 parity-map Gap 1)."
         )
     )
     parser.add_argument(
@@ -504,17 +514,52 @@ if __name__ == "__main__":
         action="store_true",
         help="Alias for --all.",
     )
+    parser.add_argument(
+        "--paperjson",
+        default=None,
+        help="Path to a single PaperJSON v2 cache file (JSON) to re-link.",
+    )
+    parser.add_argument(
+        "--stem",
+        default=None,
+        help=(
+            "PDF/URL stem -- resolves <paperjson_cache_dir>/<stem>.json when "
+            "--paperjson is omitted."
+        ),
+    )
     args = parser.parse_args()
 
-    if not (args.all or args.refresh):
-        parser.error("either --all or --refresh is required")
+    if not (args.all or args.refresh or args.paperjson or args.stem):
+        parser.error("either --all, --refresh, --paperjson, or --stem is required")
 
     try:
         cfg = _load_config()
-        summary = run_backfill(cfg)
-        print(summary)
+
+        if args.all or args.refresh:
+            summary = run_backfill(cfg)
+            print(summary)
+            return
+
+        if args.paperjson:
+            pj_path = args.paperjson
+        else:
+            pj_path = str(
+                (pathlib.Path(cfg.get("paperjson_cache_dir", ".paperjson_cache"))
+                 / f"{args.stem}.json").resolve()
+            )
+        with open(pj_path, encoding="utf-8") as f:
+            paperjson = json.load(f)
+        result = run_link(paperjson, cfg)
+        print(result)
     except SystemExit:
         raise
     except Exception as e:
         print(f"[link error: {e}]", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    # Windows cp1252 guard (Pitfall 5) — mirrors note.py/biblio.py/embed.py.
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    main()
