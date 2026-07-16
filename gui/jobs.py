@@ -421,3 +421,76 @@ def is_busy() -> bool:
     """True while any job is queued or running (08-07's chat-blocked state,
     D-16, reads this)."""
     return any(job.status in ("queued", "running") for job in JOBS.values())
+
+
+# ---------------------------------------------------------------------------
+# Drop-folder cleanup hook (D-10, T-08-14/T-08-15) -- Phase 8 Plan 05
+# ---------------------------------------------------------------------------
+
+def make_drop_cleanup(config: dict, pdf_path):
+    """Build an ``on_success`` callable for a drop-folder PDF ingest job.
+
+    Deletes ``pdf_path`` only when BOTH gates pass:
+      (a) the resolved ``pdf_path`` is inside the resolved
+          ``config["uningested_dir"]`` (containment gate -- T-08-14/T-08-15).
+      (b) a ``content_list.json`` exists under
+          ``mineru_output_dir/<pdf stem>/`` -- i.e. MinerU extraction
+          succeeded for this PDF. This is the locked D-10 semantics:
+          deletion is gated on *MinerU* success, not full-pipeline success
+          (``mineru_output_dir`` already retains the original copy
+          regardless). Reuses ``gui.scan._stage_mineru``'s exact
+          recursive-glob signal (imported locally to keep this module's
+          import surface unchanged at load time) so the write-side scan and
+          this cleanup gate can never disagree about what "MinerU succeeded"
+          means (Don't Hand-Roll).
+
+    A refusal is logged to stderr and the callable simply returns -- never
+    raises. ``_run_job`` already wraps ``on_success`` calls in a try/except
+    so a bug here can't crash the worker thread, but these two checks are
+    the actual security boundary. A missing PDF (already deleted, e.g. a
+    re-run) is a silent no-op.
+    """
+    def _cleanup() -> None:
+        from gui.scan import _stage_mineru  # local import: keep module load order unchanged
+
+        uningested_dir = config.get("uningested_dir")
+        if not uningested_dir:
+            print(
+                "[jobs warning: drop cleanup refused -- no uningested_dir configured]",
+                file=sys.stderr,
+            )
+            return
+
+        try:
+            resolved_pdf = pathlib.Path(pdf_path).resolve()
+            resolved_dir = pathlib.Path(uningested_dir).resolve()
+        except OSError as e:
+            print(
+                f"[jobs warning: drop cleanup refused -- could not resolve paths: {e}]",
+                file=sys.stderr,
+            )
+            return
+
+        try:
+            resolved_pdf.relative_to(resolved_dir)
+        except ValueError:
+            print(
+                f"[jobs warning: drop cleanup refused -- {resolved_pdf} is outside {resolved_dir}]",
+                file=sys.stderr,
+            )
+            return
+
+        stem = resolved_pdf.stem
+        if not _stage_mineru(config, stem):
+            print(
+                f"[jobs warning: drop cleanup skipped -- no content_list.json found for stem {stem!r}]",
+                file=sys.stderr,
+            )
+            return
+
+        try:
+            resolved_pdf.unlink()
+        except FileNotFoundError:
+            pass  # already gone -- no-op
+
+    return _cleanup

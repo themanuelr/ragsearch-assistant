@@ -1,0 +1,9 @@
+{# gui/templates/partials/job_status_list.html -- stacks one job_status.html
+   partial per enqueued job (08-05: Ingest All / Orchestrate). Each job's
+   own queue_position (assigned in enqueue order by gui.jobs) renders
+   naturally through the existing per-job partial. #}
+<div class="job-status-list">
+  {% for job in jobs %}
+    {% include "partials/job_status.html" %}
+  {% endfor %}
+</div>

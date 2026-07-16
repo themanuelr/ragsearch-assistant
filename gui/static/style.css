@@ -301,6 +301,46 @@ textarea:focus {
   gap: var(--space-md);
 }
 
+/* Processing — Drop Folder rows + Per-Paper Orchestration (08-UI-SPEC.md, D-10) */
+
+.drop-rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.drop-row {
+  padding: var(--space-md);
+  background: var(--color-secondary);
+  border-radius: 4px;
+}
+
+.drop-row-info {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-sm);
+}
+
+.drop-row-name {
+  font-weight: 600;
+}
+
+.drop-row-form {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.drop-row-form label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
 /* Docs & Help — doc picker + rendered markdown body (08-UI-SPEC.md, D-21) */
 
 .doc-picker ul {

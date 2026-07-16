@@ -3,7 +3,37 @@
 {% block content %}
   <h1>Processing</h1>
 
-  {# 08-05 inserts the Drop Folder section here #}
+  <section>
+    <h2>Drop Folder</h2>
+    {% if pending %}
+    <button type="button" class="btn"
+            hx-post="/processing/ingest-all"
+            hx-target="#drop-all-status"
+            hx-swap="innerHTML">
+      Ingest All
+    </button>
+    <div id="drop-all-status" class="section-gap"></div>
+    <div class="drop-rows section-gap">
+      {% for pdf in pending %}
+        {% with idx = loop.index0 %}
+          {% include "partials/drop_row.html" %}
+        {% endwith %}
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="empty-state-heading">No PDFs waiting</p>
+    <p class="empty-state-body">Drop PDF files into <code>uningestedPDFs/</code> to see them here.</p>
+    {% endif %}
+
+    <div class="section-gap">
+      <h3>Ingest from URL</h3>
+      <form hx-post="/processing/ingest-url" hx-target="#url-ingest-status" hx-swap="innerHTML">
+        <input type="text" name="url" placeholder="Paper URL (arXiv, PubMed, or journal)">
+        <button type="submit" class="btn">Ingest from URL</button>
+      </form>
+      <div id="url-ingest-status" class="section-gap"></div>
+    </div>
+  </section>
 
   <section class="section-gap">
     <h2>Bulk Actions</h2>
@@ -26,5 +56,5 @@
     <div id="bulk-action-status" class="section-gap"></div>
   </section>
 
-  {# 08-05 inserts the Per-Paper Orchestration section here #}
+  {# 08-05 Task 2 inserts the Per-Paper Orchestration section here #}
 {% endblock %}

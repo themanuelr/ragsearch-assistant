@@ -1,0 +1,28 @@
+{# gui/templates/partials/drop_row.html -- one row per scan_uningested()
+   entry (08-05, D-10). Included inside processing.html's Drop Folder
+   {% for pdf in pending %} loop; `pdf` (loop context, carried by default)
+   and `idx` (explicit {% with idx = loop.index0 %}) come from the caller --
+   `loop` itself is a for-tag-local special var, not part of the template
+   context, so it is never visible inside an {% include %}'d template. #}
+<div class="drop-row" id="drop-row-{{ idx }}">
+  <div class="drop-row-info">
+    <span class="drop-row-name">{{ pdf.name }}</span>
+    <span class="stage-label">{{ pdf.size }} bytes</span>
+  </div>
+  <form class="drop-row-form"
+        hx-post="/processing/ingest"
+        hx-target="#drop-status-{{ idx }}"
+        hx-swap="innerHTML">
+    <input type="hidden" name="filename" value="{{ pdf.name }}">
+    <label>
+      <input type="checkbox" name="force_extract" value="true">
+      Re-run MinerU even if output already exists
+    </label>
+    <label>
+      <input type="checkbox" name="refill" value="true">
+      Re-run the LLM fill reusing existing MinerU output
+    </label>
+    <button type="submit" class="btn">Ingest PDF</button>
+  </form>
+  <div id="drop-status-{{ idx }}" class="section-gap"></div>
+</div>
