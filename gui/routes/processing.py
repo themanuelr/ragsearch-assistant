@@ -28,9 +28,14 @@ from fastapi.responses import PlainTextResponse
 
 from gui import jobs as gui_jobs
 from gui.config import load_gui_config
-from gui.scan import scan_uningested
+from gui.scan import scan_paper, scan_project_papers, scan_uningested
 
 router = APIRouter()
+
+# Canonical per-paper script order (note -> biblio -> embed -> link); used
+# only to break tied order values in POST /processing/orchestrate.
+_CANONICAL_ORDER = {"note": 1, "biblio": 2, "embed": 3, "link": 4}
+_ORCHESTRATE_ACTIONS = {"note": "note", "biblio": "biblio", "embed": "embed", "link": "link_paper"}
 
 
 def _job_status_response(request: Request, job, status_code: int = 200):
@@ -85,6 +90,7 @@ def processing_page(request: Request):
             "active_page": "processing",
             "page_title": "Processing",
             "pending": scan_uningested(config),
+            "papers": scan_project_papers(config),
         },
     )
 
@@ -157,3 +163,52 @@ def processing_ingest_url(request: Request, url: Optional[str] = Form(None)):
     argv = gui_jobs.build_action_argv("ingest_url", config, url=value)
     job_id = gui_jobs.enqueue("ingest_url", argv)
     return _job_status_response(request, gui_jobs.get(job_id))
+
+
+@router.post("/processing/orchestrate")
+def processing_orchestrate(
+    request: Request,
+    registry_key: str = Form(...),
+    note_include: Optional[str] = Form(None),
+    note_order: int = Form(1),
+    biblio_include: Optional[str] = Form(None),
+    biblio_order: int = Form(2),
+    embed_include: Optional[str] = Form(None),
+    embed_order: int = Form(3),
+    link_include: Optional[str] = Form(None),
+    link_order: int = Form(4),
+):
+    """Enqueue any chosen subset/order of note/biblio/embed/link for one
+    project paper (ROADMAP: "pick which scripts run on which paper, and in
+    what order"). ``registry_key`` is looked up as an opaque registry dict
+    key via ``scan_paper`` -- never a filesystem path. The strict FIFO queue
+    (D-06) guarantees the enqueued order is the execution order."""
+    config = load_gui_config()
+
+    paper = scan_paper(config, registry_key)
+    if paper is None:
+        return PlainTextResponse("Not Found", status_code=404)
+
+    selected = []
+    for name, include, order in (
+        ("note", note_include, note_order),
+        ("biblio", biblio_include, biblio_order),
+        ("embed", embed_include, embed_order),
+        ("link", link_include, link_order),
+    ):
+        if include:
+            selected.append((name, order))
+
+    if not selected:
+        return _form_error_response(request, "Select at least one script to run.")
+
+    selected.sort(key=lambda item: (item[1], _CANONICAL_ORDER[item[0]]))
+
+    job_list = []
+    for name, _order in selected:
+        action = _ORCHESTRATE_ACTIONS[name]
+        argv = gui_jobs.build_action_argv(action, config, stem=paper["stem"])
+        job_id = gui_jobs.enqueue(action, argv)
+        job_list.append(gui_jobs.get(job_id))
+
+    return _job_status_list_response(request, job_list)

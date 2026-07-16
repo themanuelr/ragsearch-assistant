@@ -56,5 +56,74 @@
     <div id="bulk-action-status" class="section-gap"></div>
   </section>
 
-  {# 08-05 Task 2 inserts the Per-Paper Orchestration section here #}
+  <section class="section-gap">
+    <h2>Per-Paper Orchestration</h2>
+    <form hx-post="/processing/orchestrate" hx-target="#orchestrate-status" hx-swap="innerHTML">
+      <div class="settings-field">
+        <label for="orchestrate-paper">Paper</label>
+        <select name="registry_key" id="orchestrate-paper">
+          {% for paper in papers %}
+          <option value="{{ paper.registry_key }}">{{ paper.title }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Script</th>
+            <th>Order</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><input type="checkbox" name="note_include" value="true" checked></td>
+            <td>Note</td>
+            <td>
+              <select name="note_order">
+                {% for n in range(1, 5) %}
+                <option value="{{ n }}" {% if n == 1 %}selected{% endif %}>{{ n }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          <tr>
+            <td><input type="checkbox" name="biblio_include" value="true" checked></td>
+            <td>Biblio</td>
+            <td>
+              <select name="biblio_order">
+                {% for n in range(1, 5) %}
+                <option value="{{ n }}" {% if n == 2 %}selected{% endif %}>{{ n }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          <tr>
+            <td><input type="checkbox" name="embed_include" value="true" checked></td>
+            <td>Embed</td>
+            <td>
+              <select name="embed_order">
+                {% for n in range(1, 5) %}
+                <option value="{{ n }}" {% if n == 3 %}selected{% endif %}>{{ n }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+          <tr>
+            <td><input type="checkbox" name="link_include" value="true" checked></td>
+            <td>Link</td>
+            <td>
+              <select name="link_order">
+                {% for n in range(1, 5) %}
+                <option value="{{ n }}" {% if n == 4 %}selected{% endif %}>{{ n }}</option>
+                {% endfor %}
+              </select>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <button type="submit" class="btn">Run Selected</button>
+    </form>
+    <div id="orchestrate-status" class="section-gap"></div>
+  </section>
 {% endblock %}

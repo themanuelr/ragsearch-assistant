@@ -13,6 +13,7 @@ directly -- no job engine involved.
 Run with: python -m pytest tests/test_gui_processing.py -x
 """
 
+import json
 import pathlib
 import queue as queue_module
 
@@ -64,6 +65,30 @@ def _capturing_enqueue(monkeypatch):
 
     monkeypatch.setattr(gui_jobs, "enqueue", _fake_enqueue)
     return captured
+
+
+def _write_registry_entry(gui_config, registry_key, title, stem, projects=("proj-a",)):
+    registry_path = pathlib.Path(gui_config["registry_path"])
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry = {}
+    if registry_path.exists():
+        with open(registry_path, encoding="utf-8") as f:
+            registry = json.load(f)
+    registry[registry_key] = {
+        "title": title,
+        "authors": ["A. Author"],
+        "year": 2021,
+        "journal": "J",
+        "doi": registry_key,
+        "arxiv_id": None,
+        "projects": list(projects),
+        "source_path": "/x/source.pdf",
+        "paperjson_path": str(pathlib.Path(gui_config["paperjson_cache_dir"]) / f"{stem}.json"),
+        "summary": None,
+        "key_findings": None,
+    }
+    with open(registry_path, "w", encoding="utf-8") as f:
+        json.dump(registry, f)
 
 
 # ---------------------------------------------------------------------------
@@ -249,3 +274,94 @@ def test_no_watcher():
 
     processing_source = (gui_dir / "routes" / "processing.py").read_text(encoding="utf-8")
     assert "scan_uningested" in processing_source
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Per-paper orchestration
+# ---------------------------------------------------------------------------
+
+def test_orchestrate_enqueues_in_chosen_order(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "biblio_include": "true", "biblio_order": "2",
+            "link_include": "true", "link_order": "1",
+        },
+    )
+
+    assert resp.status_code == 200
+    calls = captured["calls"]
+    assert len(calls) == 2
+    assert calls[0]["action"] == "link_paper"
+    assert calls[1]["action"] == "biblio"
+    for call in calls:
+        assert "--stem" in call["argv"]
+        assert "known-stem" in call["argv"]
+
+
+def test_orchestrate_unknown_registry_key_404(gui_client, gui_config, monkeypatch):
+    _patch_processing_config(monkeypatch, gui_config)
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={"registry_key": "does-not-exist", "note_include": "true", "note_order": "1"},
+    )
+
+    assert resp.status_code == 404
+    assert captured["calls"] == []
+
+
+def test_orchestrate_empty_selection_enqueues_nothing(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post("/processing/orchestrate", data={"registry_key": "10.1234/known"})
+
+    assert resp.status_code == 200
+    assert captured["calls"] == []
+    assert "select" in resp.text.lower()
+
+
+def test_orchestrate_embed_argv_contains_paperjson_cache_path(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={"registry_key": "10.1234/known", "embed_include": "true", "embed_order": "1"},
+    )
+
+    assert resp.status_code == 200
+    argv = captured["calls"][0]["argv"]
+    expected_path = str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "known-stem.json")
+    assert argv[-1] == expected_path
+
+
+def test_processing_page_has_paper_select_and_script_rows(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    resp = gui_client.get("/processing")
+
+    assert resp.status_code == 200
+    assert 'name="registry_key"' in resp.text
+    assert "A Known Paper" in resp.text
+    for field in ("note_include", "biblio_include", "embed_include", "link_include"):
+        assert field in resp.text
+    for field in ("note_order", "biblio_order", "embed_order", "link_order"):
+        assert field in resp.text
