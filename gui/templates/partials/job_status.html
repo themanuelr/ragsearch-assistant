@@ -1,0 +1,39 @@
+{# Job status partial (Phase 8 Plan 03, D-07/D-08). Self-terminating ~2s
+   polling: hx-get/hx-trigger are present only while the job is queued or
+   running -- terminal-state renders omit them entirely so polling stops
+   naturally (RESEARCH.md Open Question 3 resolution). #}
+<div id="job-{{ job.id }}"
+     {% if job.status in ("queued", "running") %}
+     hx-get="/jobs/{{ job.id }}/status" hx-trigger="every 2s" hx-swap="outerHTML"
+     {% endif %}>
+  <div class="job-status-row">
+    <span class="job-badge job-badge-{{ job.status }}">{{ job.status }}</span>
+    {% if job.status == "queued" and job.queue_position %}
+      <span class="stage-label">(position {{ job.queue_position }})</span>
+    {% endif %}
+    <span class="stage-label job-action">{{ job.action }}</span>
+    <a class="job-log-link" href="/jobs/{{ job.id }}/log">View full log</a>
+  </div>
+  <pre class="gui-log job-tail">{{ job.tail | join("\n") }}</pre>
+  {% if job.status in ("queued", "running") %}
+    <div class="job-cancel-area">
+      <button type="button" class="destructive" id="cancel-toggle-{{ job.id }}"
+              onclick="document.getElementById('cancel-toggle-{{ job.id }}').style.display='none';
+                       document.getElementById('cancel-confirm-{{ job.id }}').style.display='block';">
+        Cancel Job
+      </button>
+      <div id="cancel-confirm-{{ job.id }}" class="job-cancel-confirm" style="display:none;">
+        <p>Cancel this job? Progress will be lost and the process will be killed immediately.</p>
+        <button type="button" class="destructive"
+                hx-post="/jobs/{{ job.id }}/cancel" hx-target="#job-{{ job.id }}" hx-swap="outerHTML">
+          Cancel Job
+        </button>
+        <button type="button"
+                onclick="document.getElementById('cancel-confirm-{{ job.id }}').style.display='none';
+                         document.getElementById('cancel-toggle-{{ job.id }}').style.display='inline-block';">
+          Keep Running
+        </button>
+      </div>
+    </div>
+  {% endif %}
+</div>

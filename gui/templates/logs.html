@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Logs & Activity — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Logs & Activity</h1>
+
+  {% if live %}
+    <h2>Active Jobs</h2>
+    {% for job in live %}
+      {% include "partials/job_status.html" %}
+    {% endfor %}
+  {% endif %}
+
+  <h2 class="section-gap">Job History</h2>
+  {% if not history %}
+    <p class="empty-state-heading">No jobs yet</p>
+    <p class="empty-state-body">Job history will appear here after you run your first pipeline action.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Job</th>
+          <th>Action</th>
+          <th>Status</th>
+          <th>Started</th>
+          <th>Finished</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in history %}
+          <tr>
+            <td><a href="/jobs/{{ job.id }}/log">{{ job.id }}</a></td>
+            <td>{{ job.action }}</td>
+            <td><span class="job-badge job-badge-{{ job.status }}">{{ job.status }}</span></td>
+            <td class="stage-label">{{ job.started_at or "—" }}</td>
+            <td class="stage-label">{{ job.finished_at or "—" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+{% endblock %}

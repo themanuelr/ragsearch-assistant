@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Job Log — {{ job.id }} — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Job Log</h1>
+  <p class="stage-label">
+    {{ job.id }} — {{ job.action }} —
+    <span class="job-badge job-badge-{{ job.status }}">{{ job.status }}</span>
+  </p>
+  <pre class="gui-log job-tail">{{ log_text }}</pre>
+  <p class="stage-label">
+    Final status: {{ job.status }}{% if job.returncode is not none %} (exit code {{ job.returncode }}){% endif %}
+  </p>
+  <p><a href="/logs">Back to Logs & Activity</a></p>
+{% endblock %}

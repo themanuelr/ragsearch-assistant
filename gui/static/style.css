@@ -229,3 +229,74 @@ textarea:focus {
   font-family: var(--font-mono);
   font-size: 12px;
 }
+
+/* Logs & Activity / job status partial (08-UI-SPEC.md Status Badge Colors) */
+
+.job-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-sm);
+}
+
+.job-badge {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: 4px;
+  background: var(--color-secondary);
+}
+
+.job-badge-queued {
+  color: var(--color-text-secondary);
+}
+
+.job-badge-running {
+  color: var(--color-accent);
+}
+
+.job-badge-done {
+  color: var(--color-success);
+}
+
+.job-badge-error,
+.job-badge-cancelled {
+  color: var(--color-destructive);
+}
+
+.job-action {
+  color: var(--color-text-secondary);
+}
+
+.job-log-link {
+  color: var(--color-accent);
+  margin-left: auto;
+}
+
+.job-tail {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--space-sm);
+  margin: 0 0 var(--space-sm) 0;
+}
+
+.job-cancel-area {
+  margin-bottom: var(--space-md);
+}
+
+.job-cancel-confirm {
+  margin-top: var(--space-sm);
+  padding: var(--space-md);
+  background: var(--color-secondary);
+  border-radius: 4px;
+}
+
+.job-cancel-confirm button {
+  margin-right: var(--space-sm);
+}
+
+.bulk-actions {
+  display: flex;
+  gap: var(--space-md);
+}
