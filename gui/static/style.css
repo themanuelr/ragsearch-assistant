@@ -432,3 +432,127 @@ textarea:focus {
   color: var(--color-success);
   font-weight: 600;
 }
+
+/* Chat page (D-13..D-18) */
+
+.chat-layout {
+  display: flex;
+  gap: var(--space-lg);
+}
+
+.chat-sidebar {
+  flex: 0 0 220px;
+}
+
+.chat-conv-list {
+  list-style: none;
+  margin: var(--space-md) 0 0 0;
+  padding: 0;
+}
+
+.chat-conv-item {
+  padding: var(--space-sm) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.chat-conv-item.active .chat-conv-link {
+  font-weight: 600;
+  color: var(--color-accent);
+}
+
+.chat-conv-link {
+  color: var(--color-text-primary);
+  text-decoration: none;
+  display: block;
+}
+
+.chat-conv-actions {
+  display: flex;
+  gap: var(--space-sm);
+  margin-top: var(--space-xs);
+}
+
+.chat-conv-actions button {
+  font-size: 12px;
+  padding: var(--space-xs) var(--space-sm);
+}
+
+.chat-rename-form,
+.chat-delete-confirm {
+  margin-top: var(--space-sm);
+  padding: var(--space-sm);
+  background: var(--color-secondary);
+  border-radius: 4px;
+}
+
+.chat-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-messages {
+  min-height: 240px;
+  margin-bottom: var(--space-md);
+}
+
+.chat-message {
+  margin-bottom: var(--space-md);
+}
+
+.chat-message-user .chat-message-content {
+  font-weight: 600;
+}
+
+.chat-message-banner {
+  margin: var(--space-xs) 0;
+}
+
+.chat-truncation-warning {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  margin: var(--space-xs) 0;
+}
+
+.chat-sources summary {
+  cursor: pointer;
+  color: var(--color-accent);
+  font-size: 12px;
+}
+
+.chat-sources-list {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  list-style: none;
+  margin: var(--space-xs) 0 0 0;
+  padding: 0;
+}
+
+.chat-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-bottom: var(--space-sm);
+}
+
+.chat-scope {
+  display: flex;
+  gap: var(--space-md);
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12px;
+}
+
+.chat-vault-picker {
+  margin-bottom: var(--space-sm);
+}
+
+.chat-input {
+  width: 100%;
+  min-height: 80px;
+  margin-bottom: var(--space-sm);
+}
+
+.chat-blocked-copy {
+  color: var(--color-text-secondary);
+}

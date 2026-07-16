@@ -1,0 +1,41 @@
+{# Chat conversation sidebar (D-18): New Chat / per-conversation Rename+Delete
+   with the UI-SPEC inline delete confirm -- no modal framework (D-02). #}
+<form method="post" action="/chat/new">
+  <button type="submit" class="btn">New Chat</button>
+</form>
+
+<ul class="chat-conv-list">
+  {% for conv in conversations %}
+    <li class="chat-conv-item{% if active_conv and conv.id == active_conv.id %} active{% endif %}">
+      <a href="/chat?conv={{ conv.id }}" class="chat-conv-link">{{ conv.title }}</a>
+
+      <div class="chat-conv-actions">
+        <button type="button"
+                onclick="document.getElementById('chat-rename-{{ conv.id }}').style.display='block';">
+          Rename
+        </button>
+        <button type="button" class="destructive"
+                onclick="document.getElementById('chat-delete-confirm-{{ conv.id }}').style.display='block';">
+          Delete
+        </button>
+      </div>
+
+      <form id="chat-rename-{{ conv.id }}" method="post" action="/chat/{{ conv.id }}/rename"
+            class="chat-rename-form" style="display:none;">
+        <input type="text" name="title" value="{{ conv.title }}">
+        <button type="submit" class="btn">Save</button>
+      </form>
+
+      <div id="chat-delete-confirm-{{ conv.id }}" class="chat-delete-confirm" style="display:none;">
+        <p>Delete this conversation? This can't be undone.</p>
+        <form method="post" action="/chat/{{ conv.id }}/delete">
+          <button type="submit" class="destructive">Delete</button>
+        </form>
+        <button type="button"
+                onclick="document.getElementById('chat-delete-confirm-{{ conv.id }}').style.display='none';">
+          Cancel
+        </button>
+      </div>
+    </li>
+  {% endfor %}
+</ul>

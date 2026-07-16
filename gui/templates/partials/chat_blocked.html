@@ -1,0 +1,8 @@
+{# D-16: chat hard-blocked while a pipeline job runs. Rendered in place of the
+   message input -- Text secondary color, no destructive/error styling (this
+   is a normal, expected state, not a failure). Deliberately has no <form>
+   with hx-post="/chat/send" -- no send action is reachable while blocked. #}
+<div class="chat-blocked" id="chat-blocked-notice">
+  <p class="chat-blocked-copy">{{ blocked_copy }}</p>
+  <textarea class="chat-input" disabled></textarea>
+</div>

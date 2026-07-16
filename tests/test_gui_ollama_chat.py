@@ -1,5 +1,7 @@
 """Tests for gui/ollama_chat.py (Phase 8 Plan 07, Task 1): the NDJSON->SSE
-streaming bridge (D-13) and model listing (D-17).
+streaming bridge (D-13) and model listing (D-17). Also covers the Chat page
+routes in gui/routes/chat.py (Task 2: model picker/blocked state/persistence,
+Task 3: retrieval scopes) per the plan's <action> instructions.
 
 Mocks ``urllib.request.urlopen`` per the existing Ollama-call mocking
 convention (see ``tests/test_ingest.py``'s ``_FakeHttpResponse``) — no live
@@ -16,10 +18,22 @@ import pathlib
 import urllib.error
 from unittest import mock
 
+import pytest
+
+import gui.chat_store as chat_store_module
+import gui.jobs as gui_jobs_module
 import gui.ollama_chat as ollama_chat
 from gui.ollama_chat import _stream_ollama_chat, list_models
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _tmp_chat_store(tmp_path, monkeypatch):
+    """Every test in this file gets a fresh, tmp-scoped chat store dir --
+    never the real ``.local/gui_chats/``."""
+    monkeypatch.setattr(chat_store_module, "STORE_DIR", tmp_path / "gui_chats")
+    yield
 
 
 class _FakeStreamResponse:
@@ -198,3 +212,115 @@ def test_no_new_http_client_dependency():
 
 def test_module_defines_ollama_base_constant():
     assert ollama_chat.OLLAMA_BASE == "http://localhost:11434"
+
+
+# ---------------------------------------------------------------------------
+# gui/routes/chat.py -- Task 2: model picker, D-16 blocked state, persistence
+# ---------------------------------------------------------------------------
+
+def test_chat_page_enabled_when_not_busy(gui_client, gui_config, monkeypatch):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    resp = gui_client.get("/chat")
+
+    assert resp.status_code == 200
+    assert 'hx-post="/chat/send"' in resp.text
+    assert "Chat is paused while a pipeline job runs" not in resp.text
+    assert "Start a conversation" in resp.text
+
+
+def test_chat_page_disabled_and_blocked_copy_when_busy(gui_client, gui_config, monkeypatch):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: True)
+    monkeypatch.setattr(gui_jobs_module, "list_jobs", lambda: [])
+
+    resp = gui_client.get("/chat")
+
+    assert resp.status_code == 200
+    assert "Chat is paused while a pipeline job runs" in resp.text
+    assert 'hx-post="/chat/send"' not in resp.text
+    assert "<textarea" in resp.text and "disabled" in resp.text
+
+
+def test_chat_page_model_dropdown_lists_tags_and_preselects_config_model(
+    gui_client, gui_config, monkeypatch
+):
+    gui_config["model_name"] = "gemma4:e4b"
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr(
+        "gui.routes.chat.list_models",
+        lambda: (["gemma4:e4b", "llama3:8b"], None),
+    )
+
+    resp = gui_client.get("/chat")
+
+    assert resp.status_code == 200
+    assert 'value="gemma4:e4b" selected' in resp.text
+    assert "llama3:8b" in resp.text
+
+
+def test_chat_send_appends_user_message_and_returns_stream_markup(
+    gui_client, gui_config, monkeypatch
+):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "Hello there",
+            "model": "llama3:8b",
+            "scope": "none",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "Hello there" in resp.text
+    assert "/chat/stream" in resp.text
+
+    saved = chat_store_module.load(conv["id"])
+    assert saved["messages"][0] == {"role": "user", "content": "Hello there"}
+    assert saved["model"] == "llama3:8b"
+
+
+def test_chat_blocked_while_busy(gui_client, gui_config, monkeypatch):
+    """D-16 prohibition: while busy, POST /chat/send returns the blocked
+    partial without attempting any retrieval/Ollama call, and GET /chat
+    renders the disabled input with the D-16 copy."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: True)
+    monkeypatch.setattr(gui_jobs_module, "list_jobs", lambda: [])
+
+    conv = chat_store_module.create_conversation()
+
+    search_calls = []
+    monkeypatch.setattr(
+        "gui.routes.chat._resolve_scope",
+        lambda *a, **k: (search_calls.append(1) or ([], None, None, None)),
+    )
+    stream_calls = []
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: (stream_calls.append(1) or iter([])),
+    )
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "hi", "model": "gemma4:e4b", "scope": "none"},
+    )
+
+    assert resp.status_code == 200
+    assert "Chat is paused while a pipeline job runs" in resp.text
+    assert search_calls == [], "no retrieval scope should be resolved while busy"
+    assert stream_calls == [], "no Ollama call should be attempted while busy"
+
+    get_resp = gui_client.get("/chat")
+    assert "Chat is paused while a pipeline job runs" in get_resp.text
+    assert 'hx-post="/chat/send"' not in get_resp.text

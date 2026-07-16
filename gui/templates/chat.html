@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Chat — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Chat</h1>
+
+  {% if model_error %}
+    <p class="settings-error">Can't reach Ollama at localhost:11434. Start Ollama and try again.</p>
+  {% endif %}
+
+  <div class="chat-layout">
+    <aside class="chat-sidebar">
+      {% include "partials/chat_sidebar.html" %}
+    </aside>
+
+    <div class="chat-main">
+      <div id="chat-messages" class="chat-messages">
+        {% if active_conv and active_conv.messages %}
+          {% for m in active_conv.messages %}
+            <div class="chat-message chat-message-{{ m.role }}">
+              <div class="chat-message-content">{{ m.content }}</div>
+              {% if m.banner %}
+                <p class="settings-error chat-message-banner">{{ m.banner }}</p>
+              {% endif %}
+              {% if m.truncation_notes %}
+                <p class="chat-truncation-warning">
+                  Context truncated — dropped from this answer: {{ m.truncation_notes | join(', ') }}
+                </p>
+              {% endif %}
+              {% if m.sources %}
+                {% include "partials/chat_sources.html" %}
+              {% endif %}
+            </div>
+          {% endfor %}
+        {% else %}
+          <p class="empty-state-heading">Start a conversation</p>
+          <p class="empty-state-body">Ask a question below — optionally pick a retrieval scope on the left.</p>
+        {% endif %}
+      </div>
+
+      {% if busy %}
+        {% include "partials/chat_blocked.html" %}
+      {% else %}
+        <form id="chat-send-form" hx-post="/chat/send" hx-target="#chat-messages" hx-swap="beforeend">
+          <input type="hidden" name="conv" value="{{ active_conv.id if active_conv else '' }}">
+
+          <div class="chat-controls">
+            <select name="model" class="chat-model-select">
+              {% for name in model_names %}
+                <option value="{{ name }}" {% if name == selected_model %}selected{% endif %}>{{ name }}</option>
+              {% endfor %}
+            </select>
+
+            <fieldset class="chat-scope">
+              <label><input type="radio" name="scope" value="none" checked> None</label>
+              <label><input type="radio" name="scope" value="chroma"> ChromaDB</label>
+              <label><input type="radio" name="scope" value="vault"> Paper Vault</label>
+            </fieldset>
+          </div>
+
+          <div class="chat-vault-picker">
+            <label for="chat-vault-notes">Papers (Paper Vault scope)</label>
+            <select name="notes" id="chat-vault-notes" multiple>
+              {% for paper in papers %}
+                <option value="{{ paper.cache_paths.vault_note }}">{{ paper.title }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <textarea name="message" class="chat-input"
+                    placeholder="Ask a question below — optionally pick a retrieval scope on the left."
+                    required></textarea>
+          <button type="submit" class="btn">Send</button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}

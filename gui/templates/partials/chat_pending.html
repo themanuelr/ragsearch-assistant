@@ -1,0 +1,42 @@
+{# Rendered by POST /chat/send: the just-sent user message plus a pending
+   assistant container wired to the SSE stream. Tokens are appended via
+   textContent/createTextNode ONLY (T-08-05) -- LLM output is untrusted and
+   must stay XSS-inert; 'innerHTML' must never appear in this file. #}
+<div class="chat-message chat-message-user">
+  <div class="chat-message-content">{{ message }}</div>
+</div>
+{% if banner %}
+  <p class="settings-error chat-message-banner">{{ banner }}</p>
+{% endif %}
+{% if truncation_notes %}
+  <p class="chat-truncation-warning">
+    Context truncated — dropped from this answer: {{ truncation_notes | join(', ') }}
+  </p>
+{% endif %}
+<div class="chat-message chat-message-assistant" id="chat-assistant-{{ conv_id }}">
+  <div class="chat-message-content" id="chat-assistant-content-{{ conv_id }}"></div>
+</div>
+<script>
+  (function () {
+    var target = document.getElementById("chat-assistant-content-{{ conv_id }}");
+    var es = new EventSource(
+      "/chat/stream?conv={{ conv_id | urlencode }}&model={{ model | urlencode }}"
+    );
+    es.onmessage = function (evt) {
+      var data = JSON.parse(evt.data);
+      if (data.token) {
+        target.appendChild(document.createTextNode(data.token));
+      }
+      if (data.error) {
+        target.appendChild(document.createTextNode(data.error));
+        es.close();
+      }
+      if (data.done) {
+        es.close();
+      }
+    };
+    es.onerror = function () {
+      es.close();
+    };
+  })();
+</script>

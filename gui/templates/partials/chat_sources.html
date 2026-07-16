@@ -1,0 +1,15 @@
+{# Retrieval "Sources" block (D-14/D-15) -- collapsed by default (native
+   details/summary, zero JS), header "Sources ({n})", rows
+   "{paper title} — {section} (score {0.NN})" in --font-mono at Label size.
+   Retrieved context is never injected silently -- every retrieval-scoped
+   answer renders this block. #}
+<details class="chat-sources">
+  <summary>Sources ({{ m.sources | length }})</summary>
+  <ul class="chat-sources-list">
+    {% for src in m.sources %}
+      <li class="chat-source-row">
+        {{ src.title }} — {{ src.section }}{% if src.score is not none %} (score {{ '%.2f' | format(src.score) }}){% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+</details>
