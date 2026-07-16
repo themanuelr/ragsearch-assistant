@@ -268,7 +268,9 @@ def _run_job(job: "JobState") -> None:
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
+            errors="replace",
             bufsize=1,
+            env={**os.environ, "PYTHONUTF8": "1"},
         )
     except Exception as e:  # noqa: BLE001 - a failed spawn is a job error, not a server crash
         job.status = "error"
@@ -326,7 +328,16 @@ def _worker_loop(work_queue) -> None:
         job = JOBS.get(job_id)
         if job is None:
             continue
-        _run_job(job)
+        try:
+            _run_job(job)
+        except Exception as e:  # noqa: BLE001 - a job exception must never kill the sole worker thread (D-06)
+            job.status = "error"
+            if job.returncode is None:
+                job.returncode = -1
+            job.finished_at = _now()
+            job.tail.append(f"[jobs error: worker exception: {e}]")
+            job.tail = job.tail[-_TAIL_MAX_LINES:]
+            _write_index()
 
 
 def _ensure_worker() -> None:

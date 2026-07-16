@@ -265,6 +265,54 @@ def test_cancel_queued_job_removes_it_from_the_queue():
 
 
 # ---------------------------------------------------------------------------
+# 08-08 Gap 1 (D-06 / GUI-04): worker survives non-UTF-8 child output and any
+# _run_job exception -- the sole worker thread must never die mid-session.
+# ---------------------------------------------------------------------------
+
+def test_worker_survives_non_utf8_child_output():
+    # Writes a lone invalid-UTF-8 byte (cp1252 'e-acute') directly to the raw
+    # stdout buffer, bypassing any child-side text encoding, so it lands on
+    # the merged pipe exactly as a real accented-author-name subprocess would.
+    non_utf8_snippet = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'caf\\xe9\\n'); "
+        "sys.stdout.buffer.flush(); "
+        "print('sentinel-ok')"
+    )
+    job1 = jobs.enqueue("noop", [sys.executable, "-c", non_utf8_snippet])
+    job1_final = _wait_terminal(job1)
+    assert job1_final.status == "done"
+    assert job1_final.returncode == 0
+    assert pathlib.Path(job1_final.log_path).exists()
+
+    # The single worker thread must still be alive to serve the next job.
+    job2 = jobs.enqueue("noop", [sys.executable, "-c", "print('second')"])
+    job2_final = _wait_terminal(job2)
+    assert job2_final.status == "done"
+
+
+def test_worker_survives_run_job_exception(monkeypatch):
+    real_run_job = jobs._run_job
+
+    def _boom_or_real(job):
+        if job.action == "boom":
+            raise RuntimeError("boom")
+        return real_run_job(job)
+
+    monkeypatch.setattr(jobs, "_run_job", _boom_or_real)
+
+    boom_id = jobs.enqueue("boom", [sys.executable, "-c", "pass"])
+    noop_id = jobs.enqueue("noop", [sys.executable, "-c", "print('noop-ok')"])
+
+    boom_final = _wait_terminal(boom_id)
+    assert boom_final.status == "error"
+    assert any("worker exception" in line for line in boom_final.tail)
+
+    noop_final = _wait_terminal(noop_id)
+    assert noop_final.status == "done"
+
+
+# ---------------------------------------------------------------------------
 # T-08-02: no shell spawn, ever
 # ---------------------------------------------------------------------------
 
