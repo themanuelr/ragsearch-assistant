@@ -4,6 +4,8 @@ table + the single 'Import into This Project' action, REG-03) and the
 drill-down's per-stage re-run buttons (D-12) filled in by 08-06.
 """
 
+import pathlib
+
 from fastapi import APIRouter, Request
 
 from gui.config import load_gui_config
@@ -39,11 +41,17 @@ def overview_project(request: Request):
 
 @router.get("/overview/project/paper/{registry_key:path}")
 def overview_project_paper(request: Request, registry_key: str):
-    """HTMX drill-down partial for one paper (D-12, read-only this plan).
+    """HTMX drill-down partial for one paper (D-12).
 
     ``registry_key`` arrives URL-encoded (DOIs contain slashes) via a
     ``:path`` converter and is used strictly as an opaque dict lookup key
     into the registry -- never joined into a filesystem path (T-08-07).
+
+    ``paperjson_cache_present`` is computed here (a plain ``Path.is_file()``
+    check on the already-resolved cache path scan_paper returned) rather than
+    in gui/scan.py -- every re-run action (note/biblio/embed/link_paper)
+    resolves the same PaperJSON cache file via --stem, so this one flag gates
+    all four re-run buttons in the partial.
     """
     from gui.app import templates
 
@@ -56,10 +64,11 @@ def overview_project_paper(request: Request, registry_key: str):
             {"paper": None, "registry_key": registry_key},
             status_code=404,
         )
+    paperjson_cache_present = pathlib.Path(paper["cache_paths"]["paperjson_path"]).is_file()
     return templates.TemplateResponse(
         request,
         "partials/paper_row.html",
-        {"paper": paper},
+        {"paper": paper, "paperjson_cache_present": paperjson_cache_present},
     )
 
 

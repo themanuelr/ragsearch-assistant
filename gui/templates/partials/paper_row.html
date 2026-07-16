@@ -35,5 +35,40 @@
     <div class="stage-label">PaperJSON: <code>{{ paper.cache_paths.paperjson_path }}</code></div>
     <div class="stage-label">Vault note: <code>{{ paper.cache_paths.vault_note }}</code></div>
   </div>
+
+  <div class="paper-rerun-actions section-gap">
+    <h4 class="stage-label">Pipeline Actions</h4>
+    {% if paperjson_cache_present %}
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-note-{{ paper.registry_key }}" hx-swap="innerHTML">
+      <input type="hidden" name="action" value="note">
+      <input type="hidden" name="stem" value="{{ paper.stem }}">
+      <button type="submit" class="btn">Re-run Note</button>
+    </form>
+    <div id="rerun-status-note-{{ paper.registry_key }}"></div>
+
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-biblio-{{ paper.registry_key }}" hx-swap="innerHTML">
+      <input type="hidden" name="action" value="biblio">
+      <input type="hidden" name="stem" value="{{ paper.stem }}">
+      <button type="submit" class="btn">Re-run Biblio</button>
+    </form>
+    <div id="rerun-status-biblio-{{ paper.registry_key }}"></div>
+
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-embed-{{ paper.registry_key }}" hx-swap="innerHTML">
+      <input type="hidden" name="action" value="embed">
+      <input type="hidden" name="stem" value="{{ paper.stem }}">
+      <button type="submit" class="btn">Re-run Embed</button>
+    </form>
+    <div id="rerun-status-embed-{{ paper.registry_key }}"></div>
+
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-link-{{ paper.registry_key }}" hx-swap="innerHTML">
+      <input type="hidden" name="action" value="link_paper">
+      <input type="hidden" name="stem" value="{{ paper.stem }}">
+      <button type="submit" class="btn">Re-run Link</button>
+    </form>
+    <div id="rerun-status-link-{{ paper.registry_key }}"></div>
+    {% else %}
+    <p class="settings-hint">No PaperJSON cache on disk yet — ingest this paper (Processing page) before re-running Note, Biblio, Embed, or Link.</p>
+    {% endif %}
+  </div>
 </div>
 {% endif %}

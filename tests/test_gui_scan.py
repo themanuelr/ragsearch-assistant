@@ -472,3 +472,61 @@ def test_overview_universal_import_enqueues_doi_argv(gui_client, gui_config, mon
     argv = captured["calls"][0]["argv"]
     assert "--doi" in argv
     assert "10.1234/out-of-project" in argv
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 Plan 06, Task 2: per-stage re-run buttons on the drill-down (D-12)
+# ---------------------------------------------------------------------------
+
+def test_paper_row_rerun_buttons_present_when_paperjson_cache_present(
+    gui_client, gui_config, monkeypatch
+):
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    title = "Rerun Ready Paper"
+    paperjson_path = str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "rerun-ready.json")
+    entry = _registry_entry(title, paperjson_path, ["proj-a"])
+    _write_registry(gui_config, {"key-rerun": entry})
+    _write_paperjson(gui_config, "rerun-ready", _EMPTY_ANALYSIS)
+
+    resp = gui_client.get("/overview/project/paper/key-rerun")
+
+    assert resp.status_code == 200
+    for label in ("Re-run Note", "Re-run Biblio", "Re-run Embed", "Re-run Link"):
+        assert label in resp.text
+
+
+def test_paper_row_rerun_note_omitted_without_paperjson_cache(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    title = "No Cache Paper"
+    paperjson_path = str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "no-cache.json")
+    entry = _registry_entry(title, paperjson_path, ["proj-a"])
+    _write_registry(gui_config, {"key-nocache": entry})
+    # Deliberately never write the PaperJSON cache file for this entry.
+
+    resp = gui_client.get("/overview/project/paper/key-nocache")
+
+    assert resp.status_code == 200
+    assert "Re-run Note" not in resp.text
+    assert "Re-run Biblio" not in resp.text
+    assert "Re-run Embed" not in resp.text
+    assert "Re-run Link" not in resp.text
+    assert "PaperJSON cache" in resp.text
+
+
+def test_paper_row_rerun_biblio_enqueues_expected_argv(gui_client, gui_config, monkeypatch):
+    import sys
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post("/jobs/enqueue", data={"action": "biblio", "stem": "rerun-ready"})
+
+    assert resp.status_code == 200
+    assert len(captured["calls"]) == 1
+    argv = captured["calls"][0]["argv"]
+    assert argv[0] == sys.executable
+    assert argv[1].endswith("biblio.py")
+    assert argv[-2:] == ["--stem", "rerun-ready"]
