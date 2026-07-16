@@ -156,3 +156,38 @@ def _guard_real_config_json():
         "Test run polluted the real repo root with a stray papers_registry.json. "
         "Point the offending test's registry_path at tmp_path instead."
     )
+
+
+@pytest.fixture
+def gui_config(tmp_path):
+    """Tmp-scoped config dict for GUI tests (Phase 8).
+
+    Mirrors the tmp-scoping discipline established for ingest tests (see
+    ``_make_ingest_config`` in tests/test_ingest.py) so the session-scoped
+    ``_guard_real_*`` fixtures above never trip: every path-bearing key here
+    points at a subdirectory of ``tmp_path``, never the real repo root.
+    """
+    return {
+        "registry_path": str(tmp_path / "papers_registry.json"),
+        "vault_path": str(tmp_path / "vault"),
+        "chroma_db_path": str(tmp_path / "chroma_db"),
+        "paperjson_cache_dir": str(tmp_path / ".paperjson_cache"),
+        "mineru_output_dir": str(tmp_path / "mineru_output"),
+        "uningested_dir": str(tmp_path / "uningestedPDFs"),
+        "gui_port": 8765,
+    }
+
+
+@pytest.fixture
+def gui_client():
+    """FastAPI TestClient over the gui.app ASGI app (Phase 8).
+
+    Imported lazily inside the fixture body (not at module scope) so that
+    collecting this conftest.py never fails before gui/app.py exists (Wave 0
+    RED task) or for any other test file that doesn't request this fixture.
+    """
+    from fastapi.testclient import TestClient
+
+    import gui.app
+
+    return TestClient(gui.app.app)

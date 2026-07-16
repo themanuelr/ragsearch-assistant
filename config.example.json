@@ -20,5 +20,7 @@
   "crossref_timeout": 30,
   "crossref_retries": 1,
   "ollama_num_ctx_cap": 65536,
-  "ollama_section_timeout": 300
+  "ollama_section_timeout": 300,
+  "gui_port": 8765,
+  "uningested_dir": "./uningestedPDFs"
 }
