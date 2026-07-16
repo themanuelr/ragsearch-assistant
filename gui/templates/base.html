@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Research Paper Intelligence System{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="gui-shell">
+    <nav class="gui-sidebar">
+      <div class="gui-sidebar-title">Research GUI</div>
+      <ul class="gui-nav">
+        <li>
+          <a class="gui-nav-item{% if active_page == 'overview_project' %} active{% endif %}"
+             href="/overview/project">Overview (Project)</a>
+        </li>
+        <li>
+          <a class="gui-nav-item{% if active_page == 'overview_universal' %} active{% endif %}"
+             href="/overview/universal">Overview (Universal)</a>
+        </li>
+        <li>
+          <a class="gui-nav-item{% if active_page == 'processing' %} active{% endif %}"
+             href="/processing">Processing</a>
+        </li>
+        <li>
+          <a class="gui-nav-item{% if active_page == 'chat' %} active{% endif %}"
+             href="/chat">Chat</a>
+        </li>
+        <li>
+          <a class="gui-nav-item{% if active_page == 'logs' %} active{% endif %}"
+             href="/logs">Logs & Activity</a>
+        </li>
+        <li>
+          <a class="gui-nav-item{% if active_page == 'docs' %} active{% endif %}"
+             href="/docs">Docs & Help</a>
+        </li>
+        <li>
+          <a class="gui-nav-item{% if active_page == 'settings' %} active{% endif %}"
+             href="/settings">Settings</a>
+        </li>
+      </ul>
+    </nav>
+    <main class="gui-content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  <script src="/static/htmx.min.js"></script>
+</body>
+</html>
