@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Docs & Help — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Docs & Help</h1>
+
+  <nav class="doc-picker">
+    <ul>
+      {% for item in picker %}
+      <li>
+        <a class="doc-picker-link{% if item.slug == current_slug %} active{% endif %}"
+           href="/docs/{{ item.slug }}">{{ item.title }}</a>
+      </li>
+      {% endfor %}
+    </ul>
+  </nav>
+
+  <section class="section-gap doc-body">
+    {{ doc_html | safe }}
+  </section>
+{% endblock %}

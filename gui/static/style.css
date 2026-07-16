@@ -300,3 +300,35 @@ textarea:focus {
   display: flex;
   gap: var(--space-md);
 }
+
+/* Docs & Help — doc picker + rendered markdown body (08-UI-SPEC.md, D-21) */
+
+.doc-picker ul {
+  list-style: none;
+  display: flex;
+  gap: var(--space-md);
+  margin: 0 0 var(--space-lg) 0;
+  padding: 0;
+}
+
+.doc-picker-link {
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.doc-picker-link.active {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.doc-body pre,
+.doc-body code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--color-secondary);
+}
+
+.doc-body pre {
+  padding: var(--space-sm);
+  overflow-x: auto;
+}

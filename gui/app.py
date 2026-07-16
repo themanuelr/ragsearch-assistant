@@ -21,7 +21,12 @@ from fastapi.templating import Jinja2Templates
 
 _GUI_DIR = pathlib.Path(__file__).resolve().parent
 
-app = FastAPI()
+# FastAPI auto-registers Swagger UI at "/docs" (plus "/redoc"/"/openapi.json")
+# by default, which collides directly with this app's own server-rendered
+# Docs & Help page at GET /docs (D-21, gui/routes/docs.py). This is a
+# Jinja2/HTMX page-rendering app, not a consumed HTTP API, so the interactive
+# API docs have no purpose here -- disable all three.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=str(_GUI_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(_GUI_DIR / "templates"))
 
