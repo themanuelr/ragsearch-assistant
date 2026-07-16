@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Processing — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Processing</h1>
+
+  {# 08-05 inserts the Drop Folder section here #}
+
+  <section class="section-gap">
+    <h2>Bulk Actions</h2>
+    <div class="bulk-actions">
+      <button type="button" class="btn"
+              hx-post="/jobs/enqueue"
+              hx-vals='{"action": "embed_all"}'
+              hx-target="#bulk-action-status"
+              hx-swap="innerHTML">
+        Backfill Embeddings
+      </button>
+      <button type="button" class="btn"
+              hx-post="/jobs/enqueue"
+              hx-vals='{"action": "link_all"}'
+              hx-target="#bulk-action-status"
+              hx-swap="innerHTML">
+        Rebuild Topic Graph
+      </button>
+    </div>
+    <div id="bulk-action-status" class="section-gap"></div>
+  </section>
+
+  {# 08-05 inserts the Per-Paper Orchestration section here #}
+{% endblock %}
