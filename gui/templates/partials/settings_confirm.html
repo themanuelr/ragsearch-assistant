@@ -1,0 +1,19 @@
+{# D-20 data-path warn+confirm partial. Copy is verbatim per 08-UI-SPEC.md's
+   Copywriting Contract -- the GUI only repoints the config value, it never
+   moves or copies data at either the old or new location. #}
+<div class="settings-confirm">
+  {% for item in pending %}
+  <p class="settings-confirm-message">
+    <strong>{{ item.label }}</strong> ({{ item.key }}) currently points to <code>{{ item.old_path }}</code>, which holds {{ item.count }} item(s). Changing this will NOT move or copy that data — the GUI only repoints the config value. Confirm you want to change it?
+  </p>
+  {% endfor %}
+
+  <form method="post" action="/settings">
+    {% for key, value in form_values.items() %}
+    <input type="hidden" name="{{ key }}" value="{{ value if value is not none else '' }}">
+    {% endfor %}
+    <input type="hidden" name="confirmed" value="true">
+    <button type="submit" class="btn destructive">Change Anyway</button>
+  </form>
+  <a class="btn" href="/settings">Keep Current Path</a>
+</div>

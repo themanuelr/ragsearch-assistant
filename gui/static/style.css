@@ -332,3 +332,63 @@ textarea:focus {
   padding: var(--space-sm);
   overflow-x: auto;
 }
+
+/* Settings — typed form, D-20 data-path flags, confirm partial */
+
+.settings-field {
+  margin-bottom: var(--space-md);
+}
+
+.settings-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: var(--space-xs);
+}
+
+.settings-field input[type="text"],
+.settings-field input[type="number"] {
+  width: 100%;
+  max-width: 480px;
+}
+
+.settings-description {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  margin: var(--space-xs) 0 0 0;
+}
+
+.settings-hint,
+.settings-restart-badge,
+.settings-legacy-badge {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.settings-error {
+  color: var(--color-destructive);
+  font-size: 12px;
+  margin: var(--space-xs) 0 0 0;
+}
+
+.settings-field-datapath {
+  padding: var(--space-sm);
+  background: var(--color-secondary);
+  border-radius: 4px;
+}
+
+.settings-confirm {
+  padding: var(--space-md);
+  background: var(--color-secondary);
+  border-radius: 4px;
+}
+
+.settings-confirm-message {
+  margin: 0 0 var(--space-md) 0;
+}
+
+.settings-saved {
+  color: var(--color-success);
+  font-weight: 600;
+}

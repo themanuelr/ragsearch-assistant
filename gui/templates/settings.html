@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Settings — Research Paper Intelligence System{% endblock %}
+{% block content %}
+  <h1>Settings</h1>
+
+  {% if saved %}
+  <p class="settings-saved">Settings saved.</p>
+  {% endif %}
+
+  <form id="settings-form" method="post" action="/settings" class="settings-form">
+    {% for field in fields %}
+    <div class="settings-field{% if field.is_data_path %} settings-field-datapath{% endif %}">
+      <label for="field-{{ field.key }}">
+        {{ field.label }}
+        {% if field.restart_required %}<span class="settings-restart-badge">requires GUI restart</span>{% endif %}
+        {% if field.legacy %}<span class="settings-legacy-badge">legacy — unused by any script</span>{% endif %}
+      </label>
+
+      {% if field.type == "bool" %}
+      <input type="checkbox" id="field-{{ field.key }}" name="{{ field.key }}"
+             {% if values.get(field.key) %}checked{% endif %}>
+      {% elif field.type == "int" %}
+      <input type="number" id="field-{{ field.key }}" name="{{ field.key }}"
+             value="{{ values.get(field.key, '') }}">
+      {% else %}
+      <input type="text" id="field-{{ field.key }}" name="{{ field.key }}"
+             value="{{ values.get(field.key, '') }}">
+      {% endif %}
+
+      <p class="settings-description">{{ field.description }}</p>
+      {% if field.is_data_path %}
+      <p class="settings-hint">don't change this unless you know what you're doing</p>
+      {% endif %}
+      {% if errors.get(field.key) %}
+      <p class="settings-error">{{ errors.get(field.key) }}</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+    <button type="submit" class="btn">Save Settings</button>
+  </form>
+
+  <section class="section-gap">
+    <h2>Setup</h2>
+    <p>
+      Run the six idempotent first-time setup steps (bootstrap the vault, check
+      external tools, pull required Ollama models, initialize ChromaDB, write
+      config.json, ensure an empty registry) against the vault path / registry
+      path / project name above. Safe to re-run -- each step skips work that
+      already exists; per-step results appear in the job log below.
+    </p>
+    {#
+      Claude's-discretion (08-CONTEXT.md): a single guided "Run Full Setup"
+      action instead of six per-step buttons, because run_setup is already a
+      fail-open orchestrator whose per-step {step, status, detail} lines land
+      directly in the job log -- one button surfaces the same information a
+      per-step UI would, without duplicating six separate routes.
+    #}
+    <button type="button" class="btn"
+            hx-post="/jobs/enqueue"
+            hx-vals='{"action": "setup"}'
+            hx-include="#settings-form [name='vault_path'], #settings-form [name='registry_path'], #settings-form [name='project_name']"
+            hx-target="#setup-status"
+            hx-swap="innerHTML">
+      Run Full Setup
+    </button>
+    <div id="setup-status" class="section-gap"></div>
+  </section>
+{% endblock %}
