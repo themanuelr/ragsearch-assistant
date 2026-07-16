@@ -497,6 +497,35 @@ def test_paper_row_rerun_buttons_present_when_paperjson_cache_present(
         assert label in resp.text
 
 
+def test_paper_row_rerun_targets_valid_css_id_for_doi_key(gui_client, gui_config, monkeypatch):
+    """08-08 Gap 2 (D-12 / GUI-08): a real DOI-shaped registry key (contains
+    '.' and '/', both invalid unescaped in a CSS id selector) must still
+    produce a matching, syntactically valid hx-target/id pair for every
+    rerun stage."""
+    import re
+
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    doi_key = "10.1021/jacs.3c10258"
+    title = "DOI Keyed Paper"
+    paperjson_path = str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "doi-keyed.json")
+    entry = _registry_entry(title, paperjson_path, ["proj-a"])
+    _write_registry(gui_config, {doi_key: entry})
+    _write_paperjson(gui_config, "doi-keyed", _EMPTY_ANALYSIS)
+
+    resp = gui_client.get(f"/overview/project/paper/{doi_key}")
+
+    assert resp.status_code == 200
+    expected_slug = "10-1021-jacs-3c10258"
+    assert re.match(r"^[A-Za-z0-9_-]+$", expected_slug)
+    for stage in ("note", "biblio", "embed", "link"):
+        expected_id = f"rerun-status-{stage}-{expected_slug}"
+        assert f'hx-target="#{expected_id}"' in resp.text
+        assert f'id="{expected_id}"' in resp.text
+    assert "rerun-status-note-10.1021" not in resp.text
+
+
 def test_paper_row_rerun_note_omitted_without_paperjson_cache(gui_client, gui_config, monkeypatch):
     gui_config["project_name"] = "proj-a"
     _patch_overview_config(monkeypatch, gui_config)

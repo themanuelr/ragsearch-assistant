@@ -39,33 +39,39 @@
   <div class="paper-rerun-actions section-gap">
     <h4 class="stage-label">Pipeline Actions</h4>
     {% if paperjson_cache_present %}
-    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-note-{{ paper.registry_key }}" hx-swap="innerHTML">
+    {# safe_key is a whitelist-slugged registry_key (gui/routes/overview.py::
+       _rerun_status_id_slug), guaranteeing a valid, escape-free CSS id. This
+       partial renders exactly one paper, so the four stage-prefixed ids
+       (note/biblio/embed/link) are always collision-free within a render;
+       across concurrently-expanded drill-downs the slug stays per-paper
+       distinct for any real DOI/arXiv/sha256 key. #}
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-note-{{ safe_key }}" hx-swap="innerHTML">
       <input type="hidden" name="action" value="note">
       <input type="hidden" name="stem" value="{{ paper.stem }}">
       <button type="submit" class="btn">Re-run Note</button>
     </form>
-    <div id="rerun-status-note-{{ paper.registry_key }}"></div>
+    <div id="rerun-status-note-{{ safe_key }}"></div>
 
-    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-biblio-{{ paper.registry_key }}" hx-swap="innerHTML">
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-biblio-{{ safe_key }}" hx-swap="innerHTML">
       <input type="hidden" name="action" value="biblio">
       <input type="hidden" name="stem" value="{{ paper.stem }}">
       <button type="submit" class="btn">Re-run Biblio</button>
     </form>
-    <div id="rerun-status-biblio-{{ paper.registry_key }}"></div>
+    <div id="rerun-status-biblio-{{ safe_key }}"></div>
 
-    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-embed-{{ paper.registry_key }}" hx-swap="innerHTML">
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-embed-{{ safe_key }}" hx-swap="innerHTML">
       <input type="hidden" name="action" value="embed">
       <input type="hidden" name="stem" value="{{ paper.stem }}">
       <button type="submit" class="btn">Re-run Embed</button>
     </form>
-    <div id="rerun-status-embed-{{ paper.registry_key }}"></div>
+    <div id="rerun-status-embed-{{ safe_key }}"></div>
 
-    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-link-{{ paper.registry_key }}" hx-swap="innerHTML">
+    <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-link-{{ safe_key }}" hx-swap="innerHTML">
       <input type="hidden" name="action" value="link_paper">
       <input type="hidden" name="stem" value="{{ paper.stem }}">
       <button type="submit" class="btn">Re-run Link</button>
     </form>
-    <div id="rerun-status-link-{{ paper.registry_key }}"></div>
+    <div id="rerun-status-link-{{ safe_key }}"></div>
     {% else %}
     <p class="settings-hint">No PaperJSON cache on disk yet — ingest this paper (Processing page) before re-running Note, Biblio, Embed, or Link.</p>
     {% endif %}

@@ -5,6 +5,7 @@ drill-down's per-stage re-run buttons (D-12) filled in by 08-06.
 """
 
 import pathlib
+import re
 
 from fastapi import APIRouter, Request
 
@@ -12,6 +13,17 @@ from gui.config import load_gui_config
 from gui.scan import scan_paper, scan_project_papers, scan_uningested, scan_universal
 
 router = APIRouter()
+
+
+def _rerun_status_id_slug(registry_key: str) -> str:
+    """Whitelist-slug a registry key into a syntactically valid, escape-free
+    CSS id fragment. Mirrors gui/jobs.py::_new_job_id's established slug
+    idiom (Don't Hand-Roll a second slug convention). Any character outside
+    ``[A-Za-z0-9]`` (DOI slashes/dots, arXiv colons, sha256's own colon,
+    even '#'/'?'/'%'/'('/')' ) collapses to a single '-', so the result is
+    always a valid unescaped CSS id selector regardless of the key's shape.
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "-", registry_key).strip("-") or "paper"
 
 
 @router.get("/overview/project")
@@ -65,10 +77,15 @@ def overview_project_paper(request: Request, registry_key: str):
             status_code=404,
         )
     paperjson_cache_present = pathlib.Path(paper["cache_paths"]["paperjson_path"]).is_file()
+    safe_key = _rerun_status_id_slug(registry_key)
     return templates.TemplateResponse(
         request,
         "partials/paper_row.html",
-        {"paper": paper, "paperjson_cache_present": paperjson_cache_present},
+        {
+            "paper": paper,
+            "paperjson_cache_present": paperjson_cache_present,
+            "safe_key": safe_key,
+        },
     )
 
 
