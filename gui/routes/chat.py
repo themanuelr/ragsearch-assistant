@@ -1,14 +1,14 @@
-"""Chat page -- streaming Ollama chat with model picker, job-blocked state,
-and persistent conversations (Phase 8 Plan 07, D-13/D-16/D-17/D-18).
-Retrieval scopes (D-14/D-15) are wired by Task 3 into ``_resolve_scope``.
+"""Chat page -- streaming Ollama chat with retrieval scopes, model picker,
+job-blocked state, and persistent conversations (Phase 8 Plan 07, D-13..D-18).
 
 Every handler is a plain ``def`` (not ``async def`` -- RESEARCH.md Pitfall 5):
-``chat_store``, ``gui.jobs``, and ``scan_project_papers`` all do blocking
-file I/O, and FastAPI runs sync routes in its thread pool, so job-status
-polling and the CSRF middleware never stall behind a chat request.
+``chat_store``, ``gui.jobs``, ``scan_project_papers``, and
+``scripts.embed._search`` all do blocking file/Chroma I/O, and FastAPI runs
+sync routes in its thread pool, so job-status polling and the CSRF
+middleware never stall behind a chat request.
 
-Retrieval-scope context assembly (D-14/D-15, Task 3) must happen
-synchronously inside ``POST /chat/send`` -- it has to complete before the LLM
+Retrieval-scope context assembly (D-14/D-15) happens synchronously inside
+``POST /chat/send`` (``_resolve_scope``) -- it must complete before the LLM
 call, and ``_search``/vault-note reads are themselves blocking I/O. The
 assembled LLM-ready message list and any Sources/banner/truncation metadata
 are handed off to ``GET /chat/stream`` through ``_PENDING``, an in-process
@@ -20,6 +20,7 @@ anything chat_store already owns.
 """
 
 import json
+import pathlib
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import PlainTextResponse, RedirectResponse, StreamingResponse
@@ -29,7 +30,12 @@ from gui import jobs as gui_jobs
 from gui.config import load_gui_config
 from gui.ollama_chat import _stream_ollama_chat, list_models
 from gui.scan import scan_project_papers
-from scripts.ingest import OLLAMA_MODEL as _DEFAULT_PIPELINE_MODEL
+from scripts.embed import _search
+from scripts.ingest import (
+    DEFAULT_NUM_CTX_CAP,
+    OLLAMA_MODEL as _DEFAULT_PIPELINE_MODEL,
+    _estimate_num_ctx,
+)
 
 router = APIRouter()
 
@@ -126,11 +132,113 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
     """Resolve the D-14/D-15 retrieval scope into
     ``(context_messages, sources, banner, truncation_notes)``.
 
-    Task 2 (this commit): ``scope`` is accepted from the form but not yet
-    wired -- every scope behaves as "none" (no retrieval, no context
-    injection). Task 3 fills in the ChromaDB (D-14) and paper-vault (D-15)
-    bodies here.
+    scope == "chroma" (D-14): runs ``scripts.embed._search`` in-process
+    (the one sanctioned in-process pipeline call) and frames every returned
+    section excerpt into a system-role preamble. Every row of the returned
+    ``sources`` list renders as one "Sources" entry -- retrieved context is
+    never injected silently. A ``_search`` error result falls back to scope
+    none for this message (fail-open, matching pipeline conventions) and is
+    surfaced as a visible banner instead of raising.
+
+    scope == "vault" (D-15): ``notes`` are vault-relative paths the client
+    submitted, but only accepted when they match an already-scanned paper's
+    own ``vault_note`` path (server-side paths from the scan -- never an
+    arbitrary client-supplied filesystem path, T-08-05-adjacent hardening).
+    The assembled prompt is sized against ``ollama_num_ctx_cap`` via
+    ``_estimate_num_ctx`` (Pitfall 6); while genuinely oversized, the
+    last-selected note is dropped and named in ``truncation_notes`` -- never
+    a silent oversized request.
+
+    scope == "none" (or anything else): pass-through, no retrieval call.
     """
+    if scope == "chroma":
+        result = _search(message, 5, config)
+        if result.get("error"):
+            # D-14 fail-open: a _search error falls back to scope none for
+            # this message, surfaced as a visible banner -- never a silent
+            # swallow and never a raised exception.
+            return [], None, result["error"], None
+
+        rows = []
+        excerpt_blocks = []
+        for paper in result.get("papers") or []:
+            for section in paper.get("sections", []):
+                rows.append({
+                    "title": paper["title"],
+                    "section": section["heading"],
+                    "score": section["score"],
+                })
+                excerpt_blocks.append(
+                    f"[{paper['title']} — {section['heading']}]\n{section['excerpt']}"
+                )
+        if not rows:
+            return [], None, None, None
+
+        context_messages = [{
+            "role": "system",
+            "content": (
+                "Answer the user's question using the retrieved excerpts "
+                "below when they are relevant. If the excerpts don't cover "
+                "the question, say so explicitly rather than guessing.\n\n"
+                + "\n\n".join(excerpt_blocks)
+            ),
+        }]
+        return context_messages, rows, None, None
+
+    if scope == "vault":
+        # Server-side paths only: the client submits a vault-relative note
+        # path, but it is accepted only if it matches an already-scanned
+        # paper's own vault_note path -- never an arbitrary client-supplied
+        # path read directly off disk.
+        allowed_notes = {
+            paper["cache_paths"]["vault_note"]: paper
+            for paper in scan_project_papers(config)
+        }
+        vault_root = pathlib.Path(config.get("vault_path") or "")
+        cap = config.get("ollama_num_ctx_cap", DEFAULT_NUM_CTX_CAP)
+
+        note_texts = []
+        for rel_path in notes or []:
+            paper = allowed_notes.get(rel_path)
+            if paper is None:
+                continue
+            try:
+                text = (vault_root / rel_path).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            note_texts.append({"title": paper["title"], "text": text})
+
+        dropped_titles: list = []
+        # Pitfall 6 guard: drop the last-selected note while the assembled
+        # prompt is genuinely oversized -- same double-check idiom as
+        # scripts/ingest.py::_fill_section's over-size guard (ladder-maxed
+        # AND raw length confirms it's not just an equal-to-a-rung fit).
+        while len(note_texts) > 1:
+            combined = "\n\n".join(n["text"] for n in note_texts)
+            estimated_ctx = _estimate_num_ctx(combined, cap=cap)
+            if estimated_ctx >= cap and len(combined) > cap * 4:
+                dropped = note_texts.pop()
+                dropped_titles.append(dropped["title"])
+                continue
+            break
+
+        if not note_texts:
+            return [], None, None, (dropped_titles or None)
+
+        sources = [
+            {"title": n["title"], "section": "Full Note", "score": None}
+            for n in note_texts
+        ]
+        context_messages = [{
+            "role": "system",
+            "content": (
+                "Answer using the following full paper notes as context.\n\n"
+                + "\n\n".join(f"[{n['title']}]\n{n['text']}" for n in note_texts)
+            ),
+        }]
+        return context_messages, sources, None, (dropped_titles or None)
+
+    # scope == "none" (or unrecognized): pass-through, no retrieval call.
     return [], None, None, None
 
 

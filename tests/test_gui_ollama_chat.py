@@ -23,6 +23,7 @@ import pytest
 import gui.chat_store as chat_store_module
 import gui.jobs as gui_jobs_module
 import gui.ollama_chat as ollama_chat
+import gui.routes.chat as chat_module
 from gui.ollama_chat import _stream_ollama_chat, list_models
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -324,3 +325,164 @@ def test_chat_blocked_while_busy(gui_client, gui_config, monkeypatch):
     get_resp = gui_client.get("/chat")
     assert "Chat is paused while a pipeline job runs" in get_resp.text
     assert 'hx-post="/chat/send"' not in get_resp.text
+
+
+# ---------------------------------------------------------------------------
+# gui/routes/chat.py -- Task 3: retrieval scopes (D-14/D-15)
+# ---------------------------------------------------------------------------
+
+def _fake_search_result():
+    return {
+        "papers": [
+            {
+                "title": "A Great Paper",
+                "registry_key": "10.1/x",
+                "status": "paper",
+                "vault_note": "Papers/A Great Paper.md",
+                "score": 0.9,
+                "sections": [
+                    {"heading": "Results", "score": 0.9, "excerpt": "some excerpt text"},
+                ],
+            }
+        ],
+        "stubs": [],
+        "error": None,
+    }
+
+
+def test_chat_sources_block_rendered_for_chroma_scope(gui_client, gui_config, monkeypatch):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+
+    conv = chat_store_module.create_conversation()
+
+    search_calls = []
+
+    def fake_search(query, n_results, config):
+        search_calls.append((query, n_results))
+        return _fake_search_result()
+
+    monkeypatch.setattr("gui.routes.chat._search", fake_search)
+
+    lines = [
+        json.dumps({"message": {"content": "Answer text"}, "done": False}).encode(),
+        json.dumps({"done": True}).encode(),
+    ]
+    monkeypatch.setattr(
+        "gui.ollama_chat.urllib.request.urlopen",
+        lambda *a, **k: _FakeStreamResponse(lines),
+    )
+
+    send_resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "what does the paper say",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert send_resp.status_code == 200
+    assert len(search_calls) == 1, "chroma scope must call _search exactly once"
+
+    stream_resp = gui_client.get(f"/chat/stream?conv={conv['id']}&model=gemma4:e4b")
+    assert stream_resp.status_code == 200
+
+    saved = chat_store_module.load(conv["id"])
+    assistant_msg = saved["messages"][-1]
+    assert assistant_msg["role"] == "assistant"
+    assert assistant_msg["content"] == "Answer text"
+    assert assistant_msg["sources"] == [
+        {"title": "A Great Paper", "section": "Results", "score": 0.9}
+    ]
+
+    page_resp = gui_client.get(f"/chat?conv={conv['id']}")
+    assert "Sources (1)" in page_resp.text
+    assert "A Great Paper" in page_resp.text
+    assert "Results" in page_resp.text
+
+
+def test_chat_chroma_scope_error_falls_back_to_none_with_banner(gui_client, gui_config, monkeypatch):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = chat_store_module.create_conversation()
+
+    monkeypatch.setattr(
+        "gui.routes.chat._search",
+        lambda *a, **k: {"papers": [], "stubs": [], "error": "[Ollama error: embedding unreachable]"},
+    )
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "hello", "model": "gemma4:e4b", "scope": "chroma"},
+    )
+
+    assert resp.status_code == 200
+    assert "[Ollama error: embedding unreachable]" in resp.text
+
+    pending = chat_module._PENDING[conv["id"]]
+    assert pending["llm_messages"] == [{"role": "user", "content": "hello"}]
+    assert pending["sources"] is None
+
+
+def test_chat_vault_scope_truncates_over_cap_and_flags_warning(
+    gui_client, gui_config, monkeypatch
+):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    vault_path = pathlib.Path(gui_config["vault_path"])
+    (vault_path / "Papers").mkdir(parents=True, exist_ok=True)
+    (vault_path / "Papers" / "Paper A.md").write_text("A" * 20000, encoding="utf-8")
+    (vault_path / "Papers" / "Paper B.md").write_text("B" * 20000, encoding="utf-8")
+
+    fake_papers = [
+        {"title": "Paper A", "cache_paths": {"vault_note": "Papers/Paper A.md"}},
+        {"title": "Paper B", "cache_paths": {"vault_note": "Papers/Paper B.md"}},
+    ]
+    monkeypatch.setattr("gui.routes.chat.scan_project_papers", lambda config: fake_papers)
+    gui_config["ollama_num_ctx_cap"] = 2048  # tiny cap: forces a drop
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "summarize",
+            "model": "gemma4:e4b",
+            "scope": "vault",
+            "notes": ["Papers/Paper A.md", "Papers/Paper B.md"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "Context truncated" in resp.text
+    assert "Paper B" in resp.text  # the dropped note is named in the warning
+
+    pending = chat_module._PENDING[conv["id"]]
+    combined_context = pending["llm_messages"][0]["content"]
+    assert "Paper A" in combined_context
+    assert "B" * 100 not in combined_context  # dropped note's content excluded
+
+
+def test_chat_none_scope_calls_no_retrieval(gui_client, gui_config, monkeypatch):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    search_calls = []
+    monkeypatch.setattr(
+        "gui.routes.chat._search", lambda *a, **k: search_calls.append(1)
+    )
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "hi", "model": "gemma4:e4b", "scope": "none"},
+    )
+
+    assert resp.status_code == 200
+    assert search_calls == []
