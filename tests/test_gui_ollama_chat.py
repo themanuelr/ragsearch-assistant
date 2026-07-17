@@ -1066,6 +1066,138 @@ def test_turn_adds_exactly_two_messages_never_more(
 
 
 # ---------------------------------------------------------------------------
+# gui/routes/chat.py -- 08-14 Task 2 (Gap B): the model is recorded per
+# assistant message, not only as the picker's last-written default.
+# ---------------------------------------------------------------------------
+
+def test_two_replies_with_different_models_each_retain_their_own_model(
+    gui_client, gui_config, monkeypatch
+):
+    """Test F: two replies produced by different models in one conversation
+    each retain their own model -- the second send does not retroactively
+    relabel the first."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = chat_store_module.create_conversation()
+
+    def _stream_for(token):
+        return lambda *a, **k: iter([_frame({"token": token}), _frame({"done": True})])
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _stream_for("reply one"))
+    resp1 = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "q1", "model": "model-x", "scope": "none"},
+    )
+    assert resp1.status_code == 200
+    stream_resp1 = gui_client.get(f"/chat/stream?conv={conv['id']}&model=model-x")
+    assert stream_resp1.status_code == 200
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _stream_for("reply two"))
+    resp2 = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "q2", "model": "model-y", "scope": "none"},
+    )
+    assert resp2.status_code == 200
+    stream_resp2 = gui_client.get(f"/chat/stream?conv={conv['id']}&model=model-y")
+    assert stream_resp2.status_code == 200
+
+    saved = chat_store_module.load(conv["id"])
+    assistant_msgs = [m for m in saved["messages"] if m["role"] == "assistant"]
+    assert len(assistant_msgs) == 2
+    assert assistant_msgs[0]["model"] == "model-x"
+    assert assistant_msgs[1]["model"] == "model-y"
+
+    # Test G: conversation["model"] holds the last pick (the picker's
+    # current default), while per-message values stay distinct.
+    assert saved["model"] == "model-y"
+
+
+def test_chat_history_renders_each_assistant_messages_own_model(
+    gui_client, gui_config, monkeypatch
+):
+    """Test H: the chat history renders each assistant message's own
+    model."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["model-x", "model-y"], None))
+
+    conv = chat_store_module.create_conversation()
+
+    def _stream_for(token):
+        return lambda *a, **k: iter([_frame({"token": token}), _frame({"done": True})])
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _stream_for("reply one"))
+    gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "q1", "model": "model-x", "scope": "none"},
+    )
+    gui_client.get(f"/chat/stream?conv={conv['id']}&model=model-x")
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _stream_for("reply two"))
+    gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "q2", "model": "model-y", "scope": "none"},
+    )
+    gui_client.get(f"/chat/stream?conv={conv['id']}&model=model-y")
+
+    page_resp = gui_client.get(f"/chat?conv={conv['id']}")
+    assert page_resp.status_code == 200
+    assert "model-x" in page_resp.text
+    assert "model-y" in page_resp.text
+
+
+def test_prechange_conversation_without_model_field_renders_without_error(
+    gui_client, gui_config, monkeypatch
+):
+    """Test I: a stored conversation whose assistant messages predate this
+    change (no model field) renders without error and without inventing a
+    model label."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["model-x"], None))
+
+    conv = chat_store_module.create_conversation()
+    conv["messages"] = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old reply"},
+    ]
+    chat_store_module.save(conv)
+
+    resp = gui_client.get(f"/chat?conv={conv['id']}")
+
+    assert resp.status_code == 200
+    assert "old reply" in resp.text
+
+
+def test_recorded_model_is_the_one_chat_stream_resolved_via_fallback_chain(
+    gui_client, gui_config, monkeypatch
+):
+    """Test J: when chat_stream resolves the model through its fallback
+    chain (conversation['model']) rather than an explicit query param, the
+    recorded value is the resolved one."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="q", model="model-z")
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([_frame({"token": "ans"}), _frame({"done": True})]),
+    )
+
+    # No `model=` query param -- chat_stream must fall back to
+    # conversation.get("model"), which chat_send already set to "model-z".
+    resp = gui_client.get(f"/chat/stream?conv={conv['id']}")
+    assert resp.status_code == 200
+
+    saved = chat_store_module.load(conv["id"])
+    assistant_msg = saved["messages"][-1]
+    assert assistant_msg["model"] == "model-z"
+
+
+# ---------------------------------------------------------------------------
 # T-08-05 (threat register): the literal innerHTML API is absent from every
 # chat template -- tokens must reach the DOM via textContent/createTextNode
 # only, keeping untrusted LLM output XSS-inert.
