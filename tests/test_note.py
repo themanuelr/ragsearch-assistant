@@ -498,6 +498,279 @@ def test_generate_note_preflight_failure():
 
 
 # ---------------------------------------------------------------------------
+# 08-13 gap closure: analysis persistence to the PaperJSON cache (T-08-GAP-18..22)
+#
+# generate_note(paperjson, config, force=False, paperjson_path=None,
+# force_analysis=False) persists the canonicalized analysis back to
+# paperjson_path (when given) and self-skips the 7 analysis calls when the
+# cached analysis is already populated (unless force_analysis=True).
+# ---------------------------------------------------------------------------
+
+def _write_pj_cache(tmp_path, pj, name="cached_paper.json"):
+    """Write a PaperJSON dict to a tmp-scoped cache file and return its path."""
+    cache_file = tmp_path / ".paperjson_cache" / name
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(pj), encoding="utf-8")
+    return str(cache_file)
+
+
+def _populated_analysis(topics=None):
+    return {
+        "generated_by": "gemma4:e4b",
+        "summary": "Existing summary.",
+        "claims": ["Existing claim."],
+        "methods_overview": "Existing methods.",
+        "results": "Existing results.",
+        "limitations": ["Existing limitation."],
+        "open_questions": [],
+        "entities": [],
+        "topics": topics if topics is not None else ["existing-topic"],
+        "connections": {"builds_on": [], "contradicts": [], "same_domain": []},
+    }
+
+
+def test_generate_note_persists_analysis_to_cache(tmp_path):
+    """Test A: after generate_note, the analysis populated in-memory is
+    re-readable from the cache file on disk (a real file write, not just a
+    mutation of the in-memory dict)."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    def _fake_analysis(paperjson):
+        paperjson["analysis"]["summary"] = "A generated summary."
+        paperjson["analysis"]["generated_by"] = "gemma4:e4b"
+
+    with mock.patch("scripts.note._generate_analysis", side_effect=_fake_analysis), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=["a-topic"]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created"):
+
+        generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    with open(cache_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["analysis"]["summary"] == "A generated summary.", (
+        "cache file must reflect the freshly-generated analysis"
+    )
+    assert on_disk["analysis"]["generated_by"] == "gemma4:e4b"
+
+
+def test_generate_note_persists_canonicalized_topics(tmp_path):
+    """Test B: the topics value re-read from the cache equals the
+    CANONICALIZED list, not the pre-canonicalization value — the write must
+    sit after _canonicalize_tags."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    def _fake_analysis(paperjson):
+        paperjson["analysis"]["topics"] = ["raw-proposed-topic"]
+
+    with mock.patch("scripts.note._generate_analysis", side_effect=_fake_analysis), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=["canonical-topic"]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created"):
+
+        generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    with open(cache_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["analysis"]["topics"] == ["canonical-topic"], (
+        "persisted topics must be the canonicalized value, not the raw proposed one"
+    )
+
+
+def test_generate_note_self_skips_populated_analysis(tmp_path):
+    """Test C: an already-populated cached analysis makes ZERO analysis
+    calls and still renders + writes the note."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    pj["analysis"] = _populated_analysis()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
+         mock.patch("scripts.note._canonicalize_tags", return_value=["existing-topic"]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created") as mock_create:
+
+        result = generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    mock_analysis.assert_not_called()
+    mock_create.assert_called_once()
+    assert result.startswith("Papers/")
+
+
+def test_generate_note_force_analysis_reruns_and_repersists(tmp_path):
+    """Test D: force_analysis=True re-runs analysis even when the cached
+    analysis is already populated, and re-persists the result."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    pj["analysis"] = _populated_analysis()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    def _fake_analysis(paperjson):
+        paperjson["analysis"]["summary"] = "Freshly re-generated summary."
+
+    with mock.patch("scripts.note._generate_analysis", side_effect=_fake_analysis) as mock_analysis, \
+         mock.patch("scripts.note._canonicalize_tags", return_value=["existing-topic"]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created"):
+
+        generate_note(pj, config, force=False, paperjson_path=cache_path, force_analysis=True)
+
+    mock_analysis.assert_called_once()
+    with open(cache_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["analysis"]["summary"] == "Freshly re-generated summary."
+
+
+def test_generate_note_empty_skeleton_treated_as_unfilled(tmp_path):
+    """Test E: a PaperJSON carrying the exact empty analysis skeleton is
+    treated as 'not yet filled' (not corrupt) -- the first run fills and
+    persists successfully, no migration."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()  # fresh skeleton, empty analysis
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    def _fake_analysis(paperjson):
+        paperjson["analysis"]["summary"] = "Filled for the first time."
+        paperjson["analysis"]["generated_by"] = "gemma4:e4b"
+
+    with mock.patch("scripts.note._generate_analysis", side_effect=_fake_analysis) as mock_analysis, \
+         mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created"):
+
+        result = generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    mock_analysis.assert_called_once()
+    assert result.startswith("Papers/")
+    with open(cache_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["analysis"]["summary"] == "Filled for the first time."
+
+
+def test_generate_note_no_path_no_write(tmp_path):
+    """Test F: called WITHOUT paperjson_path, behaviour is unchanged --
+    analysis runs, note renders/writes, and no cache file is created."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
+         mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created") as mock_create:
+
+        result = generate_note(pj, config, force=False)
+
+    mock_analysis.assert_called_once()
+    mock_create.assert_called_once()
+    assert result.startswith("Papers/")
+    assert not (tmp_path / ".paperjson_cache").exists(), (
+        "no cache file should be created when paperjson_path is not given"
+    )
+
+
+def test_generate_note_persist_failure_is_non_fatal(tmp_path):
+    """Test G: a cache-write failure still yields the note and the returned
+    path -- logged as a warning, never fatal."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    with mock.patch("scripts.note._generate_analysis"), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+         mock.patch(
+             "scripts.note._write_paperjson_cache",
+             side_effect=OSError("disk full"),
+         ), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created") as mock_create:
+
+        result = generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    mock_create.assert_called_once()
+    assert result.startswith("Papers/"), (
+        "a cache-write failure must never cost the user their note"
+    )
+
+
+def test_generate_note_existing_contracts_intact(tmp_path):
+    """Test H: the D-16 note-exists skip, the force overwrite, and both
+    error strings are unchanged by the paperjson_path/force_analysis seam."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    # D-16 skip: existing note + no force -> zero LLM calls, zero cache write
+    with mock.patch("scripts.note._generate_analysis") as mock_analysis, \
+         mock.patch("scripts.note._write_paperjson_cache") as mock_write_cache, \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=True), \
+         mock.patch("scripts.note.create_note") as mock_create:
+
+        result = generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    mock_create.assert_not_called()
+    mock_analysis.assert_not_called()
+    mock_write_cache.assert_not_called()
+    assert result.startswith("Papers/")
+
+    # force=True still passes overwrite=True to create_note
+    with mock.patch("scripts.note._generate_analysis"), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=True), \
+         mock.patch("scripts.note.create_note", return_value="Created") as mock_create2:
+
+        generate_note(pj, config, force=True)
+
+    overwrite_arg = mock_create2.call_args[1].get("overwrite", False)
+    assert overwrite_arg is True
+
+    # error strings unchanged: missing vault_path / preflight failure
+    result_no_vault = generate_note(pj, {})
+    assert result_no_vault.startswith("[note error:")
+
+    with mock.patch("scripts.note.preflight", return_value=False):
+        result_preflight = generate_note(pj, config)
+    assert result_preflight.startswith("[note error:")
+
+
+# ---------------------------------------------------------------------------
 # Plan 03: Standalone note.py default cache resolution (D-07)
 # ---------------------------------------------------------------------------
 

@@ -14,6 +14,7 @@ import argparse
 import datetime
 import json
 import os
+import pathlib
 import re
 import sys
 
@@ -29,6 +30,7 @@ from scripts.ingest import (
     _estimate_num_ctx,
     _warmup_ollama,
     _load_config,
+    _write_paperjson_cache,
     OLLAMA_MODEL,
 )
 from scripts.obsidian_cli import preflight, note_exists, create_note, _validate_vault_path
@@ -342,6 +344,48 @@ def _generate_analysis(paperjson: dict) -> None:
         analysis["limitations"] = ["(generation failed -- see raw extract)"]
 
     analysis["generated_by"] = OLLAMA_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Analysis-populated predicate (T-08-GAP-18..22) — the single definition
+# ---------------------------------------------------------------------------
+#
+# Analysis-namespace fields that indicate the PaperJSON's analysis has been
+# filled by the LLM cascade above (as opposed to the empty skeleton written
+# at ingest time — see scripts/ingest.py::_assemble_paperjson's `analysis`
+# dict). Ported verbatim from gui/scan.py's former `_ANALYSIS_POPULATED_KEYS`
+# (constant name kept so the move is traceable); gui/scan.py now imports
+# `_analysis_is_populated` from here instead of re-deriving this list.
+# `connections` is deliberately excluded, matching the original.
+_ANALYSIS_POPULATED_KEYS = (
+    "generated_by",
+    "summary",
+    "claims",
+    "methods_overview",
+    "results",
+    "limitations",
+    "open_questions",
+    "entities",
+    "topics",
+)
+
+
+def _analysis_is_populated(paperjson: dict) -> bool:
+    """True when ``paperjson["analysis"]`` has been filled by the LLM cascade.
+
+    An empty analysis skeleton (every value falsy — the shape
+    ``scripts/ingest.py::_assemble_paperjson`` writes at ingest time) means
+    "not yet filled", NEVER "corrupt". This is the back-compat contract for
+    the pre-existing cache files that predate cache persistence: they are
+    treated as unfilled and simply fill + persist on their first
+    ``generate_note`` run, with no migration required.
+
+    Takes the full PaperJSON dict (not just the ``analysis`` namespace) so
+    both call sites — ``generate_note``'s self-skip and gui/scan.py's
+    PaperJSON Fill stage light — share one shape and one definition.
+    """
+    analysis = paperjson.get("analysis") or {}
+    return any(analysis.get(key) for key in _ANALYSIS_POPULATED_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -690,14 +734,40 @@ def _render_note(paperjson: dict) -> str:
 # Orchestrator: analysis -> render -> vault write
 # ---------------------------------------------------------------------------
 
-def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
+def generate_note(
+    paperjson: dict,
+    config: dict,
+    force: bool = False,
+    paperjson_path: str | None = None,
+    force_analysis: bool = False,
+) -> str:
     """Generate a note from PaperJSON and write it to the vault.
 
-    Orchestrates: preflight -> analysis -> render -> vault write.
+    Orchestrates: preflight -> analysis (self-skip if cached) -> canonicalize
+    tags -> persist analysis to cache -> render -> vault write.
 
     Returns the vault-relative path on success, or a ``[note error: ...]``
     string on failure.  On an existing note with ``force=False``, skips
     (D-16) and returns the path without running any LLM calls.
+
+    ``force`` vs. ``force_analysis`` — kept as two separate flags rather than
+    overloading one, on purpose: ``force`` (D-16) means "overwrite an
+    existing note on disk" and is what the GUI's Re-run Note button passes.
+    Overloading it to also mean "re-run analysis" would make every note
+    re-run pay the 7 analysis LLM calls this plan exists to eliminate —
+    reintroducing the exact cost the gap identifies. ``force_analysis`` is
+    the distinct, deliberate re-analysis escape hatch (e.g. after a model
+    upgrade), keeping D-16's note-overwrite contract untouched.
+
+    ``paperjson_path``, when given, is the cache file this PaperJSON was (or
+    will be) persisted to. After analysis + tag canonicalization, the
+    enriched PaperJSON is written back to that file via
+    ``scripts.ingest._write_paperjson_cache`` (same filelock + temp-file +
+    ``os.replace`` atomicity as the rest of the pipeline), so a second run
+    against the same cache makes zero analysis LLM calls. When
+    ``paperjson_path`` is None (the default), no cache file is read or
+    written by this function — behaviour is unchanged from before this
+    persistence was added.
     """
     # Fail-fast: vault_path required
     vault_path = config.get("vault_path")
@@ -734,13 +804,41 @@ def generate_note(paperjson: dict, config: dict, force: bool = False) -> str:
     global _SECTION_TIMEOUT
     _SECTION_TIMEOUT = int(config.get("ollama_section_timeout", DEFAULT_SECTION_TIMEOUT))
 
-    # Run analysis generation (7 LLM calls)
-    _generate_analysis(paperjson)
+    # Run analysis generation (7 LLM calls) — self-skip when the cached
+    # analysis is already populated, unless a deliberate re-analysis was
+    # requested (T-08-GAP-18/21: the cost win this plan exists to deliver).
+    if _analysis_is_populated(paperjson) and not force_analysis:
+        _log(
+            "cached analysis already populated -- reusing (zero analysis "
+            "calls; pass --force-analysis / force_analysis=True to re-run)"
+        )
+    else:
+        _generate_analysis(paperjson)
 
     # Tag canonicalization (260714-dpl): merge true-synonym proposed tag slugs
     # into the existing live-vault canonical slug before rendering (fail-open).
+    # Runs on BOTH paths (fresh analysis and reused cached analysis) so the
+    # rendered note's tags are canonical either way.
     analysis = paperjson["analysis"]
     analysis["topics"] = _canonicalize_tags(analysis.get("topics") or [], config)
+
+    # Persist the filled, canonicalized analysis back to the cache
+    # (T-08-GAP-18). Sits AFTER canonicalization so the cache and the
+    # rendered note never disagree on tags (T-08-GAP-20), and BEFORE the
+    # render/vault-write so the 7 LLM calls are banked even if the vault
+    # write later fails. A cache-write failure must never cost the user
+    # their note (T-08-GAP-19) — non-fatal, logged as a warning.
+    if paperjson_path:
+        try:
+            _cache_file = pathlib.Path(paperjson_path)
+            _write_paperjson_cache(
+                paperjson, _cache_file.stem, cache_dir=str(_cache_file.parent)
+            )
+        except Exception as e:
+            _log(
+                f"[note warning: failed to persist analysis to cache "
+                f"{paperjson_path}: {e}]"
+            )
 
     # Render the note
     rendered = _render_note(paperjson)
@@ -793,6 +891,10 @@ if __name__ == "__main__":
         "--force", action="store_true",
         help="Overwrite an existing note instead of skipping (D-16).",
     )
+    parser.add_argument(
+        "--force-analysis", action="store_true",
+        help="Re-run the 7 analysis calls even when the cached analysis is populated.",
+    )
     args = parser.parse_args()
 
     try:
@@ -810,7 +912,10 @@ if __name__ == "__main__":
 
         with open(pj_path, encoding="utf-8") as f:
             paperjson = json.load(f)
-        result = generate_note(paperjson, config, force=args.force)
+        result = generate_note(
+            paperjson, config, force=args.force,
+            paperjson_path=pj_path, force_analysis=args.force_analysis,
+        )
         print(result)
     except SystemExit:
         raise
