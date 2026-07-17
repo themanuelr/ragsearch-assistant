@@ -6285,6 +6285,153 @@ def test_doi_flag_cache_absent_fallback_note(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 08-09 gap closure: --doi import registers project_name into the registry's
+# projects[] (Test 4 UAT gap; REG-03 / GUI-08). Reuses the REG-03 harness above.
+# ---------------------------------------------------------------------------
+
+def test_doi_flag_cache_present_registers_project_preserving_prior(tmp_path):
+    """Test A: a cache-present --doi import appends config['project_name'] to
+    the registry entry's projects[], preserving the pre-existing membership
+    (union-merge, CR-01/REG-04) -- so Overview (Universal) flips in-this-project
+    and Overview (Project) lists the paper."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry, _read_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/register-cache-present"
+    title = "Registers On Cache Present"
+
+    pj = {
+        "extraction": {"metadata": {
+            "title": title, "doi": doi, "authors": None, "year": 2024,
+            "journal": None, "arxiv_id": None,
+        }},
+        "analysis": {
+            "summary": "S.", "claims": ["C."], "methods_overview": "M.",
+            "results": "R.", "limitations": ["L."], "open_questions": [], "topics": [],
+            "generated_by": "gemma4:e4b",
+        },
+        "provenance": {},
+    }
+    cache_dir = pathlib.Path(cfg["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "register-cache-present.json"
+    cache_path.write_text(json.dumps(pj), encoding="utf-8")
+
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None, "authors": None, "year": 2024,
+        "journal": None, "projects": ["uat_other_project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(cache_path), "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    with mock.patch("scripts.note.generate_note", return_value="Papers/x.md"), \
+         mock.patch("scripts.biblio.run_biblio", return_value=None), \
+         mock.patch("scripts.embed.run_embed", return_value=None), \
+         mock.patch("scripts.link.run_link", return_value=None):
+        ingest._ingest_by_doi(doi, cfg)
+
+    persisted = _read_registry(cfg["registry_path"])[doi]
+    assert set(persisted["projects"]) == {"uat_other_project", cfg["project_name"]}, (
+        f"Expected both the pre-existing and the new project in projects[], got {persisted['projects']!r}"
+    )
+
+
+def test_doi_flag_cache_present_registration_idempotent(tmp_path):
+    """Test B: running the same cache-present --doi import twice leaves exactly
+    one occurrence of config['project_name'] in projects[] -- no duplicate append."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry, _read_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/register-idempotent"
+    title = "Registers Idempotently"
+
+    pj = {
+        "extraction": {"metadata": {
+            "title": title, "doi": doi, "authors": None, "year": 2024,
+            "journal": None, "arxiv_id": None,
+        }},
+        "analysis": {
+            "summary": "S.", "claims": ["C."], "methods_overview": "M.",
+            "results": "R.", "limitations": ["L."], "open_questions": [], "topics": [],
+            "generated_by": "gemma4:e4b",
+        },
+        "provenance": {},
+    }
+    cache_dir = pathlib.Path(cfg["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "register-idempotent.json"
+    cache_path.write_text(json.dumps(pj), encoding="utf-8")
+
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None, "authors": None, "year": 2024,
+        "journal": None, "projects": ["uat_other_project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(cache_path), "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    with mock.patch("scripts.note.generate_note", return_value="Papers/x.md"), \
+         mock.patch("scripts.biblio.run_biblio", return_value=None), \
+         mock.patch("scripts.embed.run_embed", return_value=None), \
+         mock.patch("scripts.link.run_link", return_value=None):
+        ingest._ingest_by_doi(doi, cfg)
+        ingest._ingest_by_doi(doi, cfg)
+
+    persisted = _read_registry(cfg["registry_path"])[doi]
+    assert persisted["projects"].count(cfg["project_name"]) == 1, (
+        f"Expected exactly one occurrence of {cfg['project_name']!r}, got {persisted['projects']!r}"
+    )
+
+
+def test_doi_flag_cache_absent_fallback_registers_project(tmp_path):
+    """Test C: the cache-absent D-16 fallback path ALSO persists
+    config['project_name'] into projects[] -- registration is not conditioned
+    on whether a full note could be rebuilt from cache."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry, _read_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/register-cache-absent"
+    title = "Registers On Cache Absent"
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None,
+        "authors": ["Jane Researcher"], "year": 2022, "journal": "Journal of Examples",
+        "projects": ["uat_other_project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(pathlib.Path(cfg["paperjson_cache_dir"]) / "missing.json"),
+        "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    ingest._ingest_by_doi(doi, cfg)
+
+    persisted = _read_registry(cfg["registry_path"])[doi]
+    assert set(persisted["projects"]) == {"uat_other_project", cfg["project_name"]}, (
+        f"Expected both the pre-existing and the new project in projects[], got {persisted['projects']!r}"
+    )
+
+
+def test_doi_flag_registry_miss_writes_nothing(tmp_path, capsys):
+    """Test D: a registry miss still returns None, prints the existing
+    not-in-registry error, and writes no registry entry (registration must
+    never fire on a miss)."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _read_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    pathlib.Path(cfg["registry_path"]).write_text("{}", encoding="utf-8")
+
+    result = ingest._ingest_by_doi("10.9999/still-absent", cfg)
+
+    assert result is None
+    captured = capsys.readouterr()
+    assert "[ingest error:" in captured.err
+    assert _read_registry(cfg["registry_path"]) == {}, (
+        "Expected no registry entry written on a registry miss"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Quick task 260714-t1o: universal shared mineru_output_dir / paperjson_cache_dir
 # ---------------------------------------------------------------------------
 

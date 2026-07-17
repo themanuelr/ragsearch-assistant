@@ -2968,6 +2968,26 @@ def _ingest_by_doi(doi_arg: str, config: dict) -> dict | None:
         )
         return None
 
+    # REG-03/GUI-08 gap closure (08-09): register this project into the
+    # resolved entry's projects[] BEFORE the cache-present/cache-absent
+    # branch, so both paths give Overview (Universal)'s "Import into This
+    # Project" action the same in-this-project outcome. Mirrors the
+    # cache-hit idiom in _run_fill_cascade (2210-2216): append if absent,
+    # write through the union-merging _write_registry under a best-effort
+    # try/except so a registry-write failure never aborts the import. The
+    # key is re-derived via _registry_key(entry) rather than trusting
+    # doi_arg literally, since doi_arg may have resolved via the title-index
+    # fallback (D-17) to a key that differs from the raw argument.
+    project_name = config.get("project_name")
+    if project_name and project_name not in entry.get("projects", []):
+        entry.setdefault("projects", []).append(project_name)
+        if registry_path:
+            try:
+                registry_key = _registry_key(entry)
+                _write_registry(entry, registry_path, registry_key)
+            except Exception as e:
+                _log(f"--doi registry project registration failed: {e}")
+
     pj_path = entry.get("paperjson_path") or ""
     if not (pj_path and pathlib.Path(pj_path).exists()):
         # D-16: cache absent -- new code path, never a ghost/empty note.
