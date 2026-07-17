@@ -15,6 +15,7 @@ Run with:  python -m pytest tests/test_gui_ollama_chat.py -x
 
 import json
 import pathlib
+import re
 import urllib.error
 from unittest import mock
 
@@ -289,6 +290,129 @@ def test_chat_send_appends_user_message_and_returns_stream_markup(
     saved = chat_store_module.load(conv["id"])
     assert saved["messages"][0] == {"role": "user", "content": "Hello there"}
     assert saved["model"] == "llama3:8b"
+
+
+# ---------------------------------------------------------------------------
+# gui/routes/chat.py + chat_pending.html -- 08-15 Task 1 (Gap A,
+# T-08-GAP-27): the pending assistant container id is keyed per MESSAGE, not
+# per conversation, so a second send in the same conversation cannot
+# duplicate the first send's id and hijack getElementById.
+# ---------------------------------------------------------------------------
+
+_CHAT_ASSISTANT_CONTENT_ID_RE = re.compile(
+    r'id="(chat-assistant-content-[^"]+)"'
+)
+_CHAT_ASSISTANT_TARGET_ID_RE = re.compile(
+    r'getElementById\("(chat-assistant-content-[^"]+)"\)'
+)
+_VALID_DOM_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _send_with_canned_scope(gui_client, gui_config, monkeypatch, conv_id, message):
+    """Shared harness for the Task 1 tests: not-busy, and _resolve_scope
+    monkeypatched to a canned no-context tuple (per the plan's <action>) so
+    these tests pin only the pending-partial markup contract, not retrieval
+    behaviour already covered elsewhere in this file."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr(
+        "gui.routes.chat._resolve_scope",
+        lambda *a, **k: ([], None, None, None, False),
+    )
+    return gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv_id,
+            "message": message,
+            "model": "gemma4:e4b",
+            "scope": "none",
+        },
+    )
+
+
+def test_chat_send_two_consecutive_sends_yield_distinct_assistant_container_ids(
+    gui_client, gui_config, monkeypatch
+):
+    """Test A: the gap's named regression -- two consecutive POSTs to
+    /chat/send in the SAME conversation must return pending partials whose
+    assistant container ids differ, so #chat-messages (hx-swap="beforeend")
+    can never end up holding two elements sharing one id."""
+    conv = chat_store_module.create_conversation()
+
+    resp1 = _send_with_canned_scope(gui_client, gui_config, monkeypatch, conv["id"], "Question 1")
+    resp2 = _send_with_canned_scope(gui_client, gui_config, monkeypatch, conv["id"], "Question 2")
+
+    assert resp1.status_code == 200
+    assert resp2.status_code == 200
+
+    id1 = _CHAT_ASSISTANT_CONTENT_ID_RE.search(resp1.text).group(1)
+    id2 = _CHAT_ASSISTANT_CONTENT_ID_RE.search(resp2.text).group(1)
+    assert id1 != id2, "duplicate assistant container id across two sends (T-08-GAP-27)"
+
+
+def test_chat_pending_script_target_id_matches_rendered_container_id(
+    gui_client, gui_config, monkeypatch
+):
+    """Test B: within one pending partial, the id the inline script resolves
+    via getElementById must be exactly the id rendered on the assistant
+    content element -- target and container must correspond, the same class
+    of bug 08-08 closed for the drill-down re-run buttons."""
+    conv = chat_store_module.create_conversation()
+
+    resp = _send_with_canned_scope(gui_client, gui_config, monkeypatch, conv["id"], "hi")
+
+    rendered_id = _CHAT_ASSISTANT_CONTENT_ID_RE.search(resp.text).group(1)
+    target_id = _CHAT_ASSISTANT_TARGET_ID_RE.search(resp.text).group(1)
+    assert rendered_id == target_id
+
+
+def test_chat_pending_assistant_container_id_is_a_valid_dom_id(
+    gui_client, gui_config, monkeypatch
+):
+    """Test C: the composed id (conv id + message index) is a syntactically
+    valid, escape-free DOM id -- conversation ids are already validated
+    against a strict charset (chat_store._CONV_ID_RE) and the index is a
+    plain integer, so the composed id cannot carry an attribute- or
+    selector-breaking character (T-08-GAP-28, accepted-not-mitigated)."""
+    conv = chat_store_module.create_conversation()
+
+    resp = _send_with_canned_scope(gui_client, gui_config, monkeypatch, conv["id"], "hi")
+
+    rendered_id = _CHAT_ASSISTANT_CONTENT_ID_RE.search(resp.text).group(1)
+    assert _VALID_DOM_ID_RE.match(rendered_id), rendered_id
+
+
+def test_chat_pending_partial_other_contracts_unchanged(
+    gui_client, gui_config, monkeypatch
+):
+    """Test D: the pending partial still renders the user message, the
+    optional banner/truncation notes, and still opens the SSE stream for the
+    right conversation and model -- this plan changes WHICH element is
+    resolved, nothing else about the partial's contract."""
+    conv = chat_store_module.create_conversation()
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr(
+        "gui.routes.chat._resolve_scope",
+        lambda *a, **k: ([], None, "a banner", ["dropped note"], False),
+    )
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "Hello there",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "Hello there" in resp.text
+    assert "a banner" in resp.text
+    assert "dropped note" in resp.text
+    assert f"/chat/stream?conv={conv['id']}" in resp.text
+    assert "model=gemma4" in resp.text
 
 
 def test_chat_blocked_while_busy(gui_client, gui_config, monkeypatch):
