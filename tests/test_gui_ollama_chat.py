@@ -489,6 +489,134 @@ def test_chat_none_scope_calls_no_retrieval(gui_client, gui_config, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# gui/routes/chat.py -- 08-11 Task 1 (Gap A / T-08-GAP-10): context spliced
+# adjacent to the latest user message, not at position 0.
+# ---------------------------------------------------------------------------
+
+def _seed_conversation_with_refusal():
+    """Conversation whose history already contains a prior user turn AND a
+    prior assistant refusal -- the exact shape from Gap A's diagnosis
+    (08-UAT.md T-08-GAP-10): a ChromaDB-error window produced a refusal that
+    then re-enters the next turn's prompt and gets pattern-continued."""
+    conv = chat_store_module.create_conversation()
+    conv["messages"] = [
+        {"role": "user", "content": "who wrote the NKCC1 paper"},
+        {
+            "role": "assistant",
+            "content": "I'm sorry for any confusion earlier; I must clarify that "
+            "as of my last update at beginning 2023-4, I'm not capable to browse "
+            "real-time databases",
+        },
+    ]
+    chat_store_module.save(conv)
+    return conv
+
+
+def test_chat_context_spliced_before_final_user_turn_not_position_zero(
+    gui_client, gui_config, monkeypatch
+):
+    """Test A: pins the ASSEMBLY position, not whether a live model then
+    answers correctly -- that is a live-LLM property no hermetic test can
+    assert, and is exactly what the confirmed diagnosis (replaying the SAME
+    question with the SAME context but a CLEAN transcript) identified as the
+    whole difference between a correct grounded answer and a confident
+    non-answer (08-UAT.md T-08-GAP-10). This is not a weaker substitute
+    chosen by accident."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = _seed_conversation_with_refusal()
+
+    canned_context = [{"role": "system", "content": "retrieved excerpts here"}]
+    monkeypatch.setattr(
+        "gui.routes.chat._resolve_scope",
+        lambda *a, **k: (
+            canned_context,
+            [{"title": "t", "section": "s", "score": 0.9}],
+            None,
+            None,
+        ),
+    )
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "who is the first author",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert resp.status_code == 200
+
+    llm_messages = chat_module._PENDING[conv["id"]]["llm_messages"]
+    assert llm_messages[-1] == {"role": "user", "content": "who is the first author"}
+    assert llm_messages[len(llm_messages) - 2] == canned_context[0]
+
+
+def test_chat_context_splice_preserves_prior_transcript_order(
+    gui_client, gui_config, monkeypatch
+):
+    """Test B: the fix reorders nothing except where the context is spliced
+    in -- every prior transcript message stays present in its original
+    relative order."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = _seed_conversation_with_refusal()
+
+    canned_context = [{"role": "system", "content": "retrieved excerpts here"}]
+    monkeypatch.setattr(
+        "gui.routes.chat._resolve_scope",
+        lambda *a, **k: (canned_context, None, None, None),
+    )
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "fresh question",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert resp.status_code == 200
+
+    llm_messages = chat_module._PENDING[conv["id"]]["llm_messages"]
+    assert llm_messages[:2] == [
+        {"role": "user", "content": "who wrote the NKCC1 paper"},
+        {
+            "role": "assistant",
+            "content": "I'm sorry for any confusion earlier; I must clarify that "
+            "as of my last update at beginning 2023-4, I'm not capable to browse "
+            "real-time databases",
+        },
+    ]
+
+
+def test_chat_none_scope_context_no_splice_equals_plain_transcript(
+    gui_client, gui_config, monkeypatch
+):
+    """Test C: an empty context_messages yields llm_messages equal to the
+    plain transcript -- no injected system message, scope-none path stays
+    byte-identical."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "hi", "model": "gemma4:e4b", "scope": "none"},
+    )
+    assert resp.status_code == 200
+
+    llm_messages = chat_module._PENDING[conv["id"]]["llm_messages"]
+    assert llm_messages == [{"role": "user", "content": "hi"}]
+    assert not any(m["role"] == "system" for m in llm_messages)
+
+
+# ---------------------------------------------------------------------------
 # T-08-05 (threat register): the literal innerHTML API is absent from every
 # chat template -- tokens must reach the DOM via textContent/createTextNode
 # only, keeping untrusted LLM output XSS-inert.

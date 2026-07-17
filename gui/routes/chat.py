@@ -278,9 +278,20 @@ def chat_send(
     conversation["model"] = model
     chat_store.save(conversation)
 
-    llm_messages = context_messages + [
+    transcript = [
         {"role": m["role"], "content": m["content"]} for m in conversation["messages"]
     ]
+    # Gap A (08-UAT.md T-08-GAP-10): context placed at position 0 is
+    # maximally distant from the question it grounds and gets outweighed by
+    # the accumulated transcript -- including the model's own prior
+    # refusals, which it then pattern-continues instead of reading the
+    # excerpts. Splicing context immediately before the final (just-sent)
+    # user turn is what made the SAME retrieved context produce a correct,
+    # grounded answer in the replay used to diagnose this gap. When
+    # context_messages is empty this is exactly `transcript` -- the
+    # scope-none path stays byte-identical and no empty system message is
+    # ever injected.
+    llm_messages = transcript[:-1] + context_messages + transcript[-1:]
 
     _PENDING[conv] = {
         "llm_messages": llm_messages,
