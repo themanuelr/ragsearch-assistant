@@ -895,6 +895,177 @@ def test_chat_none_scope_context_no_splice_equals_plain_transcript(
 
 
 # ---------------------------------------------------------------------------
+# gui/routes/chat.py -- 08-14 Task 1 (Gap A / D-18): _sse_stream guarantees
+# exactly one assistant entry per turn, even on error/empty/abandoned
+# streams, so no turn can ever leave an orphaned user message.
+# ---------------------------------------------------------------------------
+
+def _assert_alternation(messages: list) -> None:
+    """Shared invariant: strict user/assistant alternation, no two
+    consecutive messages of the same role -- the actual truth Task 1
+    defends. Reused across every test in this section."""
+    for i in range(1, len(messages)):
+        assert messages[i]["role"] != messages[i - 1]["role"], (
+            f"consecutive same-role messages at indices {i - 1},{i}: {messages}"
+        )
+
+
+def _send_turn(gui_client, gui_config, monkeypatch, conv_id, message="hi", model="gemma4:e4b"):
+    """Drive a real POST /chat/send so the user message is appended/saved
+    and a _PENDING entry is written exactly like the browser flow."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    resp = gui_client.post(
+        "/chat/send",
+        data={"conv": conv_id, "message": message, "model": model, "scope": "none"},
+    )
+    assert resp.status_code == 200
+
+
+def _frame(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def test_errored_stream_leaves_no_orphaned_user_message(gui_client, gui_config, monkeypatch):
+    """Test A: a turn whose stream yields an error frame must not leave a
+    user message without a corresponding assistant entry. The transcript
+    alternates and the final message is an assistant entry carrying the
+    error marker."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="will error")
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([_frame({"error": "[Ollama error: connection refused]"})]),
+    )
+
+    list(chat_module._sse_stream(conv["id"], "gemma4:e4b"))
+
+    saved = chat_store_module.load(conv["id"])
+    _assert_alternation(saved["messages"])
+    last = saved["messages"][-1]
+    assert last["role"] == "assistant"
+    assert last.get("error") is True
+    assert last["content"].startswith("[chat error"), last["content"]
+
+
+def test_done_with_no_tokens_still_yields_exactly_one_error_marked_assistant_entry(
+    gui_client, gui_config, monkeypatch
+):
+    """Test B: a stream that yields 'done' with no tokens still results in
+    exactly one assistant entry (error-marked, since the model produced
+    nothing) -- never a bare user message."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="empty reply")
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([_frame({"done": True})]),
+    )
+
+    list(chat_module._sse_stream(conv["id"], "gemma4:e4b"))
+
+    saved = chat_store_module.load(conv["id"])
+    _assert_alternation(saved["messages"])
+    last = saved["messages"][-1]
+    assert last["role"] == "assistant"
+    assert last.get("error") is True
+    assert last["content"].startswith("[chat error"), last["content"]
+
+
+def test_abandoned_stream_yields_exactly_one_assistant_entry_with_partial_text(
+    gui_client, gui_config, monkeypatch
+):
+    """Test C: a stream abandoned mid-flight (generator closed after a
+    partial token, as when the browser disconnects) still results in
+    exactly one assistant entry, carrying the partial text accumulated so
+    far."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="partial")
+
+    def _fake_stream(*a, **k):
+        yield _frame({"token": "partial answer"})
+        yield _frame({"token": "-- never reached"})
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _fake_stream)
+
+    gen = chat_module._sse_stream(conv["id"], "gemma4:e4b")
+    next(gen)  # consume exactly one frame, mirroring a mid-flight disconnect
+    gen.close()
+
+    saved = chat_store_module.load(conv["id"])
+    _assert_alternation(saved["messages"])
+    last = saved["messages"][-1]
+    assert last["role"] == "assistant"
+    assert last["content"] == "partial answer"
+
+
+def test_successful_stream_appends_exactly_one_assistant_message_unchanged(
+    gui_client, gui_config, monkeypatch
+):
+    """Test D: a normal completed stream still appends exactly one
+    assistant message whose content is the joined tokens, with sources and
+    truncation_notes attached exactly as today."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="normal")
+    chat_module._PENDING[conv["id"]] = {
+        "llm_messages": [{"role": "user", "content": "normal"}],
+        "sources": [{"title": "t", "section": "s", "score": 0.9}],
+        "banner": None,
+        "truncation_notes": ["dropped note"],
+    }
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([
+            _frame({"token": "Hel"}),
+            _frame({"token": "lo"}),
+            _frame({"done": True}),
+        ]),
+    )
+
+    list(chat_module._sse_stream(conv["id"], "gemma4:e4b"))
+
+    saved = chat_store_module.load(conv["id"])
+    _assert_alternation(saved["messages"])
+    last = saved["messages"][-1]
+    assert last["role"] == "assistant"
+    assert last["content"] == "Hello"
+    assert last.get("error") is not True
+    assert last["sources"] == [{"title": "t", "section": "s", "score": 0.9}]
+    assert last["truncation_notes"] == ["dropped note"]
+
+
+@pytest.mark.parametrize(
+    "frames",
+    [
+        [{"error": "[Ollama error: boom]"}],
+        [{"done": True}],
+        [{"token": "hi"}, {"done": True}],
+    ],
+)
+def test_turn_adds_exactly_two_messages_never_more(
+    gui_client, gui_config, monkeypatch, frames
+):
+    """Test E: no path appends two assistant messages for one turn --
+    the message count delta for a turn is exactly 2 (one user, one
+    assistant), across the error, empty, and success paths."""
+    conv = chat_store_module.create_conversation()
+    before_count = len(conv["messages"])
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="count me")
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([_frame(p) for p in frames]),
+    )
+
+    list(chat_module._sse_stream(conv["id"], "gemma4:e4b"))
+
+    saved = chat_store_module.load(conv["id"])
+    assert len(saved["messages"]) - before_count == 2
+
+
+# ---------------------------------------------------------------------------
 # T-08-05 (threat register): the literal innerHTML API is absent from every
 # chat template -- tokens must reach the DOM via textContent/createTextNode
 # only, keeping untrusted LLM output XSS-inert.
