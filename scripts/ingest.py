@@ -2941,12 +2941,19 @@ def _ingest_by_doi(doi_arg: str, config: dict) -> dict | None:
     Resolves doi_arg via _resolve_doi_arg (DOI / arXiv id / title forms,
     D-17). Not-in-registry: prints a clear "[ingest error: ...]" to stderr,
     writes no note, makes no network/PDF call, and returns None (D-18).
+    On a registry hit, registers config["project_name"] into the resolved
+    entry's projects[] via the union-merging _write_registry (best-effort,
+    logged on failure) BEFORE branching on cache presence, so both paths
+    below give Overview (Universal)'s "Import into This Project" action the
+    same in-this-project outcome (REG-03 / GUI-08, 08-09 gap closure).
     Cache present (.paperjson_cache intact): regenerates the complete note by
     directly reusing the same note/biblio/embed/link machinery as the Step 9
     cache-hit branch in _run_fill_cascade — zero LLM fill/analysis calls
     (D-15). Deliberately does NOT call _warmup_ollama/_doi_probe (those are
     miss-path-only steps in _run_fill_cascade, not part of the cache-hit
-    note-generation branch being reused here).
+    note-generation branch being reused here). The returned dict also carries
+    a transient _cache_path key naming the reused cache file, consumed and
+    popped by main()'s confirmation builder.
     Cache absent: writes a non-ghost registry-metadata fallback note with an
     honest callout naming the sections that could not be reconstructed (D-16).
 
