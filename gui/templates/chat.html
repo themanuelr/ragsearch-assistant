@@ -17,6 +17,9 @@
         {% if active_conv and active_conv.messages %}
           {% for m in active_conv.messages %}
             <div class="chat-message chat-message-{{ m.role }}">
+              {% if m.role == "assistant" and m.model %}
+                <p class="chat-message-model">{{ m.model }}</p>
+              {% endif %}
               <div class="chat-message-content">{{ m.content }}</div>
               {% if m.banner %}
                 <p class="settings-error chat-message-banner">{{ m.banner }}</p>

@@ -513,6 +513,12 @@ textarea:focus {
   margin: var(--space-xs) 0;
 }
 
+.chat-message-model {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  margin: 0 0 var(--space-xs) 0;
+}
+
 .chat-sources summary {
   cursor: pointer;
   color: var(--color-accent);

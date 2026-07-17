@@ -356,6 +356,11 @@ def chat_send(
         )
 
     conversation["messages"].append({"role": "user", "content": message})
+    # Gap B (08-14 Task 2): this maintains the picker's CURRENT DEFAULT --
+    # consumed only by chat_page's selected_model pre-selection -- not a
+    # claim about which model produced which reply. That fact lives on
+    # each assistant message's own "model" field (_sse_stream's finally
+    # block). Do not "fix" the apparent duplication by deleting either one.
     conversation["model"] = model
     chat_store.save(conversation)
 
@@ -478,6 +483,12 @@ def _sse_stream(conv_id: str, model: str):
                     "content": content,
                     "error": True,
                 }
+            # Gap B (08-14 Task 2): every assistant entry -- including this
+            # error-marked one -- records the model that produced (or
+            # failed to produce) it, set unconditionally (unlike sources).
+            # Knowing which model failed is exactly the diagnostic value
+            # the UAT lost when the model was only tracked per-conversation.
+            assistant_msg["model"] = model
             if sources:
                 assistant_msg["sources"] = sources
             if truncation_notes:
