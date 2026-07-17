@@ -265,6 +265,59 @@ def test_chat_page_model_dropdown_lists_tags_and_preselects_config_model(
     assert "llama3:8b" in resp.text
 
 
+# ---------------------------------------------------------------------------
+# gui/templates/chat.html -- 08-15 Task 2 (Gap B, D-15/T-08-GAP-30): the
+# note-selector block is visible only under Paper Vault scope. The reveal
+# behaviour itself is browser-only (no headless browser in this stack), so
+# these tests pin the wiring and the default-hidden state on GET /chat --
+# what can regress silently without a browser -- not the click-driven
+# toggle itself.
+# ---------------------------------------------------------------------------
+
+def test_chat_page_note_selector_hidden_by_default_with_scope_wiring(
+    gui_client, gui_config, monkeypatch
+):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.scan_project_papers", lambda config: [])
+
+    resp = gui_client.get("/chat")
+
+    assert resp.status_code == 200
+    # Default scope is "none" -- the block must render hidden.
+    assert re.search(
+        r'<div class="chat-vault-picker" id="chat-vault-picker" hidden>', resp.text
+    ), resp.text
+    # The block's id and the scope radios must both be present so a change
+    # handler wired to it can find both ends.
+    assert 'id="chat-vault-picker"' in resp.text
+    assert 'name="scope" value="vault"' in resp.text
+    assert 'name="notes"' in resp.text
+    assert 'id="chat-vault-notes"' in resp.text
+    # A toggle handler must be present, keyed off the picker's id.
+    assert 'getElementById("chat-vault-picker")' in resp.text
+
+
+def test_chat_page_note_selector_renders_one_option_per_scanned_paper(
+    gui_client, gui_config, monkeypatch
+):
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    fake_papers = [
+        {"title": "Paper A", "cache_paths": {"vault_note": "Papers/Paper A.md"}},
+        {"title": "Paper B", "cache_paths": {"vault_note": "Papers/Paper B.md"}},
+    ]
+    monkeypatch.setattr("gui.routes.chat.scan_project_papers", lambda config: fake_papers)
+
+    resp = gui_client.get("/chat")
+
+    assert resp.status_code == 200
+    assert '<option value="Papers/Paper A.md">Paper A</option>' in resp.text
+    assert '<option value="Papers/Paper B.md">Paper B</option>' in resp.text
+
+
 def test_chat_send_appends_user_message_and_returns_stream_markup(
     gui_client, gui_config, monkeypatch
 ):

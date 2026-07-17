@@ -60,7 +60,14 @@
             </fieldset>
           </div>
 
-          <div class="chat-vault-picker">
+          {# Gap B (08-15 Task 2, D-15/T-08-GAP-30): visible only under
+             Paper Vault scope, hidden by default here since "none" is the
+             default-checked radio above. Without this the block reads as
+             unexplained decoration under chroma/none scope, and its role as
+             the REQUIRED selector under vault scope is never signalled --
+             08-11's server-side empty-selection banner is this block's
+             authoritative counterpart, not a replacement for it. #}
+          <div class="chat-vault-picker" id="chat-vault-picker" hidden>
             <label for="chat-vault-notes">Papers (Paper Vault scope)</label>
             <select name="notes" id="chat-vault-notes" multiple>
               {% for paper in papers %}
@@ -68,6 +75,21 @@
               {% endfor %}
             </select>
           </div>
+          <script>
+            (function () {
+              var picker = document.getElementById("chat-vault-picker");
+              if (!picker) return;
+              var radios = document.querySelectorAll('input[name="scope"]');
+              function syncVisibility() {
+                var vaultRadio = document.querySelector('input[name="scope"][value="vault"]');
+                picker.hidden = !(vaultRadio && vaultRadio.checked);
+              }
+              radios.forEach(function (radio) {
+                radio.addEventListener("change", syncVisibility);
+              });
+              syncVisibility();
+            })();
+          </script>
 
           <textarea name="message" class="chat-input"
                     placeholder="Ask a question below — optionally pick a retrieval scope on the left."
