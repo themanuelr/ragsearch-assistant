@@ -11,6 +11,7 @@ Run with: python -m pytest tests/test_gui_scan.py -x
 
 import json
 import pathlib
+import re
 
 from gui import scan
 from scripts.note import _sanitize_filename
@@ -630,3 +631,108 @@ def test_overview_project_route_and_drilldown_partial_unchanged(gui_client, gui_
 
     assert resp.status_code == 200
     assert "Untouched Route Paper" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# 08-13 gap closure: one predicate definition, two distinct column labels
+# ---------------------------------------------------------------------------
+
+def test_stage_paperjson_fill_delegates_to_note_predicate():
+    """Test K: gui.scan no longer defines its own populated-keys tuple;
+    _stage_paperjson_fill delegates to scripts.note._analysis_is_populated
+    -- one shared predicate, imported not re-derived (Don't Hand-Roll)."""
+    from scripts import note
+
+    assert not hasattr(scan, "_ANALYSIS_POPULATED_KEYS"), (
+        "gui/scan.py must not define its own populated-keys tuple anymore"
+    )
+    assert scan._analysis_is_populated is note._analysis_is_populated
+
+
+def test_stage_paperjson_fill_follows_note_predicate_behaviorally(gui_config):
+    """Test K (behavioral): a cache file whose analysis note.py deems
+    populated reads True through _stage_paperjson_fill, and one with the
+    empty skeleton reads False -- asserted via behavior, not by patching
+    internals, so the test survives refactors."""
+    paperjson_path = pathlib.Path(gui_config["paperjson_cache_dir"]) / "k-behavior.json"
+
+    populated = dict(_EMPTY_ANALYSIS)
+    populated["summary"] = "A real summary."
+    populated["generated_by"] = "gemma4:e4b"
+    _write_json(paperjson_path, {"extraction": {"metadata": {}}, "analysis": populated, "provenance": {}})
+    assert scan._stage_paperjson_fill(paperjson_path) is True
+
+    _write_json(
+        paperjson_path,
+        {"extraction": {"metadata": {}}, "analysis": _EMPTY_ANALYSIS, "provenance": {}},
+    )
+    assert scan._stage_paperjson_fill(paperjson_path) is False
+
+
+def test_stage_paperjson_fill_tristate_preserved(gui_config):
+    """Test L: absent -> False, unparseable -> None, neither raises. The
+    tri-state contract and the read-only never-create guarantee (D-09) are
+    unchanged by the predicate delegation."""
+    absent_path = pathlib.Path(gui_config["paperjson_cache_dir"]) / "does-not-exist.json"
+    assert scan._stage_paperjson_fill(absent_path) is False
+    assert not absent_path.exists(), "must never create the path (D-09)"
+
+    unparseable_path = pathlib.Path(gui_config["paperjson_cache_dir"]) / "unparseable.json"
+    unparseable_path.parent.mkdir(parents=True, exist_ok=True)
+    unparseable_path.write_text("not valid json {{{", encoding="utf-8")
+    assert scan._stage_paperjson_fill(unparseable_path) is None
+
+
+def test_project_and_universal_paperjson_headers_are_distinct(gui_client, gui_config, monkeypatch):
+    """Test M: the Project and Universal PaperJSON column headers render
+    distinct text, so the two predicates are not presented as the same
+    claim under near-identical labels."""
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    entry = _registry_entry(
+        "Header Test Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "header-test.json"),
+        ["proj-a"],
+    )
+    _write_registry(gui_config, {"key-header": entry})
+
+    project_resp = gui_client.get("/overview/project")
+    universal_resp = gui_client.get("/overview/universal")
+
+    assert project_resp.status_code == 200
+    assert universal_resp.status_code == 200
+
+    project_header_match = re.search(r"<th[^>]*>([^<]*Filled[^<]*)</th>", project_resp.text)
+    universal_header_match = re.search(r"<th[^>]*>([^<]*Cached[^<]*)</th>", universal_resp.text)
+
+    assert project_header_match is not None, "Project page must have a header naming what it measures"
+    assert universal_header_match is not None, "Universal page must have a header naming what it measures"
+    assert project_header_match.group(1) != universal_header_match.group(1), (
+        "the two PaperJSON column headers must not read identically"
+    )
+
+
+def test_project_and_universal_consistent_for_filled_paper(gui_config):
+    """Test N (the user's actual complaint): for a paper whose cache exists
+    AND whose analysis is populated, Project and Universal both report their
+    PaperJSON indicator as true -- the contradiction the user saw is gone
+    once the analysis is actually persisted."""
+    gui_config["project_name"] = "proj-a"
+    title = "Consistent Paper"
+    paperjson_path = str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "consistent.json")
+    entry = _registry_entry(title, paperjson_path, ["proj-a"])
+    _write_registry(gui_config, {"key-consistent": entry})
+
+    populated = dict(_EMPTY_ANALYSIS)
+    populated["summary"] = "A real, persisted summary."
+    populated["generated_by"] = "gemma4:e4b"
+    _write_paperjson(gui_config, "consistent", populated)
+
+    project_papers = scan.scan_project_papers(gui_config)
+    project_paper = next(p for p in project_papers if p["registry_key"] == "key-consistent")
+    assert project_paper["stages"]["paperjson_fill"] is True
+
+    universal_entries = scan.scan_universal(gui_config)
+    universal_entry = next(e for e in universal_entries if e["registry_key"] == "key-consistent")
+    assert universal_entry["paperjson_present"] is True

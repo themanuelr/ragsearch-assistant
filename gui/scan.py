@@ -4,8 +4,9 @@ Strictly read-only. Never writes a GUI-owned state file (D-09 — the
 "ghost-state bug class" Phases 4/6 already fought) and never re-derives a
 write-side detection contract: imports ``scripts.biblio._REFS_SECTION_RE``,
 ``scripts.link._RELATED_TOPICS_RE``, ``scripts.embed._collection_session``,
-``scripts.ingest._read_registry``, and ``scripts.note._sanitize_filename``
-directly (Don't Hand-Roll, 08-RESEARCH.md Pattern 4).
+``scripts.ingest._read_registry``, ``scripts.note._sanitize_filename``, and
+``scripts.note._analysis_is_populated`` directly (Don't Hand-Roll,
+08-RESEARCH.md Pattern 4).
 
 08-10 (GUI-09/D-14): ``_stage_embed`` obtains its collection via
 ``scripts.embed._collection_session`` (not the never-closed
@@ -38,22 +39,7 @@ from scripts.biblio import _REFS_SECTION_RE
 from scripts.embed import _collection_session
 from scripts.ingest import _read_registry
 from scripts.link import _RELATED_TOPICS_RE, _parse_tags
-from scripts.note import _sanitize_filename
-
-# Analysis-namespace fields that indicate the PaperJSON's analysis has been
-# filled by the LLM cascade (as opposed to the empty skeleton written at
-# ingest time — see scripts/ingest.py::_assemble_paperjson's `analysis` dict).
-_ANALYSIS_POPULATED_KEYS = (
-    "generated_by",
-    "summary",
-    "claims",
-    "methods_overview",
-    "results",
-    "limitations",
-    "open_questions",
-    "entities",
-    "topics",
-)
+from scripts.note import _analysis_is_populated, _sanitize_filename
 
 
 def _stage_mineru(config: dict, stem: str) -> bool:
@@ -74,6 +60,12 @@ def _stage_paperjson_fill(paperjson_path: pathlib.Path) -> bool | None:
 
     False when the file is absent or the analysis namespace is still the
     empty skeleton. None (unknown) when the file exists but cannot be parsed.
+
+    Delegates the populated test to ``scripts.note._analysis_is_populated``
+    (Don't Hand-Roll) — the single definition of "the analysis namespace is
+    filled", shared with ``generate_note``'s self-skip so the Project page's
+    stage light and the note pipeline can never drift apart again
+    (08-13 gap closure).
     """
     if not paperjson_path.exists():
         return False
@@ -82,8 +74,7 @@ def _stage_paperjson_fill(paperjson_path: pathlib.Path) -> bool | None:
             data = json.load(f)
     except (OSError, ValueError):
         return None
-    analysis = data.get("analysis") or {}
-    return any(analysis.get(key) for key in _ANALYSIS_POPULATED_KEYS)
+    return _analysis_is_populated(data)
 
 
 def _stage_embed(config: dict, registry_key: str) -> bool | None:
