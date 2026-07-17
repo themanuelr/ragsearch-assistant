@@ -35,6 +35,7 @@ from scripts.ingest import (
     DEFAULT_NUM_CTX_CAP,
     OLLAMA_MODEL as _DEFAULT_PIPELINE_MODEL,
     _estimate_num_ctx,
+    _read_registry,
 )
 
 router = APIRouter()
@@ -128,6 +129,35 @@ def chat_delete(request: Request, conv_id: str):
 # the assembled LLM messages to /chat/stream (D-16 hard block re-checked here)
 # ---------------------------------------------------------------------------
 
+def _format_registry_metadata_line(entry: dict) -> str:
+    """Build a readable 'Authors (Year) — Journal' line from a registry
+    entry for the chroma excerpt header (Gap B). Omits any falsy field
+    rather than emitting an empty or "None" label -- a header claiming an
+    unknown author is worse than one that stays silent. Returns "" when the
+    entry carries no usable metadata at all (unknown registry_key, or every
+    field falsy); the caller must treat that as "no metadata line"."""
+    authors = entry.get("authors")
+    if isinstance(authors, list):
+        authors_str = ", ".join(a for a in authors if a)
+    else:
+        authors_str = authors or ""
+
+    lead_parts = []
+    if authors_str:
+        lead_parts.append(authors_str)
+    year = entry.get("year")
+    if year:
+        lead_parts.append(f"({year})")
+    lead = " ".join(lead_parts)
+
+    journal = entry.get("journal")
+    if journal and lead:
+        return f"{lead} — {journal}"
+    if journal:
+        return str(journal)
+    return lead
+
+
 def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple:
     """Resolve the D-14/D-15 retrieval scope into
     ``(context_messages, sources, banner, truncation_notes)``.
@@ -159,18 +189,30 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
             # swallow and never a raised exception.
             return [], None, result["error"], None
 
+        # Gap B (08-UAT.md): Chroma's stored metadata carries only
+        # title/heading/registry_key/status/vault_note -- authors/year/
+        # journal live in the registry, so a metadata question ("who is the
+        # first author") is unanswerable from context unless it's looked up
+        # here. Read once per call (never once per paper/section -- the loop
+        # below is over ~25 rows), matching gui/scan.py's established
+        # `_read_registry` idiom (Don't Hand-Roll).
+        registry = _read_registry(config.get("registry_path") or "")
+
         rows = []
         excerpt_blocks = []
         for paper in result.get("papers") or []:
+            registry_entry = registry.get(paper.get("registry_key")) or {}
+            metadata_line = _format_registry_metadata_line(registry_entry)
             for section in paper.get("sections", []):
                 rows.append({
                     "title": paper["title"],
                     "section": section["heading"],
                     "score": section["score"],
                 })
-                excerpt_blocks.append(
-                    f"[{paper['title']} — {section['heading']}]\n{section['excerpt']}"
-                )
+                header = f"[{paper['title']} — {section['heading']}]"
+                if metadata_line:
+                    header += f"\n{metadata_line}"
+                excerpt_blocks.append(f"{header}\n{section['excerpt']}")
         if not rows:
             return [], None, None, None
 

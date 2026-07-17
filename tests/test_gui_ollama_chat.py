@@ -427,6 +427,138 @@ def test_chat_chroma_scope_error_falls_back_to_none_with_banner(gui_client, gui_
     assert pending["sources"] is None
 
 
+# ---------------------------------------------------------------------------
+# gui/routes/chat.py -- 08-11 Task 2 (Gap B): chroma excerpt headers carry
+# authors/year/journal read from the registry.
+# ---------------------------------------------------------------------------
+
+def _write_registry(gui_config, registry: dict):
+    pathlib.Path(gui_config["registry_path"]).write_text(
+        json.dumps(registry), encoding="utf-8"
+    )
+
+
+def test_chat_chroma_context_carries_authors_year_journal(gui_client, gui_config, monkeypatch):
+    """Test D: the assembled chroma context contains the paper's authors,
+    year and journal values, so a metadata question is answerable from
+    context (08-UAT.md Gap B)."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    _write_registry(gui_config, {
+        "10.1/x": {
+            "title": "A Great Paper",
+            "authors": ["Jane Doe", "John Smith"],
+            "year": 2023,
+            "journal": "Nature",
+        }
+    })
+    monkeypatch.setattr("gui.routes.chat._search", lambda *a, **k: _fake_search_result())
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "who is the first author",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert resp.status_code == 200
+
+    context_content = chat_module._PENDING[conv["id"]]["llm_messages"][0]["content"]
+    assert "Jane Doe, John Smith" in context_content
+    assert "2023" in context_content
+    assert "Nature" in context_content
+
+
+def test_chat_chroma_context_missing_metadata_degrades_cleanly(gui_client, gui_config, monkeypatch):
+    """Test E: an unknown registry_key, or an entry whose authors/year/
+    journal are None, still produces a valid excerpt block (title + heading
+    + excerpt) and raises nothing -- a paper with no recorded metadata must
+    never break retrieval. No empty or "None" label is ever emitted."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    # Registry file exists but has no entry for "10.1/x" at all -- and, as a
+    # second scenario, an entry whose fields are explicitly None.
+    _write_registry(gui_config, {
+        "10.1/x": {"title": "A Great Paper", "authors": None, "year": None, "journal": None},
+    })
+    monkeypatch.setattr("gui.routes.chat._search", lambda *a, **k: _fake_search_result())
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "what does the paper say",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert resp.status_code == 200
+
+    context_content = chat_module._PENDING[conv["id"]]["llm_messages"][0]["content"]
+    assert "[A Great Paper — Results]" in context_content
+    assert "some excerpt text" in context_content
+    assert "None" not in context_content
+
+
+def test_chat_chroma_missing_registry_key_degrades_cleanly(gui_client, gui_config, monkeypatch):
+    """Test E (continued): a registry_key absent from the registry entirely
+    (no registry file even written) must not raise."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat._search", lambda *a, **k: _fake_search_result())
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "what does the paper say",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert resp.status_code == 200
+    context_content = chat_module._PENDING[conv["id"]]["llm_messages"][0]["content"]
+    assert "[A Great Paper — Results]" in context_content
+
+
+def test_chat_chroma_sources_shape_unchanged_by_metadata_enrichment(gui_client, gui_config, monkeypatch):
+    """Test F: the sources rows still carry exactly title/section/score --
+    the Sources block the user expands is not restructured by this change."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    _write_registry(gui_config, {
+        "10.1/x": {"title": "A Great Paper", "authors": ["Jane Doe"], "year": 2023, "journal": "Nature"},
+    })
+    monkeypatch.setattr("gui.routes.chat._search", lambda *a, **k: _fake_search_result())
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "what does the paper say",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert resp.status_code == 200
+
+    sources = chat_module._PENDING[conv["id"]]["sources"]
+    assert sources == [{"title": "A Great Paper", "section": "Results", "score": 0.9}]
+
+
 def test_chat_vault_scope_truncates_over_cap_and_flags_warning(
     gui_client, gui_config, monkeypatch
 ):
