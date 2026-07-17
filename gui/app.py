@@ -19,6 +19,8 @@ from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from gui.chat_markdown import render_chat_markdown
+
 _GUI_DIR = pathlib.Path(__file__).resolve().parent
 
 # FastAPI auto-registers Swagger UI at "/docs" (plus "/redoc"/"/openapi.json")
@@ -29,6 +31,10 @@ _GUI_DIR = pathlib.Path(__file__).resolve().parent
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=str(_GUI_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(_GUI_DIR / "templates"))
+# The untrusted-output chokepoint (T-08-GAP-31/32, GUI-09): the ONLY filter
+# permitted to turn model-derived chat text into HTML -- see
+# gui/chat_markdown.py's module docstring for the full trust rationale.
+templates.env.filters["chat_markdown"] = render_chat_markdown
 
 
 @app.middleware("http")
