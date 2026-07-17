@@ -2225,7 +2225,7 @@ def _run_fill_cascade(
                 from scripts import note as note
                 with open(pj_path, "r", encoding="utf-8") as _pjf:
                     _cached_paperjson = json.load(_pjf)
-                _note_result = note.generate_note(_cached_paperjson, config)
+                _note_result = note.generate_note(_cached_paperjson, config, paperjson_path=pj_path)
                 if isinstance(_note_result, str) and _note_result.startswith("[note error:"):
                     _log(f"registry-hit note generation failed: {_note_result}")
                 else:
@@ -2436,7 +2436,7 @@ def _run_fill_cascade(
     # Step 12b: Auto-invoke note generation (D-05/D-07 — best-effort)
     try:
         from scripts import note as note
-        note_result = note.generate_note(skeleton, config)
+        note_result = note.generate_note(skeleton, config, paperjson_path=cache_path)
         if isinstance(note_result, str) and (
             note_result.startswith("[note error:") or note_result.startswith("[note warning:")
         ):
@@ -3007,7 +3007,7 @@ def _ingest_by_doi(doi_arg: str, config: dict) -> dict | None:
 
     try:
         from scripts import note as note_mod  # noqa: PLC0415
-        note_result = note_mod.generate_note(cached_paperjson, config)
+        note_result = note_mod.generate_note(cached_paperjson, config, paperjson_path=pj_path)
         if isinstance(note_result, str) and note_result.startswith("[note error:"):
             _log(f"--doi note generation failed: {note_result}")
     except Exception as e:

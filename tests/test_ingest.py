@@ -6505,6 +6505,170 @@ def test_doi_flag_cache_absent_fallback_has_no_cache_path_key(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 08-13 gap closure: wire the paperjson_path seam through the ingest call
+# sites (the "cost win" -- Test I/J from the plan's <behavior>).
+# ---------------------------------------------------------------------------
+
+def test_doi_flag_cache_present_populated_analysis_zero_calls(tmp_path):
+    """Test I: a --doi import against a registry paper whose cached
+    PaperJSON already has a populated analysis, with the note absent from
+    the vault, makes ZERO analysis LLM calls -- _generate_analysis is never
+    invoked -- while the note is still written. This is the headline cost
+    win: the ~2-minute Test 4 --doi import spent its time on redundant
+    analysis calls despite reusing the cache.
+    """
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/populated-analysis-doi"
+    title = "Populated Analysis DOI Paper"
+
+    pj = {
+        "extraction": {
+            "metadata": {
+                "title": title, "doi": doi, "authors": None, "year": 2024,
+                "journal": None, "arxiv_id": None,
+            },
+            "sections": [], "references": [],
+        },
+        "analysis": {
+            "generated_by": "gemma4:e4b",
+            "summary": "Existing summary.",
+            "claims": ["Existing claim."],
+            "methods_overview": "Existing methods.",
+            "results": "Existing results.",
+            "limitations": ["Existing limitation."],
+            "open_questions": [],
+            "entities": [],
+            "topics": [],
+        },
+        "provenance": {},
+    }
+    cache_dir = pathlib.Path(cfg["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "populated-analysis-doi.json"
+    cache_path.write_text(json.dumps(pj), encoding="utf-8")
+
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None, "authors": None, "year": 2024,
+        "journal": None, "projects": ["test-project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(cache_path), "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    with mock.patch(
+        "scripts.note._generate_analysis",
+        side_effect=AssertionError("analysis must not run when cached analysis is populated"),
+    ), mock.patch(
+        "scripts.note.create_note", return_value="Created",
+    ) as mock_create:
+        result = ingest._ingest_by_doi(doi, cfg)
+
+    mock_create.assert_called_once()
+    assert result is not None
+
+
+def test_ingest_cache_hit_fills_analysis_once_then_reuses(tmp_path):
+    """Test J: the registry cache-hit path with an UNPOPULATED cached
+    analysis runs analysis once and persists it (via the paperjson_path
+    seam wired at the Step 9 cache-hit branch); a second identical ingest()
+    run against the same PDF makes zero analysis calls.
+    """
+    from scripts.ingest import ingest, _write_registry, DoiProbeResult
+
+    cfg = _make_ingest_config(
+        tmp_path, extra={"vault_name": "test-vault", "vault_path": str(tmp_path / "vault")}
+    )
+    (tmp_path / "vault").mkdir(parents=True, exist_ok=True)
+    reg_path = cfg["registry_path"]
+
+    cache_file = tmp_path / "cachehit_fill_paper.json"
+    cached_paperjson = {
+        "extraction": {
+            "metadata": {"title": "CacheHit Fill Paper", "authors": [], "year": 2024,
+                          "journal": None, "doi": "10.1000/cachehit.fill", "arxiv_id": None,
+                          "accession_codes": []},
+            "sections": [],
+            "references": [],
+        },
+        "analysis": {
+            "generated_by": None, "summary": None, "claims": [], "methods_overview": None,
+            "results": None, "limitations": [], "open_questions": [], "entities": [],
+            "topics": [], "connections": {"builds_on": [], "contradicts": [], "same_domain": []},
+        },
+        "provenance": {"schema_version": 2},
+    }
+    cache_file.write_text(json.dumps(cached_paperjson), encoding="utf-8")
+
+    cached_entry = {
+        "title": "CacheHit Fill Paper",
+        "doi": "10.1000/cachehit.fill",
+        "projects": ["other-project"],
+        "summary": None, "key_findings": None,
+        "authors": None, "year": 2024, "journal": None,
+        "arxiv_id": None,
+        "source_path": "/cached.pdf",
+        "paperjson_path": str(cache_file),
+    }
+    _write_registry(cached_entry, reg_path, "10.1000/cachehit.fill")
+
+    fake_pdf = tmp_path / "paper.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 cachehit fill test")
+    cl_path = _write_real_content_list(tmp_path)
+
+    probe_result = DoiProbeResult(
+        doi="10.1000/cachehit.fill", arxiv_id=None, title="CacheHit Fill Paper"
+    )
+    parsed = {
+        "title": "CacheHit Fill Paper",
+        "sections": [{"heading": "", "level": 0, "blocks": [
+            {"type": "text", "display": "A" * 200, "plain": "A" * 200},
+        ]}],
+        "references": [],
+        "metadata": {"title": "CacheHit Fill Paper", "authors": None, "year": 2024,
+                      "journal": None, "doi": "10.1000/cachehit.fill", "arxiv_id": None,
+                      "accession_codes": []},
+    }
+
+    def _fake_analysis(paperjson):
+        paperjson["analysis"]["summary"] = "First-fill summary."
+        paperjson["analysis"]["generated_by"] = "gemma4:e4b"
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+         mock.patch("scripts.note.create_note", return_value="Created"), \
+         mock.patch("scripts.note._generate_analysis", side_effect=_fake_analysis) as mock_analysis_1:
+        ingest(str(fake_pdf), cfg)
+
+    mock_analysis_1.assert_called_once()
+    with open(cache_file, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["analysis"]["summary"] == "First-fill summary.", (
+        "analysis must be persisted back to the cache file after the first fill"
+    )
+
+    with mock.patch("scripts.ingest._run_mineru"), \
+         mock.patch("scripts.ingest._find_content_list", return_value=cl_path), \
+         mock.patch("scripts.ingest._parse_content_list", return_value=parsed), \
+         mock.patch("scripts.ingest._resolve_mineru", return_value="/fake/mineru"), \
+         mock.patch("scripts.ingest._warmup_ollama"), \
+         mock.patch("scripts.ingest._doi_probe", return_value=probe_result), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+         mock.patch("scripts.note.create_note", return_value="Created"), \
+         mock.patch(
+             "scripts.note._generate_analysis",
+             side_effect=AssertionError("analysis must not run on the second cache-hit run"),
+         ):
+        ingest(str(fake_pdf), cfg)
+
+
+# ---------------------------------------------------------------------------
 # Quick task 260714-t1o: universal shared mineru_output_dir / paperjson_cache_dir
 # ---------------------------------------------------------------------------
 
