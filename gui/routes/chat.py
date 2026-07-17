@@ -46,6 +46,13 @@ _BLOCKED_COPY_TEMPLATE = (
     "It'll unlock automatically when the job finishes."
 )
 
+# Gap C (08-UAT.md T-08-GAP-13): Paper Vault scope with nothing resolvable
+# is a HARD block -- see _resolve_scope's docstring for why this is
+# deliberately different from D-14's chroma fail-open.
+_VAULT_EMPTY_SCOPE_BANNER = (
+    "Select at least one paper in the Papers list to use Paper Vault scope."
+)
+
 # conv_id -> {"llm_messages": [...], "sources": [...] | None,
 #             "banner": str | None, "truncation_notes": [str] | None}
 # Ephemeral hand-off from POST /chat/send to GET /chat/stream -- never
@@ -160,7 +167,7 @@ def _format_registry_metadata_line(entry: dict) -> str:
 
 def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple:
     """Resolve the D-14/D-15 retrieval scope into
-    ``(context_messages, sources, banner, truncation_notes)``.
+    ``(context_messages, sources, banner, truncation_notes, blocked)``.
 
     scope == "chroma" (D-14): runs ``scripts.embed._search`` in-process
     (the one sanctioned in-process pipeline call) and frames every returned
@@ -168,7 +175,8 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
     ``sources`` list renders as one "Sources" entry -- retrieved context is
     never injected silently. A ``_search`` error result falls back to scope
     none for this message (fail-open, matching pipeline conventions) and is
-    surfaced as a visible banner instead of raising.
+    surfaced as a visible banner instead of raising. ``blocked`` is always
+    False on this path -- see the fail-open-vs-hard-block note below.
 
     scope == "vault" (D-15): ``notes`` are vault-relative paths the client
     submitted, but only accepted when they match an already-scanned paper's
@@ -177,17 +185,31 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
     The assembled prompt is sized against ``ollama_num_ctx_cap`` via
     ``_estimate_num_ctx`` (Pitfall 6); while genuinely oversized, the
     last-selected note is dropped and named in ``truncation_notes`` -- never
-    a silent oversized request.
+    a silent oversized request. When nothing resolves (empty selection, or
+    every submitted path fails the ``allowed_notes`` check), ``blocked`` is
+    True and ``banner`` carries actionable copy (Gap C, 08-UAT.md
+    T-08-GAP-13).
 
     scope == "none" (or anything else): pass-through, no retrieval call.
+    ``blocked`` is always False.
+
+    Fail-open (chroma) vs hard-block (vault) is a DELIBERATE distinction,
+    not an oversight to "unify": D-14's chroma fail-open is correct because
+    the model can still answer usefully without retrieval, and the banner
+    tells the user why sources are missing. Vault scope is different -- the
+    user explicitly asked to ground on papers they did not select, so
+    answering anyway produces a confident non-answer (the exact failure Gap
+    C reports). Blocking before any persist/Ollama call is the honest
+    outcome there.
     """
     if scope == "chroma":
         result = _search(message, 5, config)
         if result.get("error"):
             # D-14 fail-open: a _search error falls back to scope none for
             # this message, surfaced as a visible banner -- never a silent
-            # swallow and never a raised exception.
-            return [], None, result["error"], None
+            # swallow and never a raised exception. Not a hard block: the
+            # model still answers, just without retrieved context.
+            return [], None, result["error"], None, False
 
         # Gap B (08-UAT.md): Chroma's stored metadata carries only
         # title/heading/registry_key/status/vault_note -- authors/year/
@@ -214,7 +236,7 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
                     header += f"\n{metadata_line}"
                 excerpt_blocks.append(f"{header}\n{section['excerpt']}")
         if not rows:
-            return [], None, None, None
+            return [], None, None, None, False
 
         context_messages = [{
             "role": "system",
@@ -225,7 +247,7 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
                 + "\n\n".join(excerpt_blocks)
             ),
         }]
-        return context_messages, rows, None, None
+        return context_messages, rows, None, None, False
 
     if scope == "vault":
         # Server-side paths only: the client submits a vault-relative note
@@ -265,7 +287,11 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
             break
 
         if not note_texts:
-            return [], None, None, (dropped_titles or None)
+            # Gap C (08-UAT.md T-08-GAP-13): a vault selection that resolves
+            # to nothing is a HARD block, not a fail-open -- the user
+            # explicitly asked to ground on papers they did not select, and
+            # answering anyway produces a confident non-answer.
+            return [], None, _VAULT_EMPTY_SCOPE_BANNER, (dropped_titles or None), True
 
         sources = [
             {"title": n["title"], "section": "Full Note", "score": None}
@@ -278,10 +304,10 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
                 + "\n\n".join(f"[{n['title']}]\n{n['text']}" for n in note_texts)
             ),
         }]
-        return context_messages, sources, None, (dropped_titles or None)
+        return context_messages, sources, None, (dropped_titles or None), False
 
     # scope == "none" (or unrecognized): pass-through, no retrieval call.
-    return [], None, None, None
+    return [], None, None, None, False
 
 
 @router.post("/chat/send")
@@ -312,9 +338,22 @@ def chat_send(
 
     config = load_gui_config()
 
-    context_messages, sources, banner, truncation_notes = _resolve_scope(
+    context_messages, sources, banner, truncation_notes, blocked = _resolve_scope(
         scope, message, notes, config
     )
+
+    if blocked:
+        # Gap C (08-UAT.md T-08-GAP-13): returned BEFORE the user-message
+        # append/save and before any _PENDING write, mirroring the D-16
+        # busy guard's early-return shape -- nothing is persisted, no
+        # _PENDING entry is written, no stream is opened, and therefore no
+        # Ollama call happens. A blocked turn can never leave an orphaned
+        # user message.
+        return templates.TemplateResponse(
+            request,
+            "partials/chat_scope_banner.html",
+            {"banner": banner},
+        )
 
     conversation["messages"].append({"role": "user", "content": message})
     conversation["model"] = model

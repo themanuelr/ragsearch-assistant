@@ -304,7 +304,7 @@ def test_chat_blocked_while_busy(gui_client, gui_config, monkeypatch):
     search_calls = []
     monkeypatch.setattr(
         "gui.routes.chat._resolve_scope",
-        lambda *a, **k: (search_calls.append(1) or ([], None, None, None)),
+        lambda *a, **k: (search_calls.append(1) or ([], None, None, None, False)),
     )
     stream_calls = []
     monkeypatch.setattr(
@@ -600,6 +600,151 @@ def test_chat_vault_scope_truncates_over_cap_and_flags_warning(
     assert "B" * 100 not in combined_context  # dropped note's content excluded
 
 
+# ---------------------------------------------------------------------------
+# gui/routes/chat.py -- 08-11 Task 3 (Gap C / T-08-GAP-13): Paper Vault
+# scope with nothing resolvable is a hard block, not a silent ungrounded turn.
+# ---------------------------------------------------------------------------
+
+def _fail_if_called(*_a, **_k):
+    raise AssertionError("blocked turn must not reach _stream_ollama_chat")
+
+
+def test_chat_vault_empty_selection_blocks_with_banner_and_no_ollama_call(
+    gui_client, gui_config, monkeypatch
+):
+    """Test G: scope='vault' with no notes submitted returns the banner
+    partial, directs the user to select at least one paper, and makes no
+    Ollama call."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _fail_if_called)
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "summarize", "model": "gemma4:e4b", "scope": "vault"},
+    )
+
+    assert resp.status_code == 200
+    assert "select at least one paper" in resp.text.lower()
+    assert conv["id"] not in chat_module._PENDING
+
+
+def test_chat_vault_empty_selection_persists_nothing(gui_client, gui_config, monkeypatch):
+    """Test H: a blocked turn leaves the stored conversation's message list
+    unchanged -- no orphaned user message -- and writes no _PENDING entry."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv = chat_store_module.create_conversation()
+    assert conv["messages"] == []
+
+    gui_client.post(
+        "/chat/send",
+        data={"conv": conv["id"], "message": "summarize", "model": "gemma4:e4b", "scope": "vault"},
+    )
+
+    saved = chat_store_module.load(conv["id"])
+    assert saved["messages"] == []
+    assert conv["id"] not in chat_module._PENDING
+
+
+def test_chat_vault_unresolvable_selection_blocks_identically(gui_client, gui_config, monkeypatch):
+    """Test I: a notes value that does not match any scanned paper's
+    vault_note path is treated identically to an empty selection (blocked +
+    banner) -- server-side validation drops it and the turn would otherwise
+    be silently ungrounded."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.scan_project_papers", lambda config: [])
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _fail_if_called)
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "summarize",
+            "model": "gemma4:e4b",
+            "scope": "vault",
+            "notes": ["Papers/Nonexistent.md"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "select at least one paper" in resp.text.lower()
+    assert conv["id"] not in chat_module._PENDING
+
+
+def test_chat_vault_valid_selection_unaffected_by_guard(gui_client, gui_config, monkeypatch):
+    """Test J: a resolvable vault selection still assembles context, still
+    returns the pending partial, and still streams -- the guard fires only
+    when the scope would otherwise be empty."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    vault_path = pathlib.Path(gui_config["vault_path"])
+    (vault_path / "Papers").mkdir(parents=True, exist_ok=True)
+    (vault_path / "Papers" / "Paper A.md").write_text("Paper A content", encoding="utf-8")
+
+    fake_papers = [
+        {"title": "Paper A", "cache_paths": {"vault_note": "Papers/Paper A.md"}},
+    ]
+    monkeypatch.setattr("gui.routes.chat.scan_project_papers", lambda config: fake_papers)
+
+    conv = chat_store_module.create_conversation()
+
+    resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "summarize",
+            "model": "gemma4:e4b",
+            "scope": "vault",
+            "notes": ["Papers/Paper A.md"],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "/chat/stream" in resp.text
+    pending = chat_module._PENDING[conv["id"]]
+    assert "Paper A content" in pending["llm_messages"][0]["content"]
+
+
+def test_chat_none_and_chroma_scopes_never_block(gui_client, gui_config, monkeypatch):
+    """Test K: scope='none' and scope='chroma' never take the blocked path;
+    the D-14 chroma fail-open still returns its banner AND still lets the
+    model answer (fail-open is deliberately different from the vault hard
+    block)."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+
+    conv_none = chat_store_module.create_conversation()
+    resp_none = gui_client.post(
+        "/chat/send",
+        data={"conv": conv_none["id"], "message": "hi", "model": "gemma4:e4b", "scope": "none"},
+    )
+    assert resp_none.status_code == 200
+    assert conv_none["id"] in chat_module._PENDING
+
+    monkeypatch.setattr(
+        "gui.routes.chat._search",
+        lambda *a, **k: {"papers": [], "stubs": [], "error": "[Ollama error: embedding unreachable]"},
+    )
+    conv_chroma = chat_store_module.create_conversation()
+    resp_chroma = gui_client.post(
+        "/chat/send",
+        data={"conv": conv_chroma["id"], "message": "hi", "model": "gemma4:e4b", "scope": "chroma"},
+    )
+    assert resp_chroma.status_code == 200
+    assert "[Ollama error: embedding unreachable]" in resp_chroma.text
+    # D-14 fail-open: still a normal pending turn (still lets the model
+    # answer), NOT the blocked banner partial.
+    assert conv_chroma["id"] in chat_module._PENDING
+
+
 def test_chat_none_scope_calls_no_retrieval(gui_client, gui_config, monkeypatch):
     monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
     monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
@@ -667,6 +812,7 @@ def test_chat_context_spliced_before_final_user_turn_not_position_zero(
             [{"title": "t", "section": "s", "score": 0.9}],
             None,
             None,
+            False,
         ),
     )
 
@@ -700,7 +846,7 @@ def test_chat_context_splice_preserves_prior_transcript_order(
     canned_context = [{"role": "system", "content": "retrieved excerpts here"}]
     monkeypatch.setattr(
         "gui.routes.chat._resolve_scope",
-        lambda *a, **k: (canned_context, None, None, None),
+        lambda *a, **k: (canned_context, None, None, None, False),
     )
 
     resp = gui_client.post(
@@ -762,6 +908,7 @@ def test_no_innerhtml_in_chat_templates():
         chat_templates_dir / "partials" / "chat_sidebar.html",
         chat_templates_dir / "partials" / "chat_sources.html",
         chat_templates_dir / "partials" / "chat_blocked.html",
+        chat_templates_dir / "partials" / "chat_scope_banner.html",
     ]
     for tpl in candidates:
         text = tpl.read_text(encoding="utf-8")

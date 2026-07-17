@@ -1,0 +1,7 @@
+{# Rendered by POST /chat/send when a retrieval scope resolves to a hard
+   block (Gap C, D-15): Paper Vault scope with nothing resolvable. Nothing
+   is persisted and no Ollama call happens for a blocked turn -- this
+   partial is banner-only, no assistant bubble, no script, no EventSource.
+   Same element/class shape chat_pending.html uses for its banner, so it
+   swaps correctly into the #chat-messages container (hx-swap="beforeend"). #}
+<p class="settings-error chat-message-banner">{{ banner }}</p>
