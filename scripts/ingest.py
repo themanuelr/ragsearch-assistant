@@ -3030,6 +3030,14 @@ def _ingest_by_doi(doi_arg: str, config: dict) -> dict | None:
     except Exception as e:
         print(f"[link warning: --doi topic linking failed: {e}]", file=sys.stderr)
 
+    # Transient signal key for main()'s confirmation builder (08-09 gap
+    # closure): names the real .paperjson_cache path that was reused, so the
+    # --doi confirmation line stops falling through to the "(no cache path
+    # recorded)" placeholder. Set AFTER the sole _write_registry call above
+    # (mirrors the ordering constraint at 2303-2309) so it can never reach
+    # the registry file; popped by main() before _emit_result so it never
+    # leaks into -o/--print JSON output.
+    cached_paperjson["_cache_path"] = pj_path
     return cached_paperjson
 
 
@@ -3162,7 +3170,14 @@ if __name__ == "__main__":
                     ).resolve()
                 )
             else:
-                cache_path = result.get("paperjson_path") or "(no cache path recorded)"
+                # --doi: consult the transient cache-path key _ingest_by_doi sets
+                # on the cache-present return (08-09 gap closure) before falling
+                # back to paperjson_path, then the existing placeholder.
+                cache_path = (
+                    result.get("_cache_path")
+                    or result.get("paperjson_path")
+                    or "(no cache path recorded)"
+                )
             confirmation = f"Cache: {cache_path}\n{note_line}"
         except Exception:
             pass  # fallback to default "[ingest] done." line
@@ -3172,6 +3187,7 @@ if __name__ == "__main__":
         if isinstance(result, dict):
             result.pop("_note_skipped", None)
             result.pop("_note_skip_pj", None)
+            result.pop("_cache_path", None)
 
         _emit_result(result, args.output, print_json=args.print_json, confirmation=confirmation)
     except SystemExit:

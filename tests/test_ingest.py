@@ -6431,6 +6431,79 @@ def test_doi_flag_registry_miss_writes_nothing(tmp_path, capsys):
     )
 
 
+def test_doi_flag_cache_present_sets_real_cache_path_key(tmp_path):
+    """08-09 Task 2: a cache-present --doi import sets the resolved cache
+    path on the returned dict under the transient _cache_path key, naming the
+    real .paperjson_cache file that was reused (not a placeholder) -- so
+    main()'s confirmation builder can render an honest Cache: line."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/cache-path-key"
+    title = "Names The Real Cache Path"
+
+    pj = {
+        "extraction": {"metadata": {
+            "title": title, "doi": doi, "authors": None, "year": 2024,
+            "journal": None, "arxiv_id": None,
+        }},
+        "analysis": {
+            "summary": "S.", "claims": ["C."], "methods_overview": "M.",
+            "results": "R.", "limitations": ["L."], "open_questions": [], "topics": [],
+            "generated_by": "gemma4:e4b",
+        },
+        "provenance": {},
+    }
+    cache_dir = pathlib.Path(cfg["paperjson_cache_dir"])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "cache-path-key.json"
+    cache_path.write_text(json.dumps(pj), encoding="utf-8")
+
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None, "authors": None, "year": 2024,
+        "journal": None, "projects": ["test-project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(cache_path), "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    with mock.patch("scripts.note.generate_note", return_value="Papers/x.md"), \
+         mock.patch("scripts.biblio.run_biblio", return_value=None), \
+         mock.patch("scripts.embed.run_embed", return_value=None), \
+         mock.patch("scripts.link.run_link", return_value=None):
+        result = ingest._ingest_by_doi(doi, cfg)
+
+    assert result.get("_cache_path") == str(cache_path), (
+        f"Expected _cache_path == {str(cache_path)!r}, got {result.get('_cache_path')!r}"
+    )
+
+
+def test_doi_flag_cache_absent_fallback_has_no_cache_path_key(tmp_path):
+    """08-09 Task 2: the cache-absent fallback return (the registry entry,
+    unchanged aside from projects[]) never carries the transient _cache_path
+    key -- that key is set only on the cache-present return path."""
+    from scripts import ingest  # noqa: PLC0415
+    from scripts.ingest import _write_registry  # noqa: PLC0415
+
+    cfg = _make_doi_flag_config(tmp_path)
+    doi = "10.1234/no-cache-path-key"
+    title = "No Cache Path Key Here"
+    entry = {
+        "title": title, "doi": doi, "arxiv_id": None,
+        "authors": ["Jane Researcher"], "year": 2022, "journal": "Journal of Examples",
+        "projects": ["test-project"], "source_path": "/old/paper.pdf",
+        "paperjson_path": str(pathlib.Path(cfg["paperjson_cache_dir"]) / "missing.json"),
+        "summary": None, "key_findings": None,
+    }
+    _write_registry(entry, cfg["registry_path"], doi)
+
+    result = ingest._ingest_by_doi(doi, cfg)
+
+    assert "_cache_path" not in result, (
+        f"Expected no _cache_path key on the cache-absent fallback return, got {result!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Quick task 260714-t1o: universal shared mineru_output_dir / paperjson_cache_dir
 # ---------------------------------------------------------------------------
