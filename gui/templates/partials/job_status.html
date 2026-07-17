@@ -14,7 +14,36 @@
     <span class="stage-label job-action">{{ job.action }}</span>
     <a class="job-log-link" href="/jobs/{{ job.id }}/log">View full log</a>
   </div>
-  <pre class="gui-log job-tail">{{ job.tail | join("\n") }}</pre>
+  <pre class="gui-log job-tail" id="job-tail-{{ job.id }}">{{ job.tail | join("\n") }}</pre>
+  {# GUI-04/D-07/D-08: the 2s poll above swaps this whole div via outerHTML,
+     which DESTROYS AND RECREATES the .job-tail <pre> on every tick -- that is
+     the exact mechanism that keeps the tail live, so do not weaken the poll
+     (e.g. to innerHTML) to "fix" the scroll. A freshly created node always
+     starts at scrollTop 0, which is what made the tail jump to the top every
+     2s. Instead, restore scroll state onto the new node on every render:
+     stick to the bottom on first render or when the user was already at the
+     bottom, otherwise hold the position they scrolled to so a long-running
+     job's log stays readable while it grows. #}
+  <script>
+    (function () {
+      var tailId = "job-tail-{{ job.id }}";
+      var el = document.getElementById(tailId);
+      if (!el) return;
+      window.__jobTailScroll = window.__jobTailScroll || {};
+      var store = window.__jobTailScroll;
+      var saved = store[tailId];
+      if (!saved || saved.atBottom) {
+        el.scrollTop = el.scrollHeight;
+      } else {
+        el.scrollTop = saved.scrollTop;
+      }
+      el.addEventListener("scroll", function () {
+        var tolerance = 4;
+        var atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) <= tolerance;
+        store[tailId] = { atBottom: atBottom, scrollTop: el.scrollTop };
+      });
+    })();
+  </script>
   {% if job.status in ("queued", "running") %}
     <div class="job-cancel-area">
       <button type="button" class="destructive" id="cancel-toggle-{{ job.id }}"

@@ -365,3 +365,56 @@ def test_processing_page_has_paper_select_and_script_rows(gui_client, gui_config
         assert field in resp.text
     for field in ("note_order", "biblio_order", "embed_order", "link_order"):
         assert field in resp.text
+
+
+# ---------------------------------------------------------------------------
+# 08-12 Task 1 (Gap A, GUI-04/D-07/D-08): scroll-stable ~2s log tail
+#
+# The tail-follow behaviour itself (stick to bottom / hold position while
+# reading) is browser-only DOM/scroll behaviour and cannot be driven from a
+# server-rendered TestClient response without a headless browser (none is in
+# this project's stack). What CAN regress silently -- and is pinned here --
+# is the markup contract: the ~2s polling attributes and the self-terminating
+# gate must survive byte-for-byte, and the tail element/script wiring that
+# the scroll-restore logic depends on must be present and correctly keyed
+# per job id.
+# ---------------------------------------------------------------------------
+
+def test_running_job_status_keeps_polling_and_carries_scroll_restore_wiring(gui_client):
+    job_id = "20260101-000000-note-abc"
+    gui_jobs.JOBS[job_id] = gui_jobs.JobState(
+        id=job_id, action="note", argv=["python", "scripts/note.py"], status="running",
+        created_at="2026-01-01T00:00:00", tail=["line one", "line two"],
+    )
+
+    resp = gui_client.get(f"/jobs/{job_id}/status")
+
+    assert resp.status_code == 200
+    # Preserved polling contract (D-07/D-08 self-terminating poll).
+    assert f'hx-get="/jobs/{job_id}/status"' in resp.text
+    assert 'hx-trigger="every 2s"' in resp.text
+    assert 'hx-swap="outerHTML"' in resp.text
+    # Per-job tail id + scroll-restore wiring referencing that same id.
+    tail_id = f"job-tail-{job_id}"
+    assert f'id="{tail_id}"' in resp.text
+    assert f'"{tail_id}"' in resp.text  # referenced inside the inline script
+    assert "getElementById" in resp.text
+    assert "scrollTop" in resp.text
+
+
+def test_terminal_job_status_omits_polling_attributes(gui_client):
+    job_id = "20260101-000000-note-xyz"
+    gui_jobs.JOBS[job_id] = gui_jobs.JobState(
+        id=job_id, action="note", argv=["python", "scripts/note.py"], status="done",
+        created_at="2026-01-01T00:00:00", tail=["done."],
+    )
+
+    resp = gui_client.get(f"/jobs/{job_id}/status")
+
+    assert resp.status_code == 200
+    assert "hx-get" not in resp.text
+    assert "hx-trigger" not in resp.text
+    # The tail id + scroll-restore wiring are unconditional (not gated on
+    # queued/running), so a terminal render still carries them -- only the
+    # polling attributes are gated.
+    assert f'id="job-tail-{job_id}"' in resp.text
