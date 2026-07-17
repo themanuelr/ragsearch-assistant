@@ -1375,16 +1375,26 @@ def test_recorded_model_is_the_one_chat_stream_resolved_via_fallback_chain(
 
 
 # ---------------------------------------------------------------------------
-# T-08-05 (threat register): the literal innerHTML API is absent from every
-# chat template -- tokens must reach the DOM via textContent/createTextNode
-# only, keeping untrusted LLM output XSS-inert.
+# T-08-05 (threat register), narrowed by Phase 8 Plan 16 (GUI-09): the DOM
+# inner-markup setter API (`.innerHTML = ...`, `insertAdjacentHTML(...)`)
+# must never be called directly in any chat template -- tokens must reach
+# the DOM via textContent/createTextNode only. This no longer forbids the
+# bare word "innerHTML": chat_pending.html's saved-frame branch passes
+# htmx's public `swap: "innerHTML"` CONFIG STRING to `htmx.ajax(...)`, which
+# is htmx swapping a SERVER-RENDERED partial (already passed through
+# gui/chat_markdown.py's chokepoint) -- not this file calling the DOM API
+# itself. The regex below still catches an actual direct-API violation.
 # ---------------------------------------------------------------------------
 
-def test_no_innerhtml_in_chat_templates():
+_INNERHTML_DOM_API_RE = re.compile(r"\.innerHTML\s*=|insertAdjacentHTML\s*\(")
+
+
+def test_no_innerhtml_dom_api_in_chat_templates():
     chat_templates_dir = _REPO_ROOT / "gui" / "templates"
     candidates = [
         chat_templates_dir / "chat.html",
         chat_templates_dir / "partials" / "chat_pending.html",
+        chat_templates_dir / "partials" / "chat_messages.html",
         chat_templates_dir / "partials" / "chat_sidebar.html",
         chat_templates_dir / "partials" / "chat_sources.html",
         chat_templates_dir / "partials" / "chat_blocked.html",
@@ -1392,4 +1402,202 @@ def test_no_innerhtml_in_chat_templates():
     ]
     for tpl in candidates:
         text = tpl.read_text(encoding="utf-8")
-        assert "innerHTML" not in text, f"{tpl} must never use innerHTML (T-08-05)"
+        assert not _INNERHTML_DOM_API_RE.search(text), (
+            f"{tpl} must never call the DOM innerHTML/insertAdjacentHTML API directly (T-08-05)"
+        )
+
+
+def test_chat_pending_token_path_still_createtextnode_only():
+    """The LIVE streaming token path (data.token) must remain
+    createTextNode-only -- unchanged by the saved-frame's htmx re-render."""
+    text = (
+        _REPO_ROOT / "gui" / "templates" / "partials" / "chat_pending.html"
+    ).read_text(encoding="utf-8")
+    assert "document.createTextNode(data.token)" in text
+
+
+# ---------------------------------------------------------------------------
+# gui/routes/chat.py + gui/templates/partials/chat_messages.html -- Phase 8
+# Plan 16 Task 2 (GUI-09): one shared history render, a race-free post-turn
+# re-render, and the sources-without-a-refresh gap closure (Tests I-N).
+# ---------------------------------------------------------------------------
+
+def test_history_partial_and_chat_page_render_the_same_history(
+    gui_client, gui_config, monkeypatch
+):
+    """Test I: GET /chat and the new history endpoint render the SAME
+    formatted markdown for the same conversation -- one render path, so the
+    page and the partial cannot drift."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+
+    conv = chat_store_module.create_conversation()
+    conv["messages"] = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "**bold reply**", "model": "gemma4:e4b"},
+    ]
+    chat_store_module.save(conv)
+
+    page_resp = gui_client.get(f"/chat?conv={conv['id']}")
+    history_resp = gui_client.get(f"/chat/{conv['id']}/messages")
+
+    assert page_resp.status_code == 200
+    assert history_resp.status_code == 200
+    assert "<strong>bold reply</strong>" in page_resp.text
+    assert "<strong>bold reply</strong>" in history_resp.text
+
+
+def test_markdown_renders_in_history_user_content_excluded(
+    gui_client, gui_config, monkeypatch
+):
+    """Test J: an assistant message's stored markdown renders as formatted
+    HTML; a user message's content is NOT passed through the renderer and
+    stays literal."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat.list_models", lambda: (["gemma4:e4b"], None))
+
+    conv = chat_store_module.create_conversation()
+    conv["messages"] = [
+        {"role": "user", "content": "**not bold** please"},
+        {"role": "assistant", "content": "**bold reply**", "model": "gemma4:e4b"},
+    ]
+    chat_store_module.save(conv)
+
+    resp = gui_client.get(f"/chat/{conv['id']}/messages")
+
+    assert resp.status_code == 200
+    assert "<strong>bold reply</strong>" in resp.text
+    assert "**not bold** please" in resp.text
+    assert "<strong>not bold</strong>" not in resp.text
+
+
+def test_history_endpoint_serves_valid_conversation_id(gui_client, gui_config, monkeypatch):
+    """Test K (valid id): the history endpoint returns the rendered
+    history for a valid conversation id."""
+    conv = chat_store_module.create_conversation()
+    conv["messages"] = [{"role": "user", "content": "hi there"}]
+    chat_store_module.save(conv)
+
+    resp = gui_client.get(f"/chat/{conv['id']}/messages")
+
+    assert resp.status_code == 200
+    assert "hi there" in resp.text
+
+
+def test_history_endpoint_404s_for_invalid_or_absent_id_without_filesystem_exception(
+    gui_client, gui_config, monkeypatch
+):
+    """Test K (invalid/absent id): an id failing chat_store's strict
+    charset, and a well-formed but non-existent id, both 404 -- never a
+    filesystem exception (mirroring chat_store's own id-validation
+    contract, T-08-18)."""
+    resp_invalid_charset = gui_client.get("/chat/bad_id_here/messages")
+    assert resp_invalid_charset.status_code == 404
+
+    resp_absent = gui_client.get("/chat/20260101-000000-deadbeef/messages")
+    assert resp_absent.status_code == 404
+
+
+def test_saved_frame_emitted_only_after_persist_completes(
+    gui_client, gui_config, monkeypatch
+):
+    """Test L: the terminal saved-frame is emitted only after the assistant
+    message is persisted -- assert the persisted state at the MOMENT the
+    saved-frame is observed (consumed frame by frame), not only at the end,
+    which would not distinguish the race (T-08-GAP-33)."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="race check")
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([_frame({"token": "answer"}), _frame({"done": True})]),
+    )
+
+    gen = chat_module._sse_stream(conv["id"], "gemma4:e4b")
+    saved_frame_seen = False
+    persisted_at_saved_frame = None
+    for raw in gen:
+        payload = json.loads(raw[len("data: "):-2])
+        if payload.get("saved"):
+            saved_frame_seen = True
+            saved_conv = chat_store_module.load(conv["id"])
+            persisted_at_saved_frame = saved_conv["messages"][-1]
+            break
+
+    assert saved_frame_seen, "no saved-frame was emitted on the normal completion path"
+    assert persisted_at_saved_frame["role"] == "assistant"
+    assert persisted_at_saved_frame["content"] == "answer"
+
+
+def test_no_saved_frame_on_abandoned_stream(gui_client, gui_config, monkeypatch):
+    """Test M: a stream abandoned mid-flight (generator closed after one
+    partial token) emits no saved-frame, and 08-14's exactly-one-assistant-
+    entry guarantee still holds."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="abandon me")
+
+    def _fake_stream(*a, **k):
+        yield _frame({"token": "partial"})
+        yield _frame({"token": "-- never reached"})
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _fake_stream)
+
+    gen = chat_module._sse_stream(conv["id"], "gemma4:e4b")
+    frame = next(gen)  # consume exactly one frame, mirroring a mid-flight disconnect
+    payload = json.loads(frame[len("data: "):-2])
+    assert payload == {"token": "partial"}
+    gen.close()
+
+    # A closed generator yields nothing further -- no saved-frame reaches
+    # the client after abandonment.
+    with pytest.raises(StopIteration):
+        next(gen)
+
+    saved = chat_store_module.load(conv["id"])
+    assistant_msgs = [m for m in saved["messages"] if m["role"] == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["content"] == "partial"
+
+
+def test_history_endpoint_includes_sources_after_turn_with_sources(
+    gui_client, gui_config, monkeypatch
+):
+    """Test N: after a turn with sources, the history endpoint's rendered
+    output includes the sources block for that turn -- the property the
+    user could previously only get by leaving the page and coming back."""
+    monkeypatch.setattr("gui.routes.chat.load_gui_config", lambda: gui_config)
+    monkeypatch.setattr(gui_jobs_module, "is_busy", lambda: False)
+    monkeypatch.setattr("gui.routes.chat._search", lambda *a, **k: _fake_search_result())
+
+    conv = chat_store_module.create_conversation()
+
+    lines = [
+        json.dumps({"message": {"content": "Answer text"}, "done": False}).encode(),
+        json.dumps({"done": True}).encode(),
+    ]
+    monkeypatch.setattr(
+        "gui.ollama_chat.urllib.request.urlopen",
+        lambda *a, **k: _FakeStreamResponse(lines),
+    )
+
+    send_resp = gui_client.post(
+        "/chat/send",
+        data={
+            "conv": conv["id"],
+            "message": "what does the paper say",
+            "model": "gemma4:e4b",
+            "scope": "chroma",
+        },
+    )
+    assert send_resp.status_code == 200
+
+    stream_resp = gui_client.get(f"/chat/stream?conv={conv['id']}&model=gemma4:e4b")
+    assert stream_resp.status_code == 200
+    assert '"saved": true' in stream_resp.text
+
+    history_resp = gui_client.get(f"/chat/{conv['id']}/messages")
+    assert history_resp.status_code == 200
+    assert "Sources (1)" in history_resp.text
+    assert "A Great Paper" in history_resp.text
