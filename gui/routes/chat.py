@@ -486,7 +486,18 @@ def _sse_stream(conv_id: str, model: str):
     error_text = None
     try:
         for frame in _stream_ollama_chat(llm_messages, model, timeout=timeout):
-            payload = json.loads(frame[len("data: "):-2])
+            # WR-01: the fixed-offset slice assumes every frame is exactly
+            # ``data: {json}\n\n``. A frame that ever drifts from that shape
+            # (a keepalive/comment line, a differently terminated frame) must
+            # not crash the whole stream -- this loop is wrapped in only a
+            # try/finally, so an unguarded json.loads here would abort the
+            # generator mid-turn. Pass an unparseable frame through untouched
+            # and skip accumulation/terminal detection for it instead.
+            try:
+                payload = json.loads(frame[len("data: "):-2])
+            except (ValueError, IndexError):
+                yield frame
+                continue
             if "token" in payload:
                 accumulated.append(payload["token"])
             if "error" in payload:

@@ -50,7 +50,14 @@
         es.close();
       }
       if (data.done) {
-        es.close();
+        // GAP-33 / CR-01: do NOT close here. The server emits a trailing
+        // `saved` frame AFTER persisting this turn (chat.py _sse_stream),
+        // and the `saved` branch below is the SOLE close-and-re-render
+        // trigger. Closing on `done` dropped the connection before `saved`
+        // arrived, so a finished reply never re-rendered with its markdown
+        // formatting, its Sources, or its model label until a page refresh.
+        // The `saved` branch and es.onerror still guarantee the stream is
+        // closed, so leaving `done` a no-op is not a connection leak.
       }
       if (data.saved) {
         // Task 2 (T-08-GAP-33): the assistant message is now durably

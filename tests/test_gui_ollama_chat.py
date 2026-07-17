@@ -1601,3 +1601,115 @@ def test_history_endpoint_includes_sources_after_turn_with_sources(
     assert history_resp.status_code == 200
     assert "Sources (1)" in history_resp.text
     assert "A Great Paper" in history_resp.text
+
+
+# gui/routes/chat.py + chat_pending.html -- 08-REVIEW CR-01 / WR-01
+# (post-turn re-render was unreachable; frame re-parse was crash-fragile).
+
+
+def _split_pending_script_blocks(pending_html: str):
+    """Return (done_block, saved_block): the inline-script bodies of the
+    `if (data.done) { ... }` and `if (data.saved) { ... }` branches in a
+    rendered chat_pending partial. Brace-matched so a nested block cannot be
+    truncated. Used to pin the CR-01 client contract without a JS runtime."""
+    def _body(marker: str) -> str:
+        start = pending_html.index(marker)
+        brace = pending_html.index("{", start)
+        depth = 0
+        for i in range(brace, len(pending_html)):
+            ch = pending_html[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return pending_html[brace + 1:i]
+        raise AssertionError(f"unbalanced braces after {marker!r}")
+
+    return _body("if (data.done)"), _body("if (data.saved)")
+
+
+def test_chat_pending_done_branch_does_not_close_stream(
+    gui_client, gui_config, monkeypatch
+):
+    """CR-01: the finished-reply re-render is driven ONLY by the trailing
+    `saved` frame, which the server emits AFTER persisting the turn. If the
+    `done` branch closes the EventSource, the connection drops before `saved`
+    arrives and the re-render (markdown formatting, Sources, model label)
+    never fires. So the `done` branch must NOT close the stream, and the
+    `saved` branch must be the sole close-and-re-render trigger."""
+    conv = chat_store_module.create_conversation()
+
+    resp = _send_with_canned_scope(gui_client, gui_config, monkeypatch, conv["id"], "hi")
+
+    done_block, saved_block = _split_pending_script_blocks(resp.text)
+    assert "es.close()" not in done_block, (
+        "done branch must not close the stream before the `saved` frame "
+        f"arrives; got: {done_block!r}"
+    )
+    assert "es.close()" in saved_block, "saved branch must close the stream"
+    assert "htmx.ajax" in saved_block, "saved branch must re-render the history"
+    assert "/messages" in saved_block, "saved branch must GET the history partial"
+
+
+def test_sse_stream_emits_saved_frame_last_after_done(
+    gui_client, gui_config, monkeypatch
+):
+    """CR-01 (server side): on a normal completed turn the `saved` frame is
+    emitted AFTER the `done` frame and is the final frame of the stream, so a
+    client that waits for `saved` (rather than closing on `done`) reliably
+    receives the terminal re-render trigger."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="normal")
+
+    monkeypatch.setattr(
+        "gui.routes.chat._stream_ollama_chat",
+        lambda *a, **k: iter([
+            _frame({"token": "Hi"}),
+            _frame({"done": True}),
+        ]),
+    )
+
+    frames = list(chat_module._sse_stream(conv["id"], "gemma4:e4b"))
+    payloads = [_payload(f) for f in frames]
+
+    done_idx = next(i for i, p in enumerate(payloads) if p.get("done"))
+    saved_idx = next(i for i, p in enumerate(payloads) if p.get("saved"))
+    assert saved_idx > done_idx, "saved frame must come after done"
+    assert saved_idx == len(payloads) - 1, "saved frame must be the last frame"
+
+
+def test_sse_stream_survives_malformed_frame(gui_client, gui_config, monkeypatch):
+    """WR-01: a frame that does not match the ``data: {json}\\n\\n`` shape must
+    not crash the stream. The malformed frame is passed through untouched and
+    the generator still completes -- persisting the assistant turn and
+    emitting the trailing `saved` frame."""
+    conv = chat_store_module.create_conversation()
+    _send_turn(gui_client, gui_config, monkeypatch, conv["id"], message="malformed")
+
+    def _fake_stream(*a, **k):
+        yield _frame({"token": "Hel"})
+        yield ": keepalive\n\n"  # a valid SSE comment line, not a data frame
+        yield _frame({"token": "lo"})
+        yield _frame({"done": True})
+
+    monkeypatch.setattr("gui.routes.chat._stream_ollama_chat", _fake_stream)
+
+    frames = list(chat_module._sse_stream(conv["id"], "gemma4:e4b"))
+
+    assert ": keepalive\n\n" in frames, "malformed frame must pass through untouched"
+    assert any(_frame_is_saved(f) for f in frames), "stream must still complete"
+
+    saved = chat_store_module.load(conv["id"])
+    last = saved["messages"][-1]
+    assert last["role"] == "assistant"
+    assert last["content"] == "Hello", "tokens around the malformed frame still accumulate"
+
+
+def _frame_is_saved(frame: str) -> bool:
+    if not frame.startswith("data: "):
+        return False
+    try:
+        return bool(_payload(frame).get("saved"))
+    except (ValueError, IndexError):
+        return False
