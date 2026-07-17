@@ -420,26 +420,73 @@ def _sse_stream(conv_id: str, model: str):
         sources = None
         truncation_notes = None
 
+    # Gap A (08-14, T-08-GAP-23): the append below MUST run on every exit
+    # path -- normal completion, an inline error frame, an unhandled
+    # exception, AND client abandonment (a closed StreamingResponse
+    # generator raises GeneratorExit inside this loop). A try/finally
+    # around the accumulation loop is what makes the append unconditional
+    # by construction rather than reachable only on the happy path; the
+    # missing-conversation early return above stays OUTSIDE this block so
+    # it remains a no-op instead of persisting to a deleted conversation.
+    #
+    # Decision (answering 08-11's deferred "should a failed/ungrounded turn
+    # be persisted at all?"): persist an ERROR-MARKED assistant entry
+    # rather than rolling back the user message. Rollback is rejected
+    # because (1) it isn't implementable for the abandonment case -- the
+    # user message was saved in a different, already-returned request, and
+    # a closed generator cannot reliably undo it; (2) an error-marked entry
+    # is honest history -- the user asked, the system failed, and silently
+    # deleting their question hides that; (3) the poisoning risk that
+    # motivated the question is about the model's own refusal PROSE being
+    # pattern-continued, not a short bracketed error marker, and 08-11's
+    # context-adjacency fix already places grounding next to the live
+    # question. A future reader should not reopen this without re-reading
+    # this reasoning.
     accumulated: list = []
-    for frame in _stream_ollama_chat(llm_messages, model, timeout=timeout):
-        payload = json.loads(frame[len("data: "):-2])
-        if "token" in payload:
-            accumulated.append(payload["token"])
-        yield frame
-        if payload.get("done") or "error" in payload:
-            break
-
-    conversation = chat_store.load(conv_id)
-    if conversation is None:
-        return
-    assistant_msg = {"role": "assistant", "content": "".join(accumulated)}
-    if sources:
-        assistant_msg["sources"] = sources
-    if truncation_notes:
-        assistant_msg["truncation_notes"] = truncation_notes
-    conversation["messages"].append(assistant_msg)
-    conversation["model"] = model
-    chat_store.save(conversation)
+    error_text = None
+    try:
+        for frame in _stream_ollama_chat(llm_messages, model, timeout=timeout):
+            payload = json.loads(frame[len("data: "):-2])
+            if "token" in payload:
+                accumulated.append(payload["token"])
+            if "error" in payload:
+                error_text = payload["error"]
+            yield frame
+            if payload.get("done") or "error" in payload:
+                break
+    finally:
+        conversation = chat_store.load(conv_id)
+        if conversation is not None:
+            if accumulated:
+                assistant_msg = {"role": "assistant", "content": "".join(accumulated)}
+            else:
+                # No tokens accumulated (an error frame, a done-with-nothing
+                # stream, or an abandonment before any token arrived): an
+                # honest error marker, never a bare/missing assistant turn.
+                # Bracketed prefix matches the project's established
+                # error-string convention (CONVENTIONS.md; see
+                # chat_stream's existing "[chat error: conversation not
+                # found]"). ``error_text`` (when captured) is folded in
+                # rather than discarded -- it is the actual diagnostic.
+                content = (
+                    f"[chat error: {error_text}]"
+                    if error_text
+                    else "[chat error: no response received]"
+                )
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": content,
+                    "error": True,
+                }
+            if sources:
+                assistant_msg["sources"] = sources
+            if truncation_notes:
+                assistant_msg["truncation_notes"] = truncation_notes
+            conversation["messages"].append(assistant_msg)
+            # The picker's current default only (see chat_send's identical
+            # comment) -- not a per-reply claim; that lives on the message.
+            conversation["model"] = model
+            chat_store.save(conversation)
 
 
 @router.get("/chat/stream")
