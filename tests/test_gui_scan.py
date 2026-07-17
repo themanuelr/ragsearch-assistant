@@ -559,3 +559,74 @@ def test_paper_row_rerun_biblio_enqueues_expected_argv(gui_client, gui_config, m
     assert argv[0] == sys.executable
     assert argv[1].endswith("biblio.py")
     assert argv[-2:] == ["--stem", "rerun-ready"]
+
+
+# ---------------------------------------------------------------------------
+# 08-12 Task 2 (Gap B, GUI-03/D-12): two-way paper-row drill-down toggle
+#
+# The expand/collapse behaviour itself is browser-only (a click handler
+# clearing or fetching into the cell) and isn't unit-testable in this stack.
+# What CAN regress silently -- and 08-08 closed a bug of exactly this shape,
+# an hx-target that didn't resolve to its container -- is the row/cell id
+# correspondence and the toggle wiring: the row's detail-cell data attribute
+# must equal the sibling detail cell's real id, and the drill-down URL data
+# attribute must address that paper's own route, or a click expands (or
+# collapses) the wrong row.
+# ---------------------------------------------------------------------------
+
+def test_overview_project_row_toggle_wiring_matches_detail_cell_and_url(
+    gui_client, gui_config, monkeypatch
+):
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    entry_a = _registry_entry(
+        "Toggle Paper A",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "toggle-a.json"),
+        ["proj-a"],
+    )
+    entry_b = _registry_entry(
+        "Toggle Paper B",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "toggle-b.json"),
+        ["proj-a"],
+    )
+    _write_registry(gui_config, {"key-toggle-a": entry_a, "key-toggle-b": entry_b})
+
+    resp = gui_client.get("/overview/project")
+
+    assert resp.status_code == 200
+    # No declarative one-way fill left on the row.
+    assert "hx-get=" not in resp.text
+    assert "hx-target=" not in resp.text
+    # Row carries the click handler.
+    assert 'onclick="paperRowToggle(this)"' in resp.text
+    # Each row's detail-cell data attribute matches its sibling detail cell's
+    # real id, and its URL data attribute addresses that paper's own route.
+    for index, key in enumerate(("key-toggle-a", "key-toggle-b")):
+        expected_cell_id = f"paper-detail-{index}"
+        assert f'data-detail-cell="{expected_cell_id}"' in resp.text
+        assert f'id="{expected_cell_id}"' in resp.text
+        assert f'data-drilldown-url="/overview/project/paper/{key}"' in resp.text
+    # The toggle function is defined exactly once regardless of paper count.
+    assert resp.text.count("window.paperRowToggle = function") == 1
+
+
+def test_overview_project_route_and_drilldown_partial_unchanged(gui_client, gui_config, monkeypatch):
+    """gui/routes/overview.py, the {registry_key:path} route contract, and
+    the drill-down partial itself are out of scope for this gap -- only the
+    row's toggle wiring changed. A drill-down request still resolves the
+    real paper partial."""
+    gui_config["project_name"] = "proj-a"
+    _patch_overview_config(monkeypatch, gui_config)
+
+    entry = _registry_entry(
+        "Untouched Route Paper",
+        str(pathlib.Path(gui_config["paperjson_cache_dir"]) / "untouched.json"),
+        ["proj-a"],
+    )
+    _write_registry(gui_config, {"key-untouched": entry})
+
+    resp = gui_client.get("/overview/project/paper/key-untouched")
+
+    assert resp.status_code == 200
+    assert "Untouched Route Paper" in resp.text

@@ -24,9 +24,9 @@
       <tbody>
         {% for paper in papers %}
         <tr class="paper-row"
-            hx-get="/overview/project/paper/{{ paper.registry_key }}"
-            hx-target="#paper-detail-{{ loop.index0 }}"
-            hx-swap="innerHTML">
+            data-detail-cell="paper-detail-{{ loop.index0 }}"
+            data-drilldown-url="/overview/project/paper/{{ paper.registry_key }}"
+            onclick="paperRowToggle(this)">
           <td>{{ paper.title }}</td>
           <td>{{ paper.metadata.year or "" }}</td>
           <td>{{ macros.stage_glyph(paper.stages.mineru) }}</td>
@@ -73,4 +73,29 @@
     <p class="empty-state-body">Drop PDF files into <code>uningestedPDFs/</code> to see them here.</p>
     {% endif %}
   </section>
+
+  {# GUI-03/D-12: the row is a two-way disclosure toggle, not a one-way htmx
+     fill. Declarative hx-get/hx-target/hx-swap on the row is deliberately
+     not used here: htmx's own click listener and this row's click handler
+     would both fire on the same click, and their relative firing order
+     decides whether an hx-trigger event filter sees pre- or post-toggle
+     state -- a race that would make the toggle flip unpredictably. One
+     handler owning both branches (collapse vs. fetch-and-expand) has no
+     such ambiguity; it still issues the fetch through htmx's own public
+     `htmx.ajax` API so the swap mechanics are unchanged. #}
+  <script>
+    (function () {
+      window.paperRowToggle = function (row) {
+        var cellId = row.getAttribute("data-detail-cell");
+        var url = row.getAttribute("data-drilldown-url");
+        var cell = document.getElementById(cellId);
+        if (!cell) return;
+        if (cell.innerHTML.trim()) {
+          cell.innerHTML = "";
+          return;
+        }
+        htmx.ajax("GET", url, { target: "#" + cellId, swap: "innerHTML" });
+      };
+    })();
+  </script>
 {% endblock %}
