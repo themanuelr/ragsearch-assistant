@@ -110,6 +110,31 @@ def chat_page(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# GET /chat/{conv_id}/messages -- rendered message-history partial, the
+# race-free re-render target for _sse_stream's terminal saved-frame
+# (Task 2, T-08-GAP-33). Renders the SAME partial GET /chat renders, so the
+# page and the post-turn re-render can never drift (Test I).
+# ---------------------------------------------------------------------------
+
+@router.get("/chat/{conv_id}/messages")
+def chat_messages(request: Request, conv_id: str):
+    from gui.app import templates
+
+    # chat_store.load validates conv_id against its strict charset BEFORE
+    # constructing any path (T-08-18) and returns None for an invalid/
+    # absent id -- no filesystem exception ever reaches this handler.
+    active_conv = chat_store.load(conv_id)
+    if active_conv is None:
+        return PlainTextResponse("Not Found", status_code=404)
+
+    return templates.TemplateResponse(
+        request,
+        "partials/chat_messages.html",
+        {"active_conv": active_conv},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sidebar actions: new / rename / delete
 # ---------------------------------------------------------------------------
 
@@ -508,6 +533,21 @@ def _sse_stream(conv_id: str, model: str):
             # comment) -- not a per-reply claim; that lives on the message.
             conversation["model"] = model
             chat_store.save(conversation)
+
+    # Race-free saved-frame (Task 2, T-08-GAP-33): the client receives
+    # `done` (yielded inside the loop above, BEFORE this generator reaches
+    # this line) while the persist above is still in flight -- re-rendering
+    # on `done` would race that persist and could render a history missing
+    # the very reply that just streamed. This trailing yield sits AFTER the
+    # try/finally above, so by construction it is only reached once the
+    # persist has completed, on the NORMAL completion path -- a closed
+    # generator (client abandonment, GeneratorExit thrown at the yield
+    # inside the loop) unwinds straight through `finally` and out of the
+    # function without ever reaching this line, so an abandoned stream
+    # never emits it (Test M). This ordering is the whole point and will
+    # look like redundancy to a future reader; it is not -- do not move
+    # this yield inside the try/finally or hang it off `done`.
+    yield f'data: {json.dumps({"saved": True})}\n\n'
 
 
 @router.get("/chat/stream")

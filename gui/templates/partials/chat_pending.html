@@ -1,8 +1,16 @@
 {# Rendered by POST /chat/send: the just-sent user message plus a pending
-   assistant container wired to the SSE stream. Tokens are appended via
-   textContent/createTextNode ONLY (T-08-05) -- LLM output is untrusted and
-   must stay XSS-inert; the DOM inner-markup setter API must never appear in
-   this file. #}
+   assistant container wired to the SSE stream.
+
+   T-08-05, narrowed by Phase 8 Plan 16 (GUI-09): the LIVE streaming token
+   path in this file must still never itself set inner markup -- tokens are
+   appended via textContent/createTextNode ONLY, and the DOM inner-markup
+   setter API must never appear in THIS file. Model output MAY now reach the
+   DOM as HTML, but ONLY after passing through gui/chat_markdown.py's
+   escape-then-restricted-render chokepoint, and ONLY via htmx's swap of a
+   server-rendered partial (the `saved` branch below, which re-renders
+   #chat-messages from GET /chat/{conv_id}/messages) -- this file remains
+   the innerHTML-free surface it always was; the chokepoint is the sole,
+   reviewed exception, one layer away. #}
 <div class="chat-message chat-message-user">
   <div class="chat-message-content">{{ message }}</div>
 </div>
@@ -43,6 +51,20 @@
       }
       if (data.done) {
         es.close();
+      }
+      if (data.saved) {
+        // Task 2 (T-08-GAP-33): the assistant message is now durably
+        // persisted -- re-render the shared history partial via htmx so
+        // this finished turn shows its formatting, its Sources and its
+        // model without a page refresh, from the exact render GET /chat
+        // already uses (Test I/N). `done` above may have already closed
+        // the stream; closing again here is a harmless no-op.
+        es.close();
+        htmx.ajax(
+          "GET",
+          "/chat/{{ conv_id | urlencode }}/messages",
+          { target: "#chat-messages", swap: "innerHTML" }
+        );
       }
     };
     es.onerror = function () {
