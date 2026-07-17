@@ -877,3 +877,176 @@ def test_cli_all_subprocess_no_crash_on_empty_registry(tmp_path):
     parsed = json.loads(lines[-1])
     assert set(parsed) == {"papers", "stubs", "skipped"}
     assert parsed == {"papers": 0, "stubs": 0, "skipped": 0}
+
+
+# ---------------------------------------------------------------------------
+# 08-10 gap closure (GUI-09 / D-14): the ChromaDB access contract for the
+# long-lived GUI process -- cross-process freshness via a close-based
+# `_collection_session`, no leaked cached System, and the two in-process
+# consumers (`_search` here, `gui.scan._stage_embed` in the next section)
+# both going through it. Reproduces the exact `Error finding id` staleness
+# confirmed at planning time on the installed chromadb 1.5.9.
+# ---------------------------------------------------------------------------
+
+def _subprocess_write_records(chroma_db_path, records):
+    """Run a real subprocess that opens `chroma_db_path`, adds `records`
+    (list of (id, embedding, metadata) tuples), and closes its client.
+
+    Mirrors this project's live-subprocess regression precedent (see
+    `test_cli_embed_file_subprocess_resolves_imports` above): a throwaway
+    `python -c` invocation, not an in-process chromadb call, so the parent
+    process's System cache can never be pre-warmed by the writer itself.
+    """
+    ids = json.dumps([r[0] for r in records])
+    embeddings = json.dumps([r[1] for r in records])
+    metadatas = json.dumps([r[2] for r in records])
+    source = (
+        "import chromadb, json\n"
+        f"client = chromadb.PersistentClient(path={str(chroma_db_path)!r})\n"
+        "collection = client.get_or_create_collection(\n"
+        "    name='papers', configuration={'hnsw': {'space': 'cosine'}}\n"
+        ")\n"
+        f"ids = json.loads({ids!r})\n"
+        f"embeddings = json.loads({embeddings!r})\n"
+        f"metadatas = json.loads({metadatas!r})\n"
+        "collection.upsert(ids=ids, embeddings=embeddings, metadatas=metadatas,\n"
+        "                  documents=[m['title'] for m in metadatas])\n"
+        "client.close()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"subprocess writer failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+def _seeded_records(n, prefix, status="paper"):
+    """Build n deterministic (id, embedding, metadata) records for the
+    subprocess writer / direct-add helpers below -- no Ollama involved."""
+    records = []
+    for i in range(n):
+        records.append((
+            f"{prefix}-{i}::0-section::0",
+            _fixed_vector(1000 + i),
+            {
+                "registry_key": f"{prefix}-{i}",
+                "title": f"{prefix.title()} Paper {i}",
+                "heading": "Section",
+                "part": 0,
+                "doi": f"10.0000/{prefix}-{i}",
+                "year": 2020,
+                "status": status,
+                "vault_note": f"Papers/{prefix.title()} Paper {i}.md",
+            },
+        ))
+    return records
+
+
+def test_search_sees_subprocess_writes_after_prior_in_process_read(tmp_path):
+    """Test A: open the collection via _collection_session, add 5 records,
+    and issue one query (this is what actually instantiates the in-process
+    HNSW segment reader -- an add-only session never touches it, matching
+    `<read_first>`'s note that scan's metadata-only read is harmless by
+    itself). Then a real subprocess writes 60 more records to the same path.
+    Then `_search` runs in the same parent -- it must return the
+    newly-written records and carry no 'error' key. Against the unfixed
+    `_search` (a per-call `_get_collection` with no close, so the HNSW reader
+    instantiated by the first query survives the subprocess write) this
+    reproduces the exact `Error finding id` internal error surfaced as
+    `[search error: ...]` -- byte-for-byte the planning-time repro."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+    chroma_db_path = config["chroma_db_path"]
+
+    initial = _seeded_records(5, "seed")
+    with embed._collection_session(config) as collection:
+        collection.upsert(
+            ids=[r[0] for r in initial],
+            embeddings=[r[1] for r in initial],
+            metadatas=[r[2] for r in initial],
+            documents=[r[2]["title"] for r in initial],
+        )
+        collection.query(
+            query_embeddings=[_fixed_vector(1000)], n_results=5, where={"status": "paper"}
+        )
+
+    subprocess_records = _seeded_records(60, "written")
+    _subprocess_write_records(chroma_db_path, subprocess_records)
+
+    query_vec = _fixed_vector(1000)  # matches seed-0's vector exactly (score 1.0)
+    with mock.patch("scripts.embed._ollama_embed_call", return_value=[query_vec]):
+        result = embed._search("relevant query", 50, config)
+
+    assert not result.get("error"), f"unexpected search error after subprocess write: {result.get('error')}"
+    registry_keys = {p["registry_key"] for p in result["papers"]}
+    written_keys = {r[2]["registry_key"] for r in subprocess_records}
+    assert written_keys & registry_keys, (
+        "the in-process _search must see records written by the subprocess "
+        f"after a prior in-process session closed; got keys: {registry_keys}"
+    )
+
+
+def test_collection_session_leaves_no_cached_system(tmp_path):
+    """Test B: after a `_collection_session` block exits, no System is left
+    cached for that path in `SharedSystemClient._identifier_to_system` -- the
+    session evicts its System rather than orphaning it (no per-query HNSW
+    index leak in a long-lived server)."""
+    from chromadb.api.shared_system_client import SharedSystemClient
+
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+
+    with embed._collection_session(config) as collection:
+        collection.upsert(
+            ids=["probe::0-section::0"],
+            embeddings=[_fixed_vector(0)],
+            metadatas=[{
+                "registry_key": "probe", "title": "Probe", "heading": "Section",
+                "part": 0, "doi": "", "year": 2020, "status": "paper",
+                "vault_note": "Papers/Probe.md",
+            }],
+            documents=["Probe"],
+        )
+
+    resolved_path = str(pathlib.Path(config["chroma_db_path"]).resolve())
+    surviving = [
+        identifier for identifier in SharedSystemClient._identifier_to_system
+        if resolved_path in str(identifier)
+    ]
+    assert not surviving, (
+        f"a System entry survived _collection_session exit for {resolved_path}: {surviving}"
+    )
+
+
+def test_collection_session_round_trip_survives_close(tmp_path):
+    """Test C: records written inside one `_collection_session` block are
+    readable from a later, independent session -- close() evicts the cached
+    System, it does not discard the on-disk data."""
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+
+    with embed._collection_session(config) as collection:
+        collection.upsert(
+            ids=["roundtrip::0-section::0"],
+            embeddings=[_fixed_vector(0)],
+            metadatas=[{
+                "registry_key": "roundtrip", "title": "Round Trip", "heading": "Section",
+                "part": 0, "doi": "", "year": 2020, "status": "paper",
+                "vault_note": "Papers/Round Trip.md",
+            }],
+            documents=["Round Trip"],
+        )
+
+    with embed._collection_session(config) as collection2:
+        got = collection2.get(where={"registry_key": "roundtrip"})
+
+    assert got["ids"] == ["roundtrip::0-section::0"], (
+        "data written inside a closed session must be readable from a later independent session"
+    )

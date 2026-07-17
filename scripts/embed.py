@@ -20,6 +20,7 @@ config-overridable) — see PROJECT.md constraints and the phase threat model
 """
 
 import argparse
+import contextlib
 import datetime
 import http.client
 import json
@@ -129,6 +130,41 @@ def _get_collection(config: dict):
         name=COLLECTION_NAME,
         configuration={"hnsw": {"space": "cosine"}},
     )
+
+
+@contextlib.contextmanager
+def _collection_session(config: dict):
+    """Yield the `papers` collection through a client that is CLOSED on exit.
+
+    WHY this exists (GUI-09 / D-14): `chromadb.PersistentClient` caches its
+    System (and the in-memory HNSW index inside it) per path in
+    `SharedSystemClient._identifier_to_system`. Constructing a new client per
+    call — as `_get_collection` does — therefore does NOT guarantee a fresh
+    view; it silently reuses whatever System is already cached for that path.
+    Only closing the LAST client open for a path evicts the cached System, and
+    only an evicted entry yields an index view that reflects writes a
+    pipeline subprocess made since the cache was populated.
+
+    This makes the session mandatory for any caller living in the long-lived
+    GUI server (the only process where staleness is reachable — a fresh
+    subprocess can never hold a stale System). `close()` is chromadb 1.5.9's
+    documented public API for this; do not substitute a private cache-
+    clearing call (e.g. `SharedSystemClient.clear_system_cache()`), which
+    never stops the System it orphans and would leak one HNSW index per query
+    in a long-lived server.
+    """
+    import chromadb  # noqa: PLC0415
+
+    client = chromadb.PersistentClient(
+        path=config.get("chroma_db_path") or str(_REPO_ROOT / "chroma_db")
+    )
+    try:
+        yield client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            configuration={"hnsw": {"space": "cosine"}},
+        )
+    finally:
+        client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -722,64 +758,64 @@ def _search(query: str, n_results: int, config: dict) -> dict:
     # metadata, etc.) must surface as the structured papers/stubs/error dict
     # -- never a raw traceback to the --query CLI / MCP search_similar caller.
     try:
-        collection = _get_collection(config)
-        results = collection.query(
-            query_embeddings=[query_vector],
-            n_results=n_results * 5,  # over-fetch sections so enough distinct papers surface (A3)
-            where={"status": "paper"},
-            include=["documents", "metadatas", "distances"],
-        )
+        with _collection_session(config) as collection:
+            results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=n_results * 5,  # over-fetch sections so enough distinct papers surface (A3)
+                where={"status": "paper"},
+                include=["documents", "metadatas", "distances"],
+            )
 
-        docs = (results.get("documents") or [[]])[0]
-        metadatas = (results.get("metadatas") or [[]])[0]
-        distances = (results.get("distances") or [[]])[0]
+            docs = (results.get("documents") or [[]])[0]
+            metadatas = (results.get("metadatas") or [[]])[0]
+            distances = (results.get("distances") or [[]])[0]
 
-        papers: dict = {}
-        for doc, meta, dist in zip(docs, metadatas, distances):
-            score = round(1 - dist, 4)
-            key = meta["registry_key"]
-            entry = papers.setdefault(key, {
-                "title": meta["title"],
-                "registry_key": key,
-                "status": meta["status"],
-                "vault_note": meta["vault_note"],
-                "score": score,
-                "sections": [],
-            })
-            entry["sections"].append({
-                "heading": meta["heading"],
-                "score": score,
-                "excerpt": doc[:300],
-            })
-            entry["score"] = max(entry["score"], score)  # D-06: rank by BEST section score
+            papers: dict = {}
+            for doc, meta, dist in zip(docs, metadatas, distances):
+                score = round(1 - dist, 4)
+                key = meta["registry_key"]
+                entry = papers.setdefault(key, {
+                    "title": meta["title"],
+                    "registry_key": key,
+                    "status": meta["status"],
+                    "vault_note": meta["vault_note"],
+                    "score": score,
+                    "sections": [],
+                })
+                entry["sections"].append({
+                    "heading": meta["heading"],
+                    "score": score,
+                    "excerpt": doc[:300],
+                })
+                entry["score"] = max(entry["score"], score)  # D-06: rank by BEST section score
 
-        ranked = sorted(papers.values(), key=lambda p: p["score"], reverse=True)[:n_results]
+            ranked = sorted(papers.values(), key=lambda p: p["score"], reverse=True)[:n_results]
 
-        # Separate stub-hits query (D-15) — never merges into the papers block;
-        # the query embedding is reused, not recomputed.
-        stub_results = collection.query(
-            query_embeddings=[query_vector],
-            n_results=n_results,
-            where={"status": "stub"},
-            include=["documents", "metadatas", "distances"],
-        )
-        stub_docs = (stub_results.get("documents") or [[]])[0]
-        stub_metadatas = (stub_results.get("metadatas") or [[]])[0]
-        stub_distances = (stub_results.get("distances") or [[]])[0]
+            # Separate stub-hits query (D-15) — never merges into the papers block;
+            # the query embedding is reused, not recomputed.
+            stub_results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=n_results,
+                where={"status": "stub"},
+                include=["documents", "metadatas", "distances"],
+            )
+            stub_docs = (stub_results.get("documents") or [[]])[0]
+            stub_metadatas = (stub_results.get("metadatas") or [[]])[0]
+            stub_distances = (stub_results.get("distances") or [[]])[0]
 
-        stubs = [
-            {
-                "title": meta["title"],
-                "registry_key": meta["registry_key"],
-                "score": round(1 - dist, 4),
-                "excerpt": doc[:300],
-            }
-            for doc, meta, dist in zip(stub_docs, stub_metadatas, stub_distances)
-        ]
-        stubs.sort(key=lambda s: s["score"], reverse=True)
-        stubs = stubs[:n_results]
+            stubs = [
+                {
+                    "title": meta["title"],
+                    "registry_key": meta["registry_key"],
+                    "score": round(1 - dist, 4),
+                    "excerpt": doc[:300],
+                }
+                for doc, meta, dist in zip(stub_docs, stub_metadatas, stub_distances)
+            ]
+            stubs.sort(key=lambda s: s["score"], reverse=True)
+            stubs = stubs[:n_results]
 
-        return {"papers": ranked, "stubs": stubs}
+            return {"papers": ranked, "stubs": stubs}
     except Exception as e:
         return {"papers": [], "stubs": [], "error": f"[search error: {e}]"}
 
