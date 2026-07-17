@@ -356,6 +356,15 @@ def chat_send(
         )
 
     conversation["messages"].append({"role": "user", "content": message})
+    # Gap A (08-15 Task 1, T-08-GAP-27): the assistant reply that will land
+    # in _sse_stream's finally block occupies the NEXT slot in
+    # conversation["messages"] -- computed here, right after the user
+    # message append, so the index is exact even though the assistant
+    # entry itself does not exist yet. Passed into chat_pending.html so the
+    # pending container's DOM id is keyed per MESSAGE, not per conversation
+    # (see that template's own comment for why a conversation-keyed id
+    # duplicates on every send and breaks getElementById).
+    assistant_index = len(conversation["messages"])
     # Gap B (08-14 Task 2): this maintains the picker's CURRENT DEFAULT --
     # consumed only by chat_page's selected_model pre-selection -- not a
     # claim about which model produced which reply. That fact lives on
@@ -395,6 +404,7 @@ def chat_send(
             "message": message,
             "banner": banner,
             "truncation_notes": truncation_notes,
+            "assistant_index": assistant_index,
         },
     )
 

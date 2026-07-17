@@ -14,12 +14,21 @@
     Context truncated — dropped from this answer: {{ truncation_notes | join(', ') }}
   </p>
 {% endif %}
-<div class="chat-message chat-message-assistant" id="chat-assistant-{{ conv_id }}">
-  <div class="chat-message-content" id="chat-assistant-content-{{ conv_id }}"></div>
+{# Gap A (08-15 Task 1, T-08-GAP-27): the wrapper/content ids are keyed on
+   conv_id AND assistant_index, not conv_id alone. The form posts with
+   hx-swap="beforeend", so every send in the SAME conversation injects
+   another pending partial into #chat-messages -- a conversation-keyed id
+   would duplicate on the second send, and getElementById (below) always
+   resolves to the FIRST matching element, so every later reply streamed
+   into the FIRST answer's bubble instead of its own. Keying per message
+   makes each pending turn's id unique so the DOM can never hold two
+   elements sharing one id. #}
+<div class="chat-message chat-message-assistant" id="chat-assistant-{{ conv_id }}-{{ assistant_index }}">
+  <div class="chat-message-content" id="chat-assistant-content-{{ conv_id }}-{{ assistant_index }}"></div>
 </div>
 <script>
   (function () {
-    var target = document.getElementById("chat-assistant-content-{{ conv_id }}");
+    var target = document.getElementById("chat-assistant-content-{{ conv_id }}-{{ assistant_index }}");
     var es = new EventSource(
       "/chat/stream?conv={{ conv_id | urlencode }}&model={{ model | urlencode }}"
     );
