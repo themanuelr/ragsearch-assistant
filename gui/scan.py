@@ -3,9 +3,15 @@
 Strictly read-only. Never writes a GUI-owned state file (D-09 — the
 "ghost-state bug class" Phases 4/6 already fought) and never re-derives a
 write-side detection contract: imports ``scripts.biblio._REFS_SECTION_RE``,
-``scripts.link._RELATED_TOPICS_RE``, ``scripts.embed._get_collection``,
+``scripts.link._RELATED_TOPICS_RE``, ``scripts.embed._collection_session``,
 ``scripts.ingest._read_registry``, and ``scripts.note._sanitize_filename``
 directly (Don't Hand-Roll, 08-RESEARCH.md Pattern 4).
+
+08-10 (GUI-09/D-14): ``_stage_embed`` obtains its collection via
+``scripts.embed._collection_session`` (not the never-closed
+``_get_collection``) — this GUI process is long-lived, and a client left
+open here would leave a cached ChromaDB System that a later in-process chat
+search would inherit, reintroducing cross-process staleness.
 
 Public API:
   scan_project_papers(config) -> list[dict]
@@ -29,7 +35,7 @@ import json
 import pathlib
 
 from scripts.biblio import _REFS_SECTION_RE
-from scripts.embed import _get_collection
+from scripts.embed import _collection_session
 from scripts.ingest import _read_registry
 from scripts.link import _RELATED_TOPICS_RE, _parse_tags
 from scripts.note import _sanitize_filename
@@ -87,16 +93,23 @@ def _stage_embed(config: dict, registry_key: str) -> bool | None:
     Guarded so a missing chroma_db_path never creates one (read-only, D-09)
     and never 500s the page — chromadb.PersistentClient's get_or_create
     would otherwise materialize the directory on first touch.
+
+    Uses ``_collection_session`` (not a bare per-call client) even though
+    this function's own metadata-only ``.get()`` read is already fresh from
+    a stale System — this runs in the long-lived GUI server, so a client
+    left open here would leave a cached System behind that a later
+    in-process chat search would inherit, reintroducing the cross-process
+    staleness GUI-09/D-14 closes (08-10).
     """
     chroma_db_path = config.get("chroma_db_path")
     if not chroma_db_path or not pathlib.Path(chroma_db_path).exists():
         return None
     try:
-        collection = _get_collection(config)
-        result = collection.get(
-            where={"$and": [{"registry_key": registry_key}, {"status": "paper"}]}
-        )
-        return bool(result.get("ids"))
+        with _collection_session(config) as collection:
+            result = collection.get(
+                where={"$and": [{"registry_key": registry_key}, {"status": "paper"}]}
+            )
+            return bool(result.get("ids"))
     except Exception:  # noqa: BLE001 - fail-open: unknown, never a 500 (D-09)
         return None
 

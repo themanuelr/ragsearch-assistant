@@ -1050,3 +1050,118 @@ def test_collection_session_round_trip_survives_close(tmp_path):
     assert got["ids"] == ["roundtrip::0-section::0"], (
         "data written inside a closed session must be readable from a later independent session"
     )
+
+
+# ---------------------------------------------------------------------------
+# 08-10 gap closure (GUI-03): gui.scan._stage_embed converted onto
+# _collection_session too -- the interaction that motivates Task 2. Both of
+# the GUI's in-process Chroma consumers must close their clients, or a scan
+# page load can poison a later chat search even with Task 1's fix already
+# in place on _search alone.
+# ---------------------------------------------------------------------------
+
+def test_scan_read_then_subprocess_write_then_search_sees_new_records(tmp_path):
+    """Test D: a scan-style read (gui.scan._stage_embed) against a seeded
+    collection, followed by a real subprocess write, followed by an
+    in-process _search -- must see the new records with no 'error' key.
+    Against an unfixed _stage_embed (leaving its client open) this fails
+    even with Task 1's session already converting _search."""
+    from gui import scan  # noqa: PLC0415
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+    chroma_db_path = config["chroma_db_path"]
+
+    seed = _seeded_records(5, "seed")
+    with embed._collection_session(config) as collection:
+        collection.upsert(
+            ids=[r[0] for r in seed],
+            embeddings=[r[1] for r in seed],
+            metadatas=[r[2] for r in seed],
+            documents=[r[2]["title"] for r in seed],
+        )
+        collection.query(
+            query_embeddings=[_fixed_vector(1000)], n_results=5, where={"status": "paper"}
+        )
+
+    # Scan-style read: metadata-only .get() for one of the seeded papers.
+    scan_result = scan._stage_embed(config, "seed-0")
+    assert scan_result is True, "precondition: scan should see the seeded paper"
+
+    subprocess_records = _seeded_records(60, "written")
+    _subprocess_write_records(chroma_db_path, subprocess_records)
+
+    query_vec = _fixed_vector(1000)
+    with mock.patch("scripts.embed._ollama_embed_call", return_value=[query_vec]):
+        result = embed._search("relevant query", 50, config)
+
+    assert not result.get("error"), f"unexpected search error after scan+subprocess write: {result.get('error')}"
+    registry_keys = {p["registry_key"] for p in result["papers"]}
+    written_keys = {r[2]["registry_key"] for r in subprocess_records}
+    assert written_keys & registry_keys, (
+        "in-process _search must see subprocess-written records after a prior "
+        f"scan-style read closed its client; got keys: {registry_keys}"
+    )
+
+
+def test_stage_embed_leaves_no_cached_system(tmp_path):
+    """Test E: after _stage_embed returns, no System is left cached for the
+    path in SharedSystemClient._identifier_to_system."""
+    from chromadb.api.shared_system_client import SharedSystemClient
+
+    from gui import scan  # noqa: PLC0415
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+
+    with embed._collection_session(config) as collection:
+        collection.upsert(
+            ids=["seed-0::0-section::0"],
+            embeddings=[_fixed_vector(0)],
+            metadatas=[{
+                "registry_key": "seed-0", "title": "Seed 0", "heading": "Section",
+                "part": 0, "doi": "", "year": 2020, "status": "paper",
+                "vault_note": "Papers/Seed 0.md",
+            }],
+            documents=["Seed 0"],
+        )
+
+    scan._stage_embed(config, "seed-0")
+
+    resolved_path = str(pathlib.Path(config["chroma_db_path"]).resolve())
+    surviving = [
+        identifier for identifier in SharedSystemClient._identifier_to_system
+        if resolved_path in str(identifier)
+    ]
+    assert not surviving, (
+        f"a System entry survived _stage_embed for {resolved_path}: {surviving}"
+    )
+
+
+def test_stage_embed_tristate_contract_preserved(tmp_path):
+    """Test F: _stage_embed's True/False/None contract is unchanged, and a
+    missing chroma_db_path is still never created (D-09)."""
+    from gui import scan  # noqa: PLC0415
+    from scripts import embed  # noqa: PLC0415
+
+    config = _make_embed_config(tmp_path)
+
+    # None: chroma_db_path does not exist on disk yet -- must not be created.
+    assert not pathlib.Path(config["chroma_db_path"]).exists()
+    assert scan._stage_embed(config, "seed-0") is None
+    assert not pathlib.Path(config["chroma_db_path"]).exists(), (
+        "_stage_embed must never create chroma_db_path (D-09 read-only contract)"
+    )
+
+    # Present key -> True; absent key -> False (once the store exists).
+    seed = _seeded_records(1, "seed")
+    with embed._collection_session(config) as collection:
+        collection.upsert(
+            ids=[r[0] for r in seed],
+            embeddings=[r[1] for r in seed],
+            metadatas=[r[2] for r in seed],
+            documents=[r[2]["title"] for r in seed],
+        )
+
+    assert scan._stage_embed(config, "seed-0") is True
+    assert scan._stage_embed(config, "absent-key") is False
