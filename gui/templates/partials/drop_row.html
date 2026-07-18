@@ -7,7 +7,7 @@
 <div class="drop-row" id="drop-row-{{ idx }}">
   <div class="drop-row-info">
     <span class="drop-row-name">{{ pdf.name }}</span>
-    <span class="stage-label">{{ pdf.size }} bytes</span>
+    <span class="stage-label">{{ pdf.size | format_file_size }}</span>
   </div>
   <form class="drop-row-form"
         hx-post="/processing/ingest"

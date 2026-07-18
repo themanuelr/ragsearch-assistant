@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from gui.chat_markdown import render_chat_markdown
+from gui.format import format_file_size
 
 _GUI_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -35,6 +36,9 @@ templates = Jinja2Templates(directory=str(_GUI_DIR / "templates"))
 # permitted to turn model-derived chat text into HTML -- see
 # gui/chat_markdown.py's module docstring for the full trust rationale.
 templates.env.filters["chat_markdown"] = render_chat_markdown
+# A plain display formatter, unlike the chokepoint above -- it handles no
+# untrusted content and emits no HTML, just a human-readable size string.
+templates.env.filters["format_file_size"] = format_file_size
 
 
 @app.middleware("http")
