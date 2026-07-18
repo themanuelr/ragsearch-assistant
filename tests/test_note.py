@@ -869,6 +869,115 @@ def test_generate_note_existing_contracts_intact(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Task 3 (08-17 gap closure): sticky-cache defect closed end to end at the
+# generate_note self-skip call site (T-08-GAP-40) -- pins the behavior at
+# the call site the gap is actually about, so a future refactor of HOW the
+# predicate is consumed (not just what it returns) cannot reintroduce
+# stickiness. Both tests drive the REAL _generate_analysis cascade (only
+# the low-level _ollama_extraction_call seam is stubbed, mirroring the
+# existing _mock_ollama_success / _mock_with_one_failure pattern used
+# above) so the analysis call count is a genuine signal, not a mock artifact.
+# ---------------------------------------------------------------------------
+
+def test_generate_note_failed_analysis_retries_on_next_run(tmp_path):
+    """THE sticky-cache regression this plan exists to close: a run in
+    which every one of the 7 analysis LLM calls fails both strikes (1)
+    completes, and the analysis it persists to cache reads as unpopulated
+    by _analysis_is_populated; (2) a second generate_note run against that
+    same persisted cache does NOT take the reuse branch -- it attempts
+    analysis again. Asserted on call count of the stubbed analysis seam,
+    not log text."""
+    from scripts.note import generate_note, _analysis_is_populated
+
+    pj = _make_paperjson()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    call_count = 0
+
+    def _mock_all_fail(prompt, system, schema, num_ctx=4096, timeout=120):
+        nonlocal call_count
+        call_count += 1
+        return "not valid json at all"  # both strikes fail, for every field
+
+    def _run_generate_note(paperjson):
+        with mock.patch("scripts.note._ollama_extraction_call", side_effect=_mock_all_fail), \
+             mock.patch("scripts.note._warmup_ollama"), \
+             mock.patch("scripts.note._canonicalize_tags", return_value=[]), \
+             mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+             mock.patch("scripts.note.preflight", return_value=True), \
+             mock.patch("scripts.note.note_exists", return_value=False), \
+             mock.patch("scripts.note.create_note", return_value="Created"):
+            generate_note(paperjson, config, force=False, paperjson_path=cache_path)
+
+    _run_generate_note(pj)
+
+    first_run_calls = call_count
+    assert first_run_calls > 0, "the analysis cascade must have run on a fresh cache"
+
+    with open(cache_path, encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert _analysis_is_populated(on_disk) is False, (
+        "an all-calls-failed run must persist a shape that reads as unpopulated"
+    )
+
+    # Second run: read the persisted cache back the way a real second
+    # invocation would (fresh dict, mirrors --paperjson resolution), then
+    # drive generate_note against it again with the same failing seam.
+    with open(cache_path, encoding="utf-8") as f:
+        pj_second_run = json.load(f)
+
+    _run_generate_note(pj_second_run)
+
+    second_run_calls = call_count - first_run_calls
+    assert second_run_calls > 0, (
+        "a second run against a failed-analysis cache must retry analysis, "
+        "not permanently self-skip (T-08-GAP-40 sticky-cache defect)"
+    )
+
+
+def test_generate_note_successful_analysis_still_self_skips_second_run(tmp_path):
+    """The complementary positive case (proves the fix corrected the
+    predicate without disabling the 08-13 cost win): a run where analysis
+    succeeds persists a populated analysis, and a second run against that
+    same cache DOES take the reuse branch with zero analysis calls."""
+    from scripts.note import generate_note
+
+    pj = _make_paperjson()
+    cache_path = _write_pj_cache(tmp_path, pj)
+    config = {"vault_path": "./.local/test-vault", "vault_name": "test-vault"}
+
+    def _mock_success(prompt, system, schema, num_ctx=4096, timeout=120):
+        return _mock_ollama_success(prompt, system, schema, num_ctx, timeout)
+
+    with mock.patch("scripts.note._ollama_extraction_call", side_effect=_mock_success), \
+         mock.patch("scripts.note._warmup_ollama"), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=["existing-topic"]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created"):
+
+        generate_note(pj, config, force=False, paperjson_path=cache_path)
+
+    with open(cache_path, encoding="utf-8") as f:
+        pj_second_run = json.load(f)
+
+    with mock.patch("scripts.note._ollama_extraction_call", side_effect=_mock_success) as mock_call, \
+         mock.patch("scripts.note._warmup_ollama"), \
+         mock.patch("scripts.note._canonicalize_tags", return_value=["existing-topic"]), \
+         mock.patch("scripts.note._render_note", return_value="# Test\n"), \
+         mock.patch("scripts.note.preflight", return_value=True), \
+         mock.patch("scripts.note.note_exists", return_value=False), \
+         mock.patch("scripts.note.create_note", return_value="Created") as mock_create:
+
+        generate_note(pj_second_run, config, force=False, paperjson_path=cache_path)
+
+    mock_call.assert_not_called()
+    mock_create.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Plan 03: Standalone note.py default cache resolution (D-07)
 # ---------------------------------------------------------------------------
 
