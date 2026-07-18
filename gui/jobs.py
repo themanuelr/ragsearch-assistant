@@ -188,6 +188,8 @@ def build_action_argv(action: str, config: dict, **params) -> list:
             argv += ["--stem", params["stem"]]
         if params.get("force"):
             argv.append("--force")
+        if params.get("force_analysis"):
+            argv.append("--force-analysis")
         return argv
 
     if action == "biblio":

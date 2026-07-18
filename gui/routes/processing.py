@@ -171,6 +171,8 @@ def processing_orchestrate(
     registry_key: str = Form(...),
     note_include: Optional[str] = Form(None),
     note_order: int = Form(1),
+    note_force: Optional[str] = Form(None),
+    note_force_analysis: Optional[str] = Form(None),
     biblio_include: Optional[str] = Form(None),
     biblio_order: int = Form(2),
     embed_include: Optional[str] = Form(None),
@@ -182,7 +184,18 @@ def processing_orchestrate(
     project paper (ROADMAP: "pick which scripts run on which paper, and in
     what order"). ``registry_key`` is looked up as an opaque registry dict
     key via ``scan_paper`` -- never a filesystem path. The strict FIFO queue
-    (D-06) guarantees the enqueued order is the execution order."""
+    (D-06) guarantees the enqueued order is the execution order.
+
+    ``note_force``/``note_force_analysis`` are the note row's only behavior
+    flags (see 08-19-PLAN.md flag_scope table -- the other three scripts take
+    no per-paper behavior flags). They exist because ``note.py``'s D-16
+    skip-by-default (note.py:798) made this route's own note action a no-op
+    against an already-noted paper -- there was no way to force regeneration
+    from the GUI at all (Round-2 UAT gap 3). Likewise, the analysis-reuse
+    self-skip (note.py:810, the 08-13 cost win) is only escapable via
+    ``--force-analysis``; without a route parameter for it, force-analysis
+    was equally unreachable from the GUI. An unticked checkbox submits no
+    form field at all, so ``None`` is the correct unticked representation."""
     config = load_gui_config()
 
     paper = scan_paper(config, registry_key)
@@ -207,7 +220,11 @@ def processing_orchestrate(
     job_list = []
     for name, _order in selected:
         action = _ORCHESTRATE_ACTIONS[name]
-        argv = gui_jobs.build_action_argv(action, config, stem=paper["stem"])
+        extra_params = {}
+        if name == "note":
+            extra_params["force"] = bool(note_force)
+            extra_params["force_analysis"] = bool(note_force_analysis)
+        argv = gui_jobs.build_action_argv(action, config, stem=paper["stem"], **extra_params)
         job_id = gui_jobs.enqueue(action, argv)
         job_list.append(gui_jobs.get(job_id))
 

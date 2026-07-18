@@ -351,6 +351,157 @@ def test_orchestrate_embed_argv_contains_paperjson_cache_path(gui_client, gui_co
     assert argv[-1] == expected_path
 
 
+# ---------------------------------------------------------------------------
+# 08-19 Gap 3 (UAT gap 3 / GUI-03/GUI-07): note force / force-analysis flags
+# reachable through POST /processing/orchestrate.
+# ---------------------------------------------------------------------------
+
+def test_orchestrate_note_force_flag_reaches_argv(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "note_include": "true", "note_order": "1",
+            "note_force": "true",
+        },
+    )
+
+    assert resp.status_code == 200
+    argv = captured["calls"][0]["argv"]
+    assert "--force" in argv
+    assert "--force-analysis" not in argv
+
+
+def test_orchestrate_note_force_analysis_flag_reaches_argv(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "note_include": "true", "note_order": "1",
+            "note_force_analysis": "true",
+        },
+    )
+
+    assert resp.status_code == 200
+    argv = captured["calls"][0]["argv"]
+    assert "--force-analysis" in argv
+    assert argv.count("--force") == 0
+
+
+def test_orchestrate_note_both_flags_reach_argv(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "note_include": "true", "note_order": "1",
+            "note_force": "true", "note_force_analysis": "true",
+        },
+    )
+
+    assert resp.status_code == 200
+    argv = captured["calls"][0]["argv"]
+    assert "--force" in argv
+    assert "--force-analysis" in argv
+
+
+def test_orchestrate_note_flags_absent_matches_todays_argv(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "note_include": "true", "note_order": "1",
+        },
+    )
+
+    assert resp.status_code == 200
+    argv = captured["calls"][0]["argv"]
+    assert "--force" not in argv
+    assert "--force-analysis" not in argv
+
+
+def test_orchestrate_note_flags_ignored_when_note_not_selected(gui_client, gui_config, monkeypatch):
+    """A crafted POST sending note flags while note is unselected must have
+    no effect (T-08-GAP-49) -- only the biblio job is enqueued, and nothing
+    about it carries a note-only flag."""
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "biblio_include": "true", "biblio_order": "1",
+            "note_force": "true", "note_force_analysis": "true",
+        },
+    )
+
+    assert resp.status_code == 200
+    calls = captured["calls"]
+    assert len(calls) == 1
+    assert calls[0]["action"] == "biblio"
+    assert "--force" not in calls[0]["argv"]
+    assert "--force-analysis" not in calls[0]["argv"]
+
+
+# ---------------------------------------------------------------------------
+# 08-19 Task 2: flag tickboxes rendered in the orchestration table, unticked
+# ---------------------------------------------------------------------------
+
+def test_processing_page_renders_note_flag_checkboxes_unticked(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    resp = gui_client.get("/processing")
+
+    assert resp.status_code == 200
+    assert 'name="note_force"' in resp.text
+    assert 'name="note_force_analysis"' in resp.text
+    # Neither checkbox carries `checked` -- unlike the include checkboxes,
+    # which are checked by default (processing.html:80/91/102/113).
+    import re
+    for field in ("note_force", "note_force_analysis"):
+        match = re.search(rf'<input[^>]*name="{field}"[^>]*>', resp.text)
+        assert match is not None, f"{field} checkbox not found"
+        assert "checked" not in match.group(0), f"{field} must default unticked"
+
+
+def test_processing_page_link_row_and_overview_topics_column_use_connected_wording(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+
+    resp = gui_client.get("/processing")
+    assert resp.status_code == 200
+    assert "Link — Link by Topics" in resp.text
+
+
 def test_processing_page_has_paper_select_and_script_rows(gui_client, gui_config, monkeypatch):
     gui_config["project_name"] = "proj-a"
     _patch_processing_config(monkeypatch, gui_config)

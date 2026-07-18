@@ -127,6 +127,39 @@ def test_build_action_argv_unknown_action_raises():
 
 
 # ---------------------------------------------------------------------------
+# 08-19 Gap 3 (UAT gap 3 / GUI-03/GUI-07): note branch force/force-analysis
+# flags. build_action_argv is the single argv-building chokepoint (T-08-02);
+# these tests pin its note-branch flag shape so a future edit here can't
+# quietly reintroduce always-skip or always-force behavior.
+# ---------------------------------------------------------------------------
+
+def test_build_action_argv_note_force_flag_appends_force():
+    argv = jobs.build_action_argv("note", {}, stem="my-stem", force=True)
+    assert "--force" in argv
+
+
+def test_build_action_argv_note_force_analysis_flag_appends_force_analysis():
+    argv = jobs.build_action_argv("note", {}, stem="my-stem", force_analysis=True)
+    assert "--force-analysis" in argv
+    assert "--force" not in argv
+
+
+def test_build_action_argv_note_both_flags_appends_both():
+    argv = jobs.build_action_argv("note", {}, stem="my-stem", force=True, force_analysis=True)
+    assert "--force" in argv
+    assert "--force-analysis" in argv
+
+
+def test_build_action_argv_note_no_flags_matches_todays_argv_exactly():
+    argv = jobs.build_action_argv("note", {}, stem="my-stem")
+    assert "--force" not in argv
+    assert "--force-analysis" not in argv
+    assert argv[0] == sys.executable
+    assert argv[1].endswith("note.py")
+    assert argv[2:] == ["--stem", "my-stem"]
+
+
+# ---------------------------------------------------------------------------
 # Task 1, Test 2/6: FIFO serial execution + queue position + is_busy()
 # ---------------------------------------------------------------------------
 
