@@ -213,3 +213,79 @@ def test_no_shared_module_level_converter_instance():
         assert not isinstance(value, _markdown_pkg.Markdown), (
             f"module-level shared Markdown instance found: {name}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test I: math pass (D-GAP2, GUI-09 gap 2, T-08-GAP-43/44/45) -- the exact
+# UAT repro was a reply containing $\text{Cl}^-$, $\text{Na}^+$, $\text{IO}$,
+# $\text{OO}$ (08-UAT.md Gap 2).
+# ---------------------------------------------------------------------------
+
+def test_charge_superscript_renders_sup_no_dollar_delimiters():
+    out = str(render_chat_markdown(r"the ion is $\text{Cl}^-$ in solution"))
+    assert "Cl<sup>-</sup>" in out
+    assert "$" not in out
+
+
+def test_second_charge_superscript_example_from_uat_repro():
+    out = str(render_chat_markdown(r"and $\text{Na}^+$ crosses the channel"))
+    assert "Na<sup>+</sup>" in out
+    assert "$" not in out
+
+
+def test_subscript_index_renders_sub_element():
+    out = str(render_chat_markdown(r"water is $\text{H}_2\text{O}$ here"))
+    assert "H<sub>2</sub>O" in out
+    assert "$" not in out
+
+
+def test_unmappable_span_degrades_to_delimiter_stripped_text():
+    # Exact UAT repro text: $\text{IO}$ and $\text{OO}$ have no caret/
+    # underscore for the mapper to act on -- they must render as their
+    # inner text with the dollar delimiters removed, never as raw
+    # dollar-delimited markup.
+    out = str(render_chat_markdown(r"channels labeled $\text{IO}$ and $\text{OO}$"))
+    assert "$" not in out
+    assert "IO" in out
+    assert "OO" in out
+
+
+def test_prose_without_dollar_sign_is_byte_identical_to_pre_math_pass_output():
+    # The math pass must be a true no-op on ordinary prose: same text run
+    # through the pre-existing escape+render steps produces the identical
+    # markup, dollar sign or no dollar sign.
+    text = "this is **bold** with *italic* and a list\n\n- one\n- two\n"
+    out = str(render_chat_markdown(text))
+    assert "<strong>bold</strong>" in out
+    assert "<em>italic</em>" in out
+    assert "<li>one</li>" in out
+    assert "$" not in out
+
+
+def test_currency_looking_single_dollar_does_not_swallow_surrounding_text():
+    # Only one $ in the whole message -- _MATH_SPAN requires a closing
+    # delimiter, so this must NOT be treated as a math span at all.
+    out = str(render_chat_markdown("It costs $5 for coffee and nothing else."))
+    assert "$5 for coffee and nothing else" in out
+    assert "<sup>" not in out
+    assert "<sub>" not in out
+
+
+def test_xss_construct_inside_math_span_stays_inert():
+    # The hostile-construct-inside-a-math-span case (T-08-GAP-43): the math
+    # pass must never open a path around the escape step. A script element
+    # placed inside a dollar-delimited span is already HTML-escaped before
+    # the math pass ever sees it, and the mapper has no pattern that could
+    # turn escaped text into a live element or attribute.
+    out = str(render_chat_markdown("before $<script>alert(1)</script>$ after"))
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+    assert "alert(1)" in out
+
+
+def test_math_span_placeholder_never_leaks_into_final_output():
+    # The placeholder round-trip must be fully consumed -- no MATHSPAN...
+    # token literal should ever survive into rendered output.
+    out = str(render_chat_markdown(r"$\text{Cl}^-$ and plain text"))
+    assert "MATHSPAN" not in out
+    assert "ENDSPAN" not in out
