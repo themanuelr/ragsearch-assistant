@@ -291,6 +291,104 @@ def test_ollama_unreachable_fails_fast(paperjson):
 
 
 # ---------------------------------------------------------------------------
+# T-08-GAP-40 / D-GAP5 (Round-2 gap closure, 08-17): _analysis_is_populated
+# must mean "analysis succeeded", not merely "analysis was attempted"
+# ---------------------------------------------------------------------------
+
+def _all_calls_failed_analysis():
+    """The exact shape ``_generate_analysis`` leaves behind when every one
+    of the 7 LLM calls fails both strikes: ``generated_by`` is still set
+    (it is written unconditionally), ``claims``/``limitations`` carry only
+    the D-14 sentinel, and every other field sits at its skeleton default.
+    This is the sticky-cache defect shape (T-08-GAP-40)."""
+    from scripts.note import _D14_FALLBACK_SENTINEL
+    return {
+        "generated_by": "gemma4:e4b",
+        "summary": None,
+        "claims": [_D14_FALLBACK_SENTINEL],
+        "methods_overview": None,
+        "results": None,
+        "limitations": [_D14_FALLBACK_SENTINEL],
+        "open_questions": [],
+        "topics": [],
+    }
+
+
+def test_analysis_is_populated_all_calls_failed_reads_unpopulated():
+    """THE regression this plan exists to close: a total-failure analysis
+    dict (generated_by set, both D-14 fallback lists carrying only the
+    sentinel, everything else empty) reads as NOT populated. Before this
+    fix, generated_by alone made this shape read as populated and
+    permanently tripped generate_note's self-skip (T-08-GAP-40)."""
+    from scripts.note import _analysis_is_populated
+
+    pj = _make_paperjson()
+    pj["analysis"] = _all_calls_failed_analysis()
+    assert _analysis_is_populated(pj) is False
+
+
+def test_analysis_is_populated_real_summary_only_reads_populated():
+    """A real summary, with every other field still in the all-failed
+    shape, is enough to read as populated (any(), not all())."""
+    from scripts.note import _analysis_is_populated
+
+    pj = _make_paperjson()
+    analysis = _all_calls_failed_analysis()
+    analysis["summary"] = "A genuine model-produced summary."
+    pj["analysis"] = analysis
+    assert _analysis_is_populated(pj) is True
+
+
+def test_analysis_is_populated_real_claims_only_reads_populated():
+    from scripts.note import _analysis_is_populated
+
+    pj = _make_paperjson()
+    analysis = _all_calls_failed_analysis()
+    analysis["claims"] = ["A genuine claim."]
+    pj["analysis"] = analysis
+    assert _analysis_is_populated(pj) is True
+
+
+def test_analysis_is_populated_real_topics_only_reads_populated():
+    from scripts.note import _analysis_is_populated
+
+    pj = _make_paperjson()
+    analysis = _all_calls_failed_analysis()
+    analysis["topics"] = ["a-real-topic"]
+    pj["analysis"] = analysis
+    assert _analysis_is_populated(pj) is True
+
+
+def test_analysis_is_populated_empty_skeleton_reads_unpopulated(skeleton):
+    """Back-compat contract, unchanged by the Round-2 fix: the exact empty
+    skeleton scripts/ingest.py writes at ingest time reads as unfilled."""
+    from scripts.note import _analysis_is_populated
+    assert _analysis_is_populated(skeleton) is False
+
+
+def test_analysis_is_populated_sentinel_mixed_with_genuine_claim_reads_populated():
+    """A claims list mixing the D-14 sentinel with one genuine claim reads
+    as populated -- only an ALL-sentinel list is falsy."""
+    from scripts.note import _analysis_is_populated, _D14_FALLBACK_SENTINEL
+
+    pj = _make_paperjson()
+    analysis = _all_calls_failed_analysis()
+    analysis["claims"] = [_D14_FALLBACK_SENTINEL, "A genuine claim."]
+    pj["analysis"] = analysis
+    assert _analysis_is_populated(pj) is True
+
+
+def test_analysis_is_populated_generated_by_alone_does_not_vote():
+    """generated_by carrying a model name with every substantive field
+    still empty must NOT read as populated -- generated_by never votes."""
+    from scripts.note import _analysis_is_populated
+
+    pj = _make_paperjson()
+    pj["analysis"]["generated_by"] = "gemma4:e4b"
+    assert _analysis_is_populated(pj) is False
+
+
+# ---------------------------------------------------------------------------
 # NOTE-02: Frontmatter YAML safety — colon in title round-trips (SC2)
 # ---------------------------------------------------------------------------
 

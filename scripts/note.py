@@ -75,6 +75,15 @@ _CTRL_TO_ESCAPE: dict[str, str] = {
     '\x0c': '\\f', # \frac (rare)
 }
 
+# D-14: single source of truth for the claims/limitations fallback sentinel.
+# _generate_analysis writes this when a field came back None/empty so D-14
+# callouts always have >= 1 entry; _analysis_is_populated (T-08-GAP-40, GAP5)
+# filters this exact string back out so an all-calls-failed run — which is
+# nothing but two one-element sentinel lists — reads as unfilled rather than
+# populated. Both sides MUST consume this one constant: a drifting duplicate
+# literal is exactly how the Round-2 UAT sticky-cache defect would return.
+_D14_FALLBACK_SENTINEL = "(generation failed -- see raw extract)"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -339,35 +348,51 @@ def _generate_analysis(paperjson: dict) -> None:
 
     # D-14: claims/limitations fallback — ensure at least one entry for callouts
     if not analysis.get("claims"):
-        analysis["claims"] = ["(generation failed -- see raw extract)"]
+        analysis["claims"] = [_D14_FALLBACK_SENTINEL]
     if not analysis.get("limitations"):
-        analysis["limitations"] = ["(generation failed -- see raw extract)"]
+        analysis["limitations"] = [_D14_FALLBACK_SENTINEL]
 
     analysis["generated_by"] = OLLAMA_MODEL
 
 
 # ---------------------------------------------------------------------------
-# Analysis-populated predicate (T-08-GAP-18..22) — the single definition
+# Analysis-populated predicate (T-08-GAP-18..22, T-08-GAP-40) — the single
+# definition
 # ---------------------------------------------------------------------------
 #
-# Analysis-namespace fields that indicate the PaperJSON's analysis has been
-# filled by the LLM cascade above (as opposed to the empty skeleton written
-# at ingest time — see scripts/ingest.py::_assemble_paperjson's `analysis`
-# dict). Ported verbatim from gui/scan.py's former `_ANALYSIS_POPULATED_KEYS`
-# (constant name kept so the move is traceable); gui/scan.py now imports
-# `_analysis_is_populated` from here instead of re-deriving this list.
+# Two roles, not one flat list (D-GAP5, Round-2 gap closure 2026-07-18):
+#
+# `generated_by` proves nothing about success. `_generate_analysis` sets it
+# unconditionally on every run, whether or not a single one of the 7 calls
+# actually returned a value — so a predicate that lets it vote can never
+# distinguish "the cascade was invoked" from "the cascade produced
+# anything". That conflation was the Round-2 UAT sticky-cache defect
+# (T-08-GAP-40): a run where every analysis LLM call times out still exits
+# with generated_by set plus two D-14 sentinel-only fallback lists,
+# persists that shape to cache, and permanently trips generate_note's
+# self-skip on every subsequent run. `generated_by` is kept in the
+# persisted analysis dict as provenance — it is just excluded from the vote.
+_ANALYSIS_PROVENANCE_ONLY_KEYS = (
+    "generated_by",
+)
+
+# Substantive keys: DO vote. Each is a genuine cascade output; ANY one of
+# them carrying real model output means analysis succeeded.
 #
 # `entities` and `connections` are excluded: neither is ever written by any
 # code path. Entity extraction and connection inference were deferred to
 # Phase 6 by 02-CONTEXT.md D-10; Phase 6 was rescoped to the topic graph and
 # never picked them up. Both fields were formally descoped by user decision
 # on 2026-07-18 during Phase 8 Round-2 gap closure (D-GAP4, 08-17-PLAN.md) —
-# `connections` was already absent from this key tuple before this change
-# (and is now also removed from the skeleton itself), `entities` is removed
-# from this key tuple by this change, and both removals now read as one
-# deliberate act rather than an inherited quirk.
+# `connections` was already absent from this key tuple before that change
+# (and is now also removed from the skeleton itself), `entities` was
+# removed from this key tuple by that change, and both removals now read
+# as one deliberate act rather than an inherited quirk.
+#
+# Ported (name kept for traceability) from gui/scan.py's former
+# `_ANALYSIS_POPULATED_KEYS`; gui/scan.py now imports `_analysis_is_populated`
+# from here instead of re-deriving this list.
 _ANALYSIS_POPULATED_KEYS = (
-    "generated_by",
     "summary",
     "claims",
     "methods_overview",
@@ -379,21 +404,55 @@ _ANALYSIS_POPULATED_KEYS = (
 
 
 def _analysis_is_populated(paperjson: dict) -> bool:
-    """True when ``paperjson["analysis"]`` has been filled by the LLM cascade.
+    """True when ``paperjson["analysis"]`` carries at least one genuine
+    LLM-filled field — i.e. analysis actually *succeeded*, not merely that
+    the cascade was *attempted* (T-08-GAP-40, D-GAP5).
 
     An empty analysis skeleton (every value falsy — the shape
     ``scripts/ingest.py::_assemble_paperjson`` writes at ingest time) means
     "not yet filled", NEVER "corrupt". This is the back-compat contract for
     the pre-existing cache files that predate cache persistence: they are
     treated as unfilled and simply fill + persist on their first
-    ``generate_note`` run, with no migration required.
+    ``generate_note`` run, with no migration required. This paragraph is
+    unchanged by the Round-2 fix below.
+
+    ``generated_by`` (see ``_ANALYSIS_PROVENANCE_ONLY_KEYS``) does NOT vote:
+    it is set unconditionally by ``_generate_analysis`` whether or not any
+    call succeeded, so counting it made this predicate mean "was the
+    cascade called at least once?" rather than "did it produce anything?" —
+    the Round-2 UAT gap. Only the substantive keys in
+    ``_ANALYSIS_POPULATED_KEYS`` vote.
+
+    A candidate value only counts as genuine after the D-14 fallback
+    sentinel (``_D14_FALLBACK_SENTINEL``) is filtered out: for a list value,
+    drop any element equal to the sentinel and test what remains; for a
+    scalar, reject a value equal to the sentinel. A claims/limitations list
+    whose only element is the sentinel is therefore falsy — precisely the
+    all-calls-failed shape this predicate must reject. A list mixing the
+    sentinel with one genuine element still reads as populated.
+
+    Uses ``any()`` over the substantive keys, not ``all()``: fields like
+    ``open_questions``/``topics`` can legitimately come back empty on a
+    healthy run, so requiring every field to be non-empty would force a
+    full 7-call re-run forever on perfectly good cached analysis — defeating
+    the 08-13 cost win from the opposite direction.
 
     Takes the full PaperJSON dict (not just the ``analysis`` namespace) so
     both call sites — ``generate_note``'s self-skip and gui/scan.py's
     PaperJSON Fill stage light — share one shape and one definition.
     """
     analysis = paperjson.get("analysis") or {}
-    return any(analysis.get(key) for key in _ANALYSIS_POPULATED_KEYS)
+
+    def _has_genuine_value(value: object) -> bool:
+        if isinstance(value, list):
+            return any(v != _D14_FALLBACK_SENTINEL for v in value)
+        if value == _D14_FALLBACK_SENTINEL:
+            return False
+        return bool(value)
+
+    return any(
+        _has_genuine_value(analysis.get(key)) for key in _ANALYSIS_POPULATED_KEYS
+    )
 
 
 # ---------------------------------------------------------------------------
