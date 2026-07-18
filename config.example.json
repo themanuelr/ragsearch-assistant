@@ -4,7 +4,6 @@
   "project_name": "my-project",
   "mineru_path": "",
   "mineru_timeout": 1800,
-  "obsidian_exe": "",
   "defuddle_path": "",
   "web_min_body_chars": 2000,
   "defuddle_timeout": 60,

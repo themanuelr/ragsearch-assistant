@@ -6,12 +6,16 @@ plain module attribute -- tests monkeypatch it to a ``tmp_path`` file so the
 suite never risks a real write at repo root (``tests/conftest.py``'s
 ``_guard_real_config_json`` session guard is the safety net).
 
-``FIELDS`` is the single source of truth for the typed form: all 24 keys from
-``config.example.json`` (the 22 documented keys plus the two Phase 8 adds,
+``FIELDS`` is the single source of truth for the typed form: all 23 keys from
+``config.example.json`` (the 21 documented keys plus the two Phase 8 adds,
 ``gui_port``/``uningested_dir``), each carrying its Python type, whether it is
 one of the six D-20 data-path keys, and any special label
-(``restart_required`` for ``gui_port``, ``legacy`` for ``obsidian_exe`` --
-confirmed dead config via ``grep -rn "obsidian_exe" scripts/`` at plan time).
+(``restart_required`` for ``gui_port``). The dead ``obsidian_exe`` key
+(a leftover from the retired obsidian-cli subprocess integration -- vault
+writes have been direct atomic file I/O since 02-06) was removed in round-2
+gap closure (08-20, GUI-07). ``legacy`` is kept as a field flag with zero
+current users -- infrastructure for the next config key that outlives its
+own usefulness, not dead code to prune.
 
 Save flow (POST /settings):
   1. Coerce each submitted value against its FIELDS type. A coercion failure
@@ -53,7 +57,7 @@ _DATA_PATH_KEYS = (
     "uningested_dir",
 )
 
-# All 24 keys config.json accepts (22 documented in config.example.json plus
+# All 23 keys config.json accepts (21 documented in config.example.json plus
 # the two Phase 8 adds, gui_port/uningested_dir), each with its render type,
 # D-20 flag, description, and any special label.
 FIELDS = [
@@ -81,11 +85,6 @@ FIELDS = [
         "key": "mineru_timeout", "type": "int", "is_data_path": False,
         "label": "MinerU Timeout (seconds)", "restart_required": False, "legacy": False,
         "description": "Max seconds to wait for MinerU PDF structure extraction.",
-    },
-    {
-        "key": "obsidian_exe", "type": "str", "is_data_path": False,
-        "label": "Obsidian Executable", "restart_required": False, "legacy": True,
-        "description": "legacy — unused by any script (vault writes are direct atomic file I/O, not a subprocess to Obsidian).",
     },
     {
         "key": "defuddle_path", "type": "str", "is_data_path": False,
@@ -283,7 +282,6 @@ def settings_save(
     project_name: str = Form(""),
     mineru_path: str = Form(""),
     mineru_timeout: str = Form(""),
-    obsidian_exe: str = Form(""),
     defuddle_path: str = Form(""),
     web_min_body_chars: str = Form(""),
     defuddle_timeout: str = Form(""),
@@ -310,7 +308,6 @@ def settings_save(
         "project_name": project_name,
         "mineru_path": mineru_path,
         "mineru_timeout": mineru_timeout,
-        "obsidian_exe": obsidian_exe,
         "defuddle_path": defuddle_path,
         "web_min_body_chars": web_min_body_chars,
         "defuddle_timeout": defuddle_timeout,

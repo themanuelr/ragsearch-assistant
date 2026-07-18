@@ -93,9 +93,6 @@ keys, grouped by area:
 - `defuddle_timeout` — defuddle subprocess timeout in seconds (default: `60`)
 - `web_min_body_chars` — minimum extracted body length to accept a web page as valid (default: `2000`)
 
-**Obsidian**
-- `obsidian_exe` — path to the Obsidian desktop executable (optional — for opening notes; vault writes do not go through Obsidian)
-
 **Embeddings / search**
 - `chroma_db_path` — path to this project's local ChromaDB store (default: `./chroma_db`)
 - `embed_model` — Ollama embedding model (default: `nomic-embed-text`)
