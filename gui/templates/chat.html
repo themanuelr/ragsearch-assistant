@@ -83,6 +83,30 @@
                     required></textarea>
           <button type="submit" class="btn">Send</button>
         </form>
+        <script>
+          (function () {
+            // Gap 1 (08-18 Task 2, T-08-GAP-46): clear the composer after a
+            // successful send so the sent question doesn't sit in the box
+            // while its answer streams in beneath it. Bound to
+            // htmx:afterRequest on #chat-send-form itself -- that form is
+            // NOT inside #chat-messages (the swap target), so this handler
+            // survives every post-turn swap of that container without
+            // needing to be re-attached. Gated on event.detail.successful
+            // so a failed send (e.g. Ollama down) never destroys the
+            // user's typed question. Only the textarea is reset; the model
+            // select, scope radios, and vault-picker selection are left
+            // untouched so a follow-up question keeps the same retrieval
+            // context.
+            var form = document.getElementById("chat-send-form");
+            var textarea = form ? form.querySelector("textarea.chat-input") : null;
+            if (!form || !textarea) return;
+            form.addEventListener("htmx:afterRequest", function (evt) {
+              if (evt.detail && evt.detail.successful) {
+                textarea.value = "";
+              }
+            });
+          })();
+        </script>
       {% endif %}
     </div>
   </div>
