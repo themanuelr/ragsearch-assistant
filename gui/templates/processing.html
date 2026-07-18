@@ -73,6 +73,7 @@
             <th>Run</th>
             <th>Script</th>
             <th>Order</th>
+            <th>Options</th>
           </tr>
         </thead>
         <tbody>
@@ -86,6 +87,17 @@
                 {% endfor %}
               </select>
             </td>
+            <td>
+              <label class="settings-hint">
+                <input type="checkbox" name="note_force" value="true">
+                Force (overwrite an existing note instead of skipping it)
+              </label>
+              <br>
+              <label class="settings-hint">
+                <input type="checkbox" name="note_force_analysis" value="true">
+                Force analysis (re-run all 7 analysis LLM calls — slow, ~2 minutes vs. seconds when reused)
+              </label>
+            </td>
           </tr>
           <tr>
             <td><input type="checkbox" name="biblio_include" value="true" checked></td>
@@ -97,6 +109,7 @@
                 {% endfor %}
               </select>
             </td>
+            <td></td>
           </tr>
           <tr>
             <td><input type="checkbox" name="embed_include" value="true" checked></td>
@@ -108,10 +121,11 @@
                 {% endfor %}
               </select>
             </td>
+            <td></td>
           </tr>
           <tr>
             <td><input type="checkbox" name="link_include" value="true" checked></td>
-            <td>Link</td>
+            <td>Link — Link by Topics</td>
             <td>
               <select name="link_order">
                 {% for n in range(1, 5) %}
@@ -119,6 +133,7 @@
                 {% endfor %}
               </select>
             </td>
+            <td></td>
           </tr>
         </tbody>
       </table>
