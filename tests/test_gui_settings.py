@@ -16,7 +16,7 @@ from gui.routes import settings
 
 
 def _config_dict(gui_config, **overrides):
-    """Full 24-key config dict: config.example.json defaults, tmp-scoped
+    """Full 23-key config dict: config.example.json defaults, tmp-scoped
     gui_config paths, plus test-specific overrides -- mirrors what a real
     <form> submission carries (every field, not just the one being changed)."""
     values = json.loads(settings._EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -50,8 +50,8 @@ def _patch_config_path(monkeypatch, tmp_path):
 # FIELDS table shape (acceptance criteria)
 # ---------------------------------------------------------------------------
 
-def test_fields_table_has_24_entries_and_six_datapaths():
-    assert len(settings.FIELDS) == 24
+def test_fields_table_has_23_entries_and_six_datapaths():
+    assert len(settings.FIELDS) == 23
     datapath_keys = {f["key"] for f in settings.FIELDS if f["is_data_path"]}
     assert datapath_keys == {
         "registry_path", "vault_path", "chroma_db_path",
@@ -66,7 +66,7 @@ def test_save_writes_via_tmp_file_and_os_replace():
 
 
 # ---------------------------------------------------------------------------
-# Test 1: GET /settings renders 24 typed fields
+# Test 1: GET /settings renders 23 typed fields
 # ---------------------------------------------------------------------------
 
 def test_get_settings_renders_typed_inputs(gui_client):
@@ -78,8 +78,32 @@ def test_get_settings_renders_typed_inputs(gui_client):
     assert 'type="checkbox"' in resp.text
     assert "requires GUI restart" in resp.text
     assert "gui_port" in resp.text
-    assert "legacy" in resp.text
-    assert "obsidian_exe" in resp.text
+
+
+def test_get_settings_has_no_dead_obsidian_exe_field(gui_client):
+    """obsidian_exe was removed as dead config (round-2 gap closure,
+    GUI-07) -- the field must no longer be rendered as an editable
+    Settings input."""
+    resp = gui_client.get("/settings")
+    assert resp.status_code == 200
+    assert 'name="obsidian_exe"' not in resp.text
+    assert "obsidian_exe" not in resp.text
+
+
+def test_legacy_config_still_carrying_obsidian_exe_loads_and_renders(gui_client, gui_config):
+    """T-08-GAP-51 back-compat case: an existing clone's on-disk config.json
+    still carries the removed obsidian_exe key after upgrade. The GUI must
+    ignore the extra key, not reject it -- both _load_config (plain
+    json.load, no schema validation) and this route's dict-merge loader
+    tolerate unknown keys."""
+    base = _config_dict(gui_config, obsidian_exe="/some/old/path/to/Obsidian.exe")
+    settings.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    settings.CONFIG_PATH.write_text(json.dumps(base), encoding="utf-8")
+
+    resp = gui_client.get("/settings")
+
+    assert resp.status_code == 200
+    assert 'name="obsidian_exe"' not in resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -308,7 +308,6 @@ def test_config_example_matches_write_config_keys(tmp_path):
         "project_name": "test-project",
         "mineru_path": "",
         "mineru_timeout": 1800,
-        "obsidian_exe": "",
         "defuddle_path": "",
         "web_min_body_chars": 2000,
         "defuddle_timeout": 60,
