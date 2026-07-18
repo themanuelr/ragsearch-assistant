@@ -356,7 +356,16 @@ def _generate_analysis(paperjson: dict) -> None:
 # dict). Ported verbatim from gui/scan.py's former `_ANALYSIS_POPULATED_KEYS`
 # (constant name kept so the move is traceable); gui/scan.py now imports
 # `_analysis_is_populated` from here instead of re-deriving this list.
-# `connections` is deliberately excluded, matching the original.
+#
+# `entities` and `connections` are excluded: neither is ever written by any
+# code path. Entity extraction and connection inference were deferred to
+# Phase 6 by 02-CONTEXT.md D-10; Phase 6 was rescoped to the topic graph and
+# never picked them up. Both fields were formally descoped by user decision
+# on 2026-07-18 during Phase 8 Round-2 gap closure (D-GAP4, 08-17-PLAN.md) —
+# `connections` was already absent from this key tuple before this change
+# (and is now also removed from the skeleton itself), `entities` is removed
+# from this key tuple by this change, and both removals now read as one
+# deliberate act rather than an inherited quirk.
 _ANALYSIS_POPULATED_KEYS = (
     "generated_by",
     "summary",
@@ -365,7 +374,6 @@ _ANALYSIS_POPULATED_KEYS = (
     "results",
     "limitations",
     "open_questions",
-    "entities",
     "topics",
 )
 

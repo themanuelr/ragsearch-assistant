@@ -118,12 +118,49 @@ def test_analysis_skeleton(paper_json):
         "methods_overview",
         "limitations",
         "open_questions",
-        "entities",
         "topics",
-        "connections",
     ]
     for field in required_fields:
         assert field in analysis, f"Expected field '{field}' in analysis skeleton"
+
+
+def test_analysis_skeleton_excludes_descoped_fields(paper_json):
+    """D-GAP4 (2026-07-18): `entities` and `connections` are never written by
+    any code path and must not appear in the assembled skeleton."""
+    analysis = paper_json["analysis"]
+    assert "entities" not in analysis, (
+        "'entities' was formally descoped by D-GAP4 and must not be in the skeleton"
+    )
+    assert "connections" not in analysis, (
+        "'connections' was formally descoped by D-GAP4 and must not be in the skeleton"
+    )
+
+
+def test_legacy_cache_dict_with_descoped_keys_loads_without_error():
+    """Back-compat (read direction): a pre-existing cache dict that still
+    carries the descoped `entities`/`connections` keys must be processed
+    without error -- extra keys are ignored, never rejected."""
+    from scripts.note import _analysis_is_populated
+
+    legacy_paperjson = {
+        "extraction": {"metadata": {}, "sections": [], "references": []},
+        "analysis": {
+            "generated_by": None,
+            "summary": None,
+            "claims": [],
+            "methods_overview": None,
+            "results": None,
+            "limitations": [],
+            "open_questions": [],
+            "entities": [],
+            "topics": [],
+            "connections": {"builds_on": [], "contradicts": [], "same_domain": []},
+        },
+        "provenance": {},
+    }
+    # Must not raise, and the presence of the legacy keys must not itself
+    # make an otherwise-empty analysis read as populated.
+    assert _analysis_is_populated(legacy_paperjson) is False
 
 
 def test_extraction_namespace_keys(paper_json):

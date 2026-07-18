@@ -1829,7 +1829,17 @@ def _assemble_paperjson(parsed: dict, provenance: dict) -> dict:
         "references": parsed.get("references", []),
     }
 
-    # D-22: analysis namespace as empty skeleton; Phase 2 fills
+    # D-22: analysis namespace as empty skeleton; Phase 2 fills the 7
+    # cascade fields below (summary through topics) plus generated_by.
+    #
+    # Two additional fields — `entities` and `connections` — originally
+    # appeared here but were never wired to any LLM call. Entity extraction
+    # and connection inference were deferred to Phase 6 by 02-CONTEXT.md
+    # D-10; Phase 6 was rescoped to the topic graph and never picked them
+    # up. Both fields were formally descoped by user decision on 2026-07-18
+    # during Phase 8 Round-2 gap closure (D-GAP4, 08-17-PLAN.md). Do not
+    # re-add them speculatively — if entity extraction is wanted later it
+    # gets its own feature planning.
     analysis = {
         "generated_by": None,
         "summary": None,
@@ -1838,13 +1848,7 @@ def _assemble_paperjson(parsed: dict, provenance: dict) -> dict:
         "results": None,  # D-09: Phase 2 fills Results section
         "limitations": [],
         "open_questions": [],
-        "entities": [],
         "topics": [],
-        "connections": {
-            "builds_on": [],
-            "contradicts": [],
-            "same_domain": [],
-        },
     }
 
     return {
