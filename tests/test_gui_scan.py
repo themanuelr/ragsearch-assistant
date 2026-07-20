@@ -596,9 +596,16 @@ def test_overview_project_row_toggle_wiring_matches_detail_cell_and_url(
     resp = gui_client.get("/overview/project")
 
     assert resp.status_code == 200
-    # No declarative one-way fill left on the row.
-    assert "hx-get=" not in resp.text
-    assert "hx-target=" not in resp.text
+    # No declarative one-way fill left on the ROW itself -- scoped to each
+    # <tr class="paper-row" ...> opening tag (not the whole page) since
+    # Phase 08.1 Plan 01 (D-01..D-05) legitimately added page-level hx-get/
+    # hx-target search+pagination controls (the shared picker) elsewhere on
+    # this same page; the row's own toggle mechanism must still be pure JS.
+    row_tags = re.findall(r'<tr class="paper-row"[^>]*>', resp.text)
+    assert len(row_tags) == 2
+    for row_tag in row_tags:
+        assert "hx-get=" not in row_tag
+        assert "hx-target=" not in row_tag
     # Row carries the click handler.
     assert 'onclick="paperRowToggle(this)"' in resp.text
     # Each row's detail-cell data attribute matches its sibling detail cell's
