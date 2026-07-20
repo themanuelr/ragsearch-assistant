@@ -489,6 +489,7 @@ def _sse_stream(conv_id: str, model: str):
         llm_messages = pending["llm_messages"]
         sources = pending["sources"]
         truncation_notes = pending["truncation_notes"]
+        chroma_query = pending.get("chroma_query")
     else:
         # Defensive fallback (e.g. a stream reopened without a fresh send):
         # no retrieval context, just the raw transcript.
@@ -497,6 +498,7 @@ def _sse_stream(conv_id: str, model: str):
         ]
         sources = None
         truncation_notes = None
+        chroma_query = None
 
     # Gap A (08-14, T-08-GAP-23): the append below MUST run on every exit
     # path -- normal completion, an inline error frame, an unhandled
@@ -573,6 +575,10 @@ def _sse_stream(conv_id: str, model: str):
             # Knowing which model failed is exactly the diagnostic value
             # the UAT lost when the model was only tracked per-conversation.
             assistant_msg["model"] = model
+            # D-12 (08.1-03): recorded unconditionally, like "model" above --
+            # a new top-level key, NOT folded into `sources` (a list of
+            # per-excerpt dicts). None/absent for every non-chroma turn.
+            assistant_msg["chroma_query"] = chroma_query if chroma_query else None
             if sources:
                 assistant_msg["sources"] = sources
             if truncation_notes:

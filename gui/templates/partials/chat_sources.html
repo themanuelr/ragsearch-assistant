@@ -5,6 +5,13 @@
    answer renders this block. #}
 <details class="chat-sources">
   <summary>Sources ({{ m.sources | length }})</summary>
+  {# D-12 (08.1-03): the recorded ChromaDB retrieval query, when present,
+     so the Sources block stays interpretable later. Autoescaped by Jinja
+     (never |safe) -- m.chroma_query is untrusted user input rendered
+     verbatim (T-08.1-03-02). #}
+  {% if m.chroma_query %}
+    <p class="chat-sources-query">Retrieved for: {{ m.chroma_query }}</p>
+  {% endif %}
   <ul class="chat-sources-list">
     {% for src in m.sources %}
       <li class="chat-source-row">
