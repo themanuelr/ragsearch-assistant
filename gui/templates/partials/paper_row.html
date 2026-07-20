@@ -10,7 +10,7 @@
   <ul class="stage-checklist">
     <li>{{ macros.stage_glyph(paper.stages.mineru) }} <span class="stage-label">MinerU</span></li>
     <li>{{ macros.stage_glyph(paper.stages.registry) }} <span class="stage-label">Registry</span></li>
-    <li>{{ macros.stage_glyph(paper.stages.paperjson_fill) }} <span class="stage-label">PaperJSON Fill</span></li>
+    <li>{{ macros.stage_glyph(paper.stages.paperjson_fill) }} <span class="stage-label">Analysis Filled</span></li>
     <li>{{ macros.stage_glyph(paper.stages.note) }} <span class="stage-label">Note</span></li>
     <li>{{ macros.stage_glyph(paper.stages.biblio) }} <span class="stage-label">Biblio</span></li>
     <li>{{ macros.stage_glyph(paper.stages.embed) }} <span class="stage-label">Embed</span></li>
@@ -69,7 +69,7 @@
     <form class="rerun-form" hx-post="/jobs/enqueue" hx-target="#rerun-status-link-{{ safe_key }}" hx-swap="innerHTML">
       <input type="hidden" name="action" value="link_paper">
       <input type="hidden" name="stem" value="{{ paper.stem }}">
-      <button type="submit" class="btn">Re-run Link</button>
+      <button type="submit" class="btn">Re-run Link — Link by Topics</button>
     </form>
     <div id="rerun-status-link-{{ safe_key }}"></div>
     {% else %}
