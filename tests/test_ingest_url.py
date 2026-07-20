@@ -383,3 +383,113 @@ def test_quality_gate_web_message():
     assert "possible scanned/garbage PDF" in pdf_msg, (
         f"PDF-path gate message must mention 'possible scanned/garbage PDF': {pdf_msg!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 08.1 Plan 05 Task 1 (RED): paywall vs. network defuddle classifier
+# (D-19). ing._classify_defuddle_failure does not exist yet -- referenced via
+# the module attribute (`ing._classify_defuddle_failure`) inside each test
+# body so collection succeeds before Task 2 lands.
+# ---------------------------------------------------------------------------
+
+def test_classify_defuddle_failure_paywall_on_4xx():
+    """A 4xx status present in stderr classifies as 'paywall' (401/403)."""
+    assert ing._classify_defuddle_failure("Error: Failed to fetch: 403 Forbidden") == "paywall"
+    assert ing._classify_defuddle_failure("Error: Failed to fetch: 401 Unauthorized") == "paywall"
+
+
+def test_classify_defuddle_failure_network_on_fetch_failed():
+    """A status-free 'fetch failed' (DNS/connection-shaped) classifies as 'network'."""
+    assert ing._classify_defuddle_failure("TypeError: fetch failed") == "network"
+
+
+def test_classify_defuddle_failure_network_on_timeout_text():
+    """A status-free timeout message classifies as 'network'."""
+    assert ing._classify_defuddle_failure("Error: Timed out fetching page after 10s") == "network"
+
+
+def test_classify_defuddle_failure_network_on_5xx():
+    """A non-4xx status (server error, no bot-block signal) still classifies as 'network'."""
+    assert ing._classify_defuddle_failure("Error: Failed to fetch: 503 Service Unavailable") == "network"
+
+
+def test_run_defuddle_classifies_403_as_paywall_message(monkeypatch):
+    """_run_defuddle raises a paywall/bot-block-worded RuntimeError when stderr carries
+    a 4xx status (D-19 wiring inside _run_defuddle itself)."""
+    class _FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: Failed to fetch: 403 Forbidden"
+
+    # Note: the URL deliberately avoids embedding "paywall"/"unreachable"/"network"
+    # substrings itself -- those words would leak into the raised message via the
+    # existing f"...: {url} ..." interpolation and produce a false-positive match
+    # regardless of whether the classifier is actually wired in.
+    monkeypatch.setattr(ing.subprocess, "run", lambda *a, **kw: _FakeResult())
+    with pytest.raises(RuntimeError) as excinfo:
+        ing._run_defuddle("https://onlinelibrary.example.com/doi/full/10.1111/x", "defuddle", timeout=5)
+    msg = str(excinfo.value).lower()
+    assert "paywall" in msg or "bot-block" in msg or "bot blocked" in msg, (
+        f"Expected a paywall/bot-block phrase in the raised message, got: {excinfo.value!r}"
+    )
+
+
+def test_run_defuddle_classifies_fetch_failed_as_network_message(monkeypatch):
+    """_run_defuddle raises a network-unreachable-worded RuntimeError when stderr carries
+    no status code (DNS/connection-shaped failure)."""
+    class _FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "TypeError: fetch failed"
+
+    # Note: the URL deliberately avoids embedding "network"/"unreachable" substrings
+    # itself, for the same false-positive-via-interpolation reason as above.
+    monkeypatch.setattr(ing.subprocess, "run", lambda *a, **kw: _FakeResult())
+    with pytest.raises(RuntimeError) as excinfo:
+        ing._run_defuddle("https://dead-host.example.invalid/article", "defuddle", timeout=5)
+    msg = str(excinfo.value).lower()
+    assert "network" in msg and "unreachable" in msg, (
+        f"Expected a network-unreachable phrase in the raised message, got: {excinfo.value!r}"
+    )
+
+
+def test_ingest_url_paywall_vs_network_messages_distinct(monkeypatch, capsys):
+    """ingest_url prints two textually DISTINCT [ingest error: ...] messages for a
+    paywall-shaped vs a network-shaped RuntimeError raised by _run_defuddle -- the
+    existing `except RuntimeError as e: print(f"[ingest error: {e}]", ...)` handler
+    needs no structural change, only the underlying message text differs (D-19)."""
+    monkeypatch.setattr(ing, "_resolve_defuddle", lambda config: "defuddle")
+
+    cfg = {
+        "web_min_body_chars": 2000,
+        "registry_path": "",
+        "project_name": "t",
+        "defuddle_timeout": 60,
+    }
+
+    def _raise_paywall(url, exe, timeout=60):
+        raise RuntimeError(
+            "web extraction failed — looks paywalled or bot-blocked, try the PDF or "
+            "arXiv version: https://example.com (defuddle exit 1: Failed to fetch: 403 Forbidden)"
+        )
+
+    monkeypatch.setattr(ing, "_run_defuddle", _raise_paywall)
+    with pytest.raises(SystemExit):
+        ing.ingest_url("https://www.example.com/paywalled", cfg)
+    paywall_err = capsys.readouterr().err
+
+    def _raise_network(url, exe, timeout=60):
+        raise RuntimeError(
+            "web extraction failed — network unreachable, could not reach the site: "
+            "https://unreachable.example.com (defuddle exit 1: TypeError: fetch failed)"
+        )
+
+    monkeypatch.setattr(ing, "_run_defuddle", _raise_network)
+    with pytest.raises(SystemExit):
+        ing.ingest_url("https://unreachable.example.com", cfg)
+    network_err = capsys.readouterr().err
+
+    assert paywall_err != network_err, "Expected the two ingest_url error messages to be textually distinct"
+    assert "[ingest error:" in paywall_err and "[ingest error:" in network_err
+    assert "paywall" in paywall_err.lower() or "bot-block" in paywall_err.lower()
+    assert "network unreachable" in network_err.lower()

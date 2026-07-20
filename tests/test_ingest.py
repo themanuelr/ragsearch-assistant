@@ -6878,3 +6878,182 @@ def test_absent_dir_keys_fall_back_to_legacy_defaults(tmp_path):
     assert mock_run.call_args.args[1] == str(pathlib.Path(".mineru_output") / fake_pdf.stem), (
         f"Expected legacy .mineru_output base when mineru_output_dir absent, got {mock_run.call_args.args[1]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 08.1 Plan 05 Task 1 (RED): --backfill-metadata self-heal contract
+# (D-17, D-18). _run_metadata_backfill does not exist yet -- imported LOCALLY
+# inside each test body (mirrors tests/test_retag.py's own not-yet-existing-
+# symbol precedent) so collection succeeds before Task 3 lands.
+# ---------------------------------------------------------------------------
+
+def _write_backfill_note(vault_path, title, doi, authors=None, year=None, journal=None):
+    """Seed a Papers/ note with DOI-bearing frontmatter, optionally missing year/journal."""
+    from scripts.note import _sanitize_filename  # noqa: PLC0415
+
+    filename = _sanitize_filename(title)
+    lines = ["---", f'title: "{title}"']
+    if authors:
+        lines.append("authors:")
+        for a in authors:
+            lines.append(f'  - "{a}"')
+    if year is not None:
+        lines.append(f"year: {year}")
+    if journal:
+        lines.append(f'journal: "{journal}"')
+    lines.append(f'doi: "{doi}"')
+    lines.append("status: ingested")
+    lines.append("date_ingested: 2026-07-01")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append("## My Notes")
+    lines.append("")
+    note_path = pathlib.Path(vault_path) / "Papers" / f"{filename}.md"
+    note_path.write_text("\n".join(lines), encoding="utf-8")
+    return filename
+
+
+def test_backfill_fills_missing_year_journal_preserves_full_entry(tmp_path):
+    """_run_metadata_backfill fills missing year/journal AND preserves the rest of
+    the registry entry byte-for-value intact (Pitfall 5 -- the highest-value
+    assertion: a partial-dict _write_registry call would null title/authors/doi/
+    summary for this key)."""
+    from scripts.ingest import _run_metadata_backfill, _write_registry, _read_registry
+
+    vault = tmp_path / "vault"
+    (vault / "Papers").mkdir(parents=True)
+    cfg = _make_ingest_config(tmp_path, extra={
+        "vault_path": str(vault),
+        "crossref_validate": True,
+        "crossref_contact_email": "t@e.com",
+    })
+
+    entry = {
+        "title": "Backfill Paper One",
+        "authors": ["Smith, J."],
+        "year": None,
+        "journal": None,
+        "doi": "10.1016/backfill.one",
+        "arxiv_id": None,
+        "projects": ["test-project"],
+        "source_path": "/data/backfill1.pdf",
+        "paperjson_path": "/data/backfill1.json",
+        "summary": "An existing summary.",
+        "key_findings": ["finding one"],
+    }
+    _write_registry(dict(entry), cfg["registry_path"], "10.1016/backfill.one")
+    _write_backfill_note(vault, "Backfill Paper One", "10.1016/backfill.one", authors=["Smith, J."])
+
+    with mock.patch("scripts.ingest._crossref_journal_full", return_value="Trends in Chemistry"), \
+         mock.patch("scripts.ingest._crossref_published_year", return_value=2021):
+        result = _run_metadata_backfill(cfg)
+
+    assert result["updated"] == 1, f"Expected exactly 1 updated entry, got {result}"
+
+    registry = _read_registry(cfg["registry_path"])
+    updated_entry = registry["10.1016/backfill.one"]
+    assert updated_entry["year"] == 2021
+    assert updated_entry["journal"] == "Trends in Chemistry"
+    # Pitfall 5 -- full-entry preservation (never a partial-dict write)
+    assert updated_entry["title"] == "Backfill Paper One"
+    assert updated_entry["authors"] == ["Smith, J."]
+    assert updated_entry["doi"] == "10.1016/backfill.one"
+    assert updated_entry["summary"] == "An existing summary."
+    assert updated_entry["key_findings"] == ["finding one"]
+    assert updated_entry["projects"] == ["test-project"]
+
+
+def test_backfill_patches_note_frontmatter(tmp_path):
+    """_run_metadata_backfill patches the matching vault note frontmatter with the
+    same year/journal via create_note(overwrite=True) (Pitfall 6 -- both stores)."""
+    from scripts.ingest import _run_metadata_backfill, _write_registry
+
+    vault = tmp_path / "vault"
+    (vault / "Papers").mkdir(parents=True)
+    cfg = _make_ingest_config(tmp_path, extra={
+        "vault_path": str(vault),
+        "crossref_validate": True,
+        "crossref_contact_email": "t@e.com",
+    })
+
+    entry = {
+        "title": "Backfill Paper Two",
+        "authors": ["Doe, A."],
+        "year": None,
+        "journal": None,
+        "doi": "10.1016/backfill.two",
+        "arxiv_id": None,
+        "projects": ["test-project"],
+        "source_path": "/data/backfill2.pdf",
+        "paperjson_path": "/data/backfill2.json",
+        "summary": None,
+        "key_findings": None,
+    }
+    _write_registry(dict(entry), cfg["registry_path"], "10.1016/backfill.two")
+    _write_backfill_note(vault, "Backfill Paper Two", "10.1016/backfill.two", authors=["Doe, A."])
+
+    with mock.patch("scripts.ingest._crossref_journal_full", return_value="Journal of Testing"), \
+         mock.patch("scripts.ingest._crossref_published_year", return_value=2019):
+        _run_metadata_backfill(cfg)
+
+    note_content = (vault / "Papers" / "Backfill Paper Two.md").read_text(encoding="utf-8")
+    assert "year: 2019" in note_content, f"Expected patched year in note frontmatter, got:\n{note_content}"
+    assert 'journal: "Journal of Testing"' in note_content, (
+        f"Expected patched journal in note frontmatter, got:\n{note_content}"
+    )
+
+
+def test_backfill_noop_when_crossref_validate_false(tmp_path):
+    """crossref_validate=false (or absent) -> backfill is a no-op, zero Crossref calls
+    (D-18 offline-by-default preserved)."""
+    from scripts.ingest import _run_metadata_backfill, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={"vault_path": str(tmp_path / "vault")})
+    assert "crossref_validate" not in cfg, "Fixture must not set crossref_validate for this test"
+
+    entry = {
+        "title": "Backfill Paper Three", "authors": None, "year": None, "journal": None,
+        "doi": "10.1016/backfill.three", "arxiv_id": None, "projects": ["test-project"],
+        "source_path": "", "paperjson_path": "", "summary": None, "key_findings": None,
+    }
+    _write_registry(dict(entry), cfg["registry_path"], "10.1016/backfill.three")
+
+    with mock.patch("scripts.ingest._crossref_journal_full",
+                     side_effect=AssertionError("crossref called when flag off")), \
+         mock.patch("scripts.ingest._crossref_published_year",
+                     side_effect=AssertionError("crossref called when flag off")):
+        result = _run_metadata_backfill(cfg)
+
+    assert result["checked"] == 0
+    assert result["updated"] == 0
+    assert isinstance(result.get("note"), str) and result["note"], (
+        f"Expected a human-readable no-op note in the result, got {result}"
+    )
+
+
+def test_backfill_skips_entry_already_complete(tmp_path):
+    """An entry that already has both year and journal makes zero Crossref calls for it."""
+    from scripts.ingest import _run_metadata_backfill, _write_registry
+
+    cfg = _make_ingest_config(tmp_path, extra={
+        "vault_path": str(tmp_path / "vault"),
+        "crossref_validate": True,
+        "crossref_contact_email": "t@e.com",
+    })
+
+    entry = {
+        "title": "Backfill Paper Four", "authors": None, "year": 2020, "journal": "Existing Journal",
+        "doi": "10.1016/backfill.four", "arxiv_id": None, "projects": ["test-project"],
+        "source_path": "", "paperjson_path": "", "summary": None, "key_findings": None,
+    }
+    _write_registry(dict(entry), cfg["registry_path"], "10.1016/backfill.four")
+
+    with mock.patch("scripts.ingest._crossref_journal_full",
+                     side_effect=AssertionError("should not be called for a complete entry")), \
+         mock.patch("scripts.ingest._crossref_published_year",
+                     side_effect=AssertionError("should not be called for a complete entry")):
+        result = _run_metadata_backfill(cfg)
+
+    assert result["checked"] == 0, f"Expected an already-complete entry to never enter the check count, got {result}"
