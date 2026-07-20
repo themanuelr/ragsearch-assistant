@@ -718,6 +718,167 @@ def _render_frontmatter(meta: dict, analysis: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Surgical frontmatter patch (D-08, Pitfall 4) — shared by retag (08.1-02)
+# and any future frontmatter-only patch path (e.g. DOI-metadata backfill).
+# Never reuses _render_frontmatter, which unconditionally stamps today's
+# date_ingested on every call — that would silently overwrite the paper's
+# real ingestion date on every patch.
+# ---------------------------------------------------------------------------
+
+# Field order mirrors _render_frontmatter's own emission order exactly, so a
+# freshly-patched note is indistinguishable in shape from one rendered fresh.
+_FRONTMATTER_CANONICAL_ORDER = [
+    "title", "authors", "year", "journal", "doi", "arxiv_id",
+    "tags", "status", "date_ingested",
+]
+
+# Frontmatter fields _patch_frontmatter_fields must NEVER rewrite, even if a
+# caller mistakenly passes one in scalar_updates (Pitfall 4 defensive
+# backstop — the intended contract is that callers simply never pass them).
+_FRONTMATTER_PROTECTED_KEYS = frozenset({"date_ingested", "status"})
+
+_FRONTMATTER_KEY_LINE_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*):(.*)$')
+
+
+def _frontmatter_canonical_index(key: str) -> int:
+    """Position of ``key`` in the canonical field order; unknown keys sort last."""
+    try:
+        return _FRONTMATTER_CANONICAL_ORDER.index(key)
+    except ValueError:
+        return len(_FRONTMATTER_CANONICAL_ORDER)
+
+
+def _parse_frontmatter_entries(fm_lines: list[str]) -> list[tuple[str | None, list[str]]]:
+    """Split frontmatter lines into ``(key, original_lines)`` entries, preserving
+    every original line byte-exact.
+
+    Multi-line blocks (``authors:``, ``tags:``) collect their following
+    ``  - ...`` continuation lines into the same entry. A line that is not a
+    recognizable ``key: ...`` line (e.g. a stray blank line) becomes an
+    unkeyed passthrough entry so it round-trips untouched.
+    """
+    entries: list[tuple[str | None, list[str]]] = []
+    i = 0
+    n = len(fm_lines)
+    while i < n:
+        line = fm_lines[i]
+        match = _FRONTMATTER_KEY_LINE_RE.match(line)
+        if not match:
+            entries.append((None, [line]))
+            i += 1
+            continue
+        key, rest = match.group(1), match.group(2)
+        block = [line]
+        i += 1
+        if rest.strip() == "":
+            while i < n and fm_lines[i].strip().startswith("- "):
+                block.append(fm_lines[i])
+                i += 1
+        entries.append((key, block))
+    return entries
+
+
+def _render_frontmatter_scalar_line(key: str, value) -> str:
+    """Render a single scalar frontmatter line, mirroring _render_frontmatter's
+    own quoting convention (int -> unquoted, everything else -> double-quoted
+    with internal ``"`` escaped)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{key}: {value}"
+    escaped = str(value).replace('"', '\\"')
+    return f'{key}: "{escaped}"'
+
+
+def _insert_frontmatter_entry_at_canonical_position(
+    entries: list[tuple[str | None, list[str]]], key: str, block: list[str]
+) -> None:
+    """Insert a new ``(key, block)`` entry immediately before the first existing
+    entry whose canonical position is later, mirroring _render_frontmatter's
+    field order (title, authors, year, journal, doi, arxiv_id, tags, status,
+    date_ingested)."""
+    new_index = _frontmatter_canonical_index(key)
+    insert_at = len(entries)
+    for i, (existing_key, _) in enumerate(entries):
+        if existing_key is None:
+            continue
+        if _frontmatter_canonical_index(existing_key) > new_index:
+            insert_at = i
+            break
+    entries.insert(insert_at, (key, block))
+
+
+def _patch_frontmatter_fields(
+    content: str,
+    scalar_updates: dict | None = None,
+    tag_replacement: list[str] | None = None,
+) -> str:
+    """Rewrite ONLY the given frontmatter keys; every other frontmatter line
+    and the entire body (everything from the closing ``---`` fence onward)
+    are preserved byte-exact.
+
+    Field ORDER on insert mirrors _render_frontmatter's canonical order
+    (title, authors, year, journal, doi, arxiv_id, tags, status,
+    date_ingested) so a freshly-patched note is indistinguishable in shape
+    from one that was rendered fresh. Never touches ``date_ingested`` or
+    ``status``.
+
+    Args:
+        content: Full note content, frontmatter fence + body.
+        scalar_updates: e.g. ``{"year": 2021, "journal": "Trends in Chemistry"}``.
+            Existing lines for these keys are replaced in place; absent keys
+            are inserted at their canonical position.
+        tag_replacement: Full replacement list of already-canonicalized+
+            slugified tag strings. Replaces the entire existing ``tags:``
+            block (or inserts one at the canonical position when absent).
+            An empty list removes the ``tags:`` block entirely, mirroring
+            _render_frontmatter's own "only emit tags: when non-empty" rule.
+
+    Returns:
+        The patched note content, frontmatter + original body reassembled.
+
+    Raises:
+        ValueError: When content has no frontmatter fence (caller should
+            treat that as an unexpected/pre-08.1 note shape and skip rather
+            than corrupt).
+    """
+    lines = content.split("\n")
+    fence_indices = [i for i, line in enumerate(lines) if line.strip() == "---"]
+    if len(fence_indices) < 2:
+        raise ValueError(
+            "_patch_frontmatter_fields: content has no frontmatter fence"
+        )
+    start, end = fence_indices[0], fence_indices[1]
+    fm_lines = lines[start + 1:end]
+    body_lines = lines[end:]  # second "---" fence onward -- byte-exact
+
+    entries = _parse_frontmatter_entries(fm_lines)
+
+    updates = {
+        k: v for k, v in (scalar_updates or {}).items()
+        if k not in _FRONTMATTER_PROTECTED_KEYS
+    }
+
+    updated_keys: set[str] = set()
+    for i, (key, _block) in enumerate(entries):
+        if key in updates:
+            entries[i] = (key, [_render_frontmatter_scalar_line(key, updates[key])])
+            updated_keys.add(key)
+    for key, value in updates.items():
+        if key not in updated_keys:
+            _insert_frontmatter_entry_at_canonical_position(
+                entries, key, [_render_frontmatter_scalar_line(key, value)]
+            )
+
+    if tag_replacement is not None:
+        entries = [(k, b) for k, b in entries if k != "tags"]
+        if tag_replacement:
+            tag_block = ["tags:"] + [f'  - "{slug}"' for slug in tag_replacement]
+            _insert_frontmatter_entry_at_canonical_position(entries, "tags", tag_block)
+
+    new_fm_lines = [line for _, block in entries for line in block]
+    return "\n".join(["---"] + new_fm_lines + body_lines)
+
+
+# ---------------------------------------------------------------------------
 # Deterministic note rendering (Pattern 3, D-08, D-14, D-15)
 # ---------------------------------------------------------------------------
 
