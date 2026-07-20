@@ -3,7 +3,21 @@
 {% block content %}
   <h1>Processing</h1>
 
-  <section>
+  {# Tab bar — reuses the Docs & Help page's .doc-picker / .doc-picker-link
+     markup+CSS (no new tab component). Client-side only: every panel stays in
+     the DOM (so htmx wiring like the retag picker's hx-trigger="load" fires
+     regardless of which tab is visible); the script at the bottom toggles the
+     .active link and the panels' `hidden` attribute. #}
+  <nav class="doc-picker" id="processing-tabs">
+    <ul>
+      <li><a class="doc-picker-link active" href="#" data-tab="tab-ingest">Ingest</a></li>
+      <li><a class="doc-picker-link" href="#" data-tab="tab-orchestration">Orchestration</a></li>
+      <li><a class="doc-picker-link" href="#" data-tab="tab-retag">Retag</a></li>
+      <li><a class="doc-picker-link" href="#" data-tab="tab-bulk">Bulk Actions</a></li>
+    </ul>
+  </nav>
+
+  <section class="tab-panel" id="tab-ingest">
     <h2>Drop Folder</h2>
     {% if pending %}
     <button type="button" class="btn"
@@ -35,7 +49,7 @@
     </div>
   </section>
 
-  <section class="section-gap">
+  <section class="tab-panel" id="tab-orchestration" hidden>
     <h2>Per-Paper Orchestration</h2>
     <form hx-post="/processing/orchestrate" hx-target="#orchestrate-status" hx-swap="innerHTML">
       <div class="settings-field">
@@ -132,7 +146,7 @@
     <div id="orchestrate-status" class="section-gap"></div>
   </section>
 
-  <section class="section-gap">
+  <section class="tab-panel" id="tab-retag" hidden>
     <h2>Retag</h2>
     <p class="settings-hint">Re-tag one or more already-ingested papers along a new axis. Existing tags are never removed — only new distinct topics are appended (D-06).</p>
     <form hx-post="/processing/retag" hx-target="#retag-status" hx-swap="innerHTML">
@@ -163,7 +177,7 @@
     <div id="retag-status" class="section-gap"></div>
   </section>
 
-  <section class="section-gap">
+  <section class="tab-panel" id="tab-bulk" hidden>
     <h2>Bulk Actions</h2>
     <div class="bulk-actions">
       <button type="button" class="btn"
@@ -183,4 +197,27 @@
     </div>
     <div id="bulk-action-status" class="section-gap"></div>
   </section>
+
+  {# Client-side tab switcher. Panels are never removed from the DOM, so all
+     existing htmx wiring (including the retag picker's hx-trigger="load")
+     keeps working regardless of the active tab. #}
+  <script>
+    (function () {
+      var nav = document.getElementById("processing-tabs");
+      if (!nav) return;
+      var links = nav.querySelectorAll(".doc-picker-link");
+      links.forEach(function (link) {
+        link.addEventListener("click", function (e) {
+          e.preventDefault();
+          var targetId = link.getAttribute("data-tab");
+          links.forEach(function (l) {
+            var panel = document.getElementById(l.getAttribute("data-tab"));
+            var isActive = l === link;
+            l.classList.toggle("active", isActive);
+            if (panel) panel.hidden = !isActive;
+          });
+        });
+      });
+    })();
+  </script>
 {% endblock %}
