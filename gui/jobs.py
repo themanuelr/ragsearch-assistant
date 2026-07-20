@@ -222,6 +222,16 @@ def build_action_argv(action: str, config: dict, **params) -> list:
     if action == "link_all":
         return [py, script("link.py"), "--all"]
 
+    if action == "retag":
+        argv = [py, script("retag.py")]
+        if params.get("paperjson"):
+            argv += ["--paperjson", params["paperjson"]]
+        else:
+            argv += ["--stem", params["stem"]]
+        if params.get("context"):
+            argv += ["--context", params["context"]]
+        return argv
+
     if action == "setup":
         argv = [py, script("setup.py"), "--non-interactive"]
         if params.get("vault_path"):
