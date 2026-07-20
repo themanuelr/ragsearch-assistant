@@ -62,14 +62,33 @@
               {% endfor %}
             </select>
           </div>
+
+          {# D-10/D-11/D-13 (08.1-03): optional ChromaDB retrieval-query box
+             + n_results control, visible only under ChromaDB scope --
+             reuses the exact #chat-vault-picker hidden-attribute toggle
+             idiom above. This form is never replaced by any htmx swap
+             (hx-target is #chat-messages, hx-swap="beforeend"), so this
+             field's DOM node -- and whatever the user typed into it --
+             survives every turn untouched (D-11 stickiness is free; do NOT
+             add any script that clears/resets it on send). #}
+          <div class="chat-chroma-query" id="chat-chroma-query-picker" hidden>
+            <label for="chat-chroma-query">Retrieval query (ChromaDB scope)</label>
+            <input type="text" name="chroma_query" id="chat-chroma-query"
+                   placeholder="Retrieval topic (optional) — blank uses your question above">
+            <label for="chat-n-results">Results</label>
+            <input type="number" name="n_results" id="chat-n-results" min="1" max="20" value="5">
+          </div>
           <script>
             (function () {
               var picker = document.getElementById("chat-vault-picker");
-              if (!picker) return;
+              var chromaPicker = document.getElementById("chat-chroma-query-picker");
+              if (!picker && !chromaPicker) return;
               var radios = document.querySelectorAll('input[name="scope"]');
               function syncVisibility() {
                 var vaultRadio = document.querySelector('input[name="scope"][value="vault"]');
-                picker.hidden = !(vaultRadio && vaultRadio.checked);
+                var chromaRadio = document.querySelector('input[name="scope"][value="chroma"]');
+                if (picker) picker.hidden = !(vaultRadio && vaultRadio.checked);
+                if (chromaPicker) chromaPicker.hidden = !(chromaRadio && chromaRadio.checked);
               }
               radios.forEach(function (radio) {
                 radio.addEventListener("change", syncVisibility);
