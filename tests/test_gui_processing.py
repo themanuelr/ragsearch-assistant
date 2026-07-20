@@ -519,6 +519,71 @@ def test_processing_page_has_paper_select_and_script_rows(gui_client, gui_config
 
 
 # ---------------------------------------------------------------------------
+# Phase 08.1 Plan 04 (D-14, D-15, D-16): Processing reorg -- per-paper
+# orchestration leads Bulk Actions, the shared radio picker replaces the
+# plain inline <select name="registry_key">, and ingest --force-extract is
+# reachable from the drop-folder row.
+# ---------------------------------------------------------------------------
+
+def test_processing_orchestration_leads_bulk_actions_with_radio_picker(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    uningested_dir = pathlib.Path(gui_config["uningested_dir"])
+    uningested_dir.mkdir(parents=True, exist_ok=True)
+    (uningested_dir / "paper-a.pdf").write_bytes(b"%PDF-1.4")
+
+    resp = gui_client.get("/processing")
+    assert resp.status_code == 200
+    text = resp.text
+
+    # (a) D-14: per-paper orchestration renders ABOVE Bulk Actions -- compare
+    # byte offsets of two stable section headings.
+    orchestration_idx = text.index("Per-Paper Orchestration")
+    bulk_idx = text.index("Bulk Actions")
+    assert orchestration_idx < bulk_idx, "Per-Paper Orchestration must render before Bulk Actions (D-14)"
+
+    # (b) D-16: the orchestration selector IS the shared picker (radio mode),
+    # not a divergent plain <select name="registry_key"> inline option list.
+    assert 'id="orch-picker-results"' in text
+    assert 'hx-get="/papers/picker"' in text
+    assert '"scope": "project"' in text
+    assert '"select_mode": "radio"' in text
+    assert '<select name="registry_key"' not in text
+    assert 'type="radio" name="registry_key"' in text
+    assert "A Known Paper" in text  # picker's first-page radio row rendered synchronously
+
+    # (c) D-15: ingest --force-extract reachable on the drop-folder row.
+    assert 'name="force_extract"' in text
+
+
+def test_orchestrate_enqueue_still_honors_note_force_flags_after_reorg(gui_client, gui_config, monkeypatch):
+    """POST /processing/orchestrate keeps reading registry_key + note_force +
+    note_force_analysis unchanged -- only the selector's markup source
+    changed (D-16), not the route's contract."""
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+    _write_registry_entry(gui_config, "10.1234/known", "A Known Paper", "known-stem")
+
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/orchestrate",
+        data={
+            "registry_key": "10.1234/known",
+            "note_include": "true", "note_order": "1",
+            "note_force": "true", "note_force_analysis": "true",
+        },
+    )
+
+    assert resp.status_code == 200
+    argv = captured["calls"][0]["argv"]
+    assert "--force" in argv
+    assert "--force-analysis" in argv
+
+
+# ---------------------------------------------------------------------------
 # 08-12 Task 1 (Gap A, GUI-04/D-07/D-08): scroll-stable ~2s log tail
 #
 # The tail-follow behaviour itself (stick to bottom / hold position while
