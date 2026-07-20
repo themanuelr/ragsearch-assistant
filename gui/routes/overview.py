@@ -142,6 +142,7 @@ def papers_picker(
     page: int = 1,
     page_size: int = 25,
     select_mode: str = "display",
+    target_id: str = "picker-results",
 ):
     """Shared server-side-filtered, paginated paper picker (D-01..D-05).
 
@@ -152,6 +153,13 @@ def papers_picker(
     ``page_size`` is clamped server-side to {25,50,100,200} -- the HTML
     ``<select>`` is client-side only and is never trusted as-is
     (T-08.1-01-02). ``page`` is clamped to >=1.
+
+    ``target_id`` (Phase 08.1 Plan 04, D-16): the wrapping container id this
+    picker's own hx-target/hx-get swap into. Defaults to Overview's
+    established "picker-results"; a page mounting a second, distinct picker
+    (e.g. Processing's per-paper radio picker) passes its own id so
+    round-trip search/page-size/pagination requests keep swapping the right
+    container instead of reverting to the default on every subsequent swap.
 
     Plain ``def`` (not ``async def``): scan_project_papers/scan_universal do
     blocking file/Chroma I/O, mirroring every other route in this module.
@@ -181,5 +189,6 @@ def papers_picker(
             "q": q,
             "select_mode": select_mode,
             "page_size": page_size,
+            "target_id": target_id,
         },
     )

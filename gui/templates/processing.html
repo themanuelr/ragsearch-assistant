@@ -36,36 +36,26 @@
   </section>
 
   <section class="section-gap">
-    <h2>Bulk Actions</h2>
-    <div class="bulk-actions">
-      <button type="button" class="btn"
-              hx-post="/jobs/enqueue"
-              hx-vals='{"action": "embed_all"}'
-              hx-target="#bulk-action-status"
-              hx-swap="innerHTML">
-        Backfill Embeddings
-      </button>
-      <button type="button" class="btn"
-              hx-post="/jobs/enqueue"
-              hx-vals='{"action": "link_all"}'
-              hx-target="#bulk-action-status"
-              hx-swap="innerHTML">
-        Rebuild Topic Graph
-      </button>
-    </div>
-    <div id="bulk-action-status" class="section-gap"></div>
-  </section>
-
-  <section class="section-gap">
     <h2>Per-Paper Orchestration</h2>
     <form hx-post="/processing/orchestrate" hx-target="#orchestrate-status" hx-swap="innerHTML">
       <div class="settings-field">
-        <label for="orchestrate-paper">Paper</label>
-        <select name="registry_key" id="orchestrate-paper">
-          {% for paper in papers %}
-          <option value="{{ paper.registry_key }}">{{ paper.title }}</option>
-          {% endfor %}
-        </select>
+        <label>Paper</label>
+        {# Shared paper picker (D-01..D-05, Phase 08.1 Plan 01), radio mode
+           (D-16): replaces the plain inline <select name="registry_key">
+           this section used to render. Content is server-rendered
+           synchronously via {% include %} (no hx-trigger="load") so a bare
+           page GET already contains the first page of radio-selectable
+           papers -- matching Overview's own established initial-render
+           contract (08.1-01-SUMMARY.md tech-stack pattern). Subsequent
+           search/page-size/page changes swap #orch-picker-results via the
+           partial's own hx-get controls; ``target_id`` keeps those swaps
+           targeting this mount instead of colliding with any other picker
+           later added to this page (e.g. retag's checkbox picker, D-09). #}
+        <div id="orch-picker-results">
+          {% with target_id = "orch-picker-results" %}
+            {% include "partials/paper_picker.html" %}
+          {% endwith %}
+        </div>
       </div>
       <table>
         <thead>
@@ -140,5 +130,26 @@
       <button type="submit" class="btn">Run Selected</button>
     </form>
     <div id="orchestrate-status" class="section-gap"></div>
+  </section>
+
+  <section class="section-gap">
+    <h2>Bulk Actions</h2>
+    <div class="bulk-actions">
+      <button type="button" class="btn"
+              hx-post="/jobs/enqueue"
+              hx-vals='{"action": "embed_all"}'
+              hx-target="#bulk-action-status"
+              hx-swap="innerHTML">
+        Backfill Embeddings
+      </button>
+      <button type="button" class="btn"
+              hx-post="/jobs/enqueue"
+              hx-vals='{"action": "link_all"}'
+              hx-target="#bulk-action-status"
+              hx-swap="innerHTML">
+        Rebuild Topic Graph
+      </button>
+    </div>
+    <div id="bulk-action-status" class="section-gap"></div>
   </section>
 {% endblock %}

@@ -28,7 +28,7 @@ from fastapi.responses import PlainTextResponse
 
 from gui import jobs as gui_jobs
 from gui.config import load_gui_config
-from gui.scan import scan_paper, scan_project_papers, scan_uningested
+from gui.scan import filter_and_paginate, scan_paper, scan_project_papers, scan_uningested
 
 router = APIRouter()
 
@@ -79,10 +79,19 @@ def _is_safe_drop_filename(filename: str) -> bool:
 def processing_page(request: Request):
     """Plain ``def`` (not ``async def``): scan_uningested/scan_project_papers
     do blocking filesystem/registry I/O (RESEARCH.md Pitfall 5). Detection is
-    this scan call only -- never a background watcher."""
+    this scan call only -- never a background watcher.
+
+    Per-paper orchestration's paper selector is the shared picker (D-16,
+    Phase 08.1 Plan 01/04) in radio mode -- the same ``filter_and_paginate``
+    shape ``GET /overview/project`` feeds into its own first-page render, so
+    a bare ``GET /processing`` already contains the first page of
+    radio-selectable papers without a round-trip (see
+    ``partials/paper_picker.html``'s own initial-render contract)."""
     from gui.app import templates
 
     config = load_gui_config()
+    papers = scan_project_papers(config)
+    result = filter_and_paginate(papers, "", 1, 25)
     return templates.TemplateResponse(
         request,
         "processing.html",
@@ -90,7 +99,11 @@ def processing_page(request: Request):
             "active_page": "processing",
             "page_title": "Processing",
             "pending": scan_uningested(config),
-            "papers": scan_project_papers(config),
+            "result": result,
+            "scope": "project",
+            "q": "",
+            "select_mode": "radio",
+            "page_size": 25,
         },
     )
 

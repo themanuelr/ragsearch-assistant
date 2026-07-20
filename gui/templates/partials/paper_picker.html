@@ -9,23 +9,33 @@
    The search input + page-size dropdown + prev/next pagination controls
    live INSIDE this partial (not the parent page) so every filter/page-
    size/page change round-trips through a fresh hx-get and swaps the whole
-   #picker-results container. This is why the search input echoes ``q``
+   #{{ target_id }} container. This is why the search input echoes ``q``
    back into its own value -- relying on Jinja2's default autoescape only,
-   never |safe (T-08.1-01-01). #}
+   never |safe (T-08.1-01-01).
+
+   ``target_id`` (Phase 08.1 Plan 04, D-16): the wrapping container id this
+   partial's own hx-target/hx-get controls swap into. Defaults to
+   "picker-results" (Overview's established id, unchanged for those
+   consumers) -- a caller mounting a SECOND picker on the same page (e.g.
+   Processing's per-paper radio picker) passes a distinct id via
+   ``{% with target_id = "orch-picker-results" %}`` so its search/page-size/
+   pagination swaps target its own container instead of colliding with
+   another picker mount on the same page. #}
+{% set target_id = target_id | default("picker-results") %}
 <div class="picker-controls">
   <input type="search" name="q" value="{{ q }}"
          placeholder="Search title, authors, journal, year..."
          hx-get="/papers/picker"
          hx-trigger="keyup changed delay:300ms"
-         hx-target="#picker-results"
+         hx-target="#{{ target_id }}"
          hx-include="[name='page_size']"
-         hx-vals='{"page": 1, "scope": "{{ scope }}", "select_mode": "{{ select_mode }}"}'>
+         hx-vals='{"page": 1, "scope": "{{ scope }}", "select_mode": "{{ select_mode }}", "target_id": "{{ target_id }}"}'>
   <select name="page_size"
           hx-get="/papers/picker"
           hx-trigger="change"
-          hx-target="#picker-results"
+          hx-target="#{{ target_id }}"
           hx-include="[name='q']"
-          hx-vals='{"page": 1, "scope": "{{ scope }}", "select_mode": "{{ select_mode }}"}'>
+          hx-vals='{"page": 1, "scope": "{{ scope }}", "select_mode": "{{ select_mode }}", "target_id": "{{ target_id }}"}'>
     <option value="25" {% if page_size == 25 %}selected{% endif %}>25</option>
     <option value="50" {% if page_size == 50 %}selected{% endif %}>50</option>
     <option value="100" {% if page_size == 100 %}selected{% endif %}>100</option>
@@ -193,14 +203,14 @@
 
 <div class="picker-pagination section-gap">
   <button type="button" class="btn"
-          hx-get="/papers/picker?page={{ result.page - 1 }}&scope={{ scope }}&select_mode={{ select_mode }}"
-          hx-target="#picker-results"
+          hx-get="/papers/picker?page={{ result.page - 1 }}&scope={{ scope }}&select_mode={{ select_mode }}&target_id={{ target_id }}"
+          hx-target="#{{ target_id }}"
           hx-include="[name='q'],[name='page_size']"
           {% if result.page <= 1 %}disabled{% endif %}>Prev</button>
   <span class="stage-label">Page {{ result.page }} &middot; {{ result.total }} total</span>
   <button type="button" class="btn"
-          hx-get="/papers/picker?page={{ result.page + 1 }}&scope={{ scope }}&select_mode={{ select_mode }}"
-          hx-target="#picker-results"
+          hx-get="/papers/picker?page={{ result.page + 1 }}&scope={{ scope }}&select_mode={{ select_mode }}&target_id={{ target_id }}"
+          hx-target="#{{ target_id }}"
           hx-include="[name='q'],[name='page_size']"
           {% if not result.has_next %}disabled{% endif %}>Next</button>
 </div>
