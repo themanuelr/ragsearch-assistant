@@ -1,52 +1,17 @@
 {% extends "base.html" %}
-{% import "partials/_stage_macros.html" as macros %}
 {% block title %}Overview (Universal) — Research Paper Intelligence System{% endblock %}
 {% block content %}
   <h1>Overview (Universal)</h1>
 
   <section>
     <h2>Universal Registry</h2>
-    {% if entries %}
-    <table>
-      <thead>
-        <tr>
-          <th>Title</th>
-          <th>Year</th>
-          <th>Projects</th>
-          <th>MinerU</th>
-          <th title="PaperJSON cache file exists on disk (analysis may or may not be filled yet)">PaperJSON Cached</th>
-          <th>Vault Note</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for entry in entries %}
-        <tr>
-          <td>{{ entry.title }}</td>
-          <td>{{ entry.year or "" }}</td>
-          <td>{{ entry.projects | join(", ") if entry.projects else "—" }}</td>
-          <td>{{ macros.stage_glyph(entry.mineru_present) }}</td>
-          <td>{{ macros.stage_glyph(entry.paperjson_present) }}</td>
-          <td>{{ entry.vault_note or "—" }}</td>
-          <td>
-            {% if not entry.in_this_project %}
-            <form hx-post="/jobs/enqueue"
-                  hx-target="#import-status-{{ loop.index0 }}"
-                  hx-swap="innerHTML">
-              <input type="hidden" name="action" value="ingest_doi">
-              <input type="hidden" name="doi" value="{{ entry.registry_key }}">
-              <button type="submit" class="btn">Import into This Project</button>
-            </form>
-            {% endif %}
-            <div id="import-status-{{ loop.index0 }}" class="section-gap"></div>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}
-    <p class="empty-state-heading">No papers yet</p>
-    <p class="empty-state-body">Papers ingested by any project clone sharing this registry will appear here.</p>
-    {% endif %}
+    {# Shared paper picker (D-01..D-05, Phase 08.1 Plan 01): server-side
+       search + pagination over the global registry. Initial content is
+       server-rendered via {% include %} so a bare page GET already
+       contains the first page; subsequent filter/page-size/page changes
+       swap #picker-results via the partial's own hx-get controls. #}
+    <div id="picker-results">
+      {% include "partials/paper_picker.html" %}
+    </div>
   </section>
 {% endblock %}

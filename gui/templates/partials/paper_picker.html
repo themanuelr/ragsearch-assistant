@@ -1,0 +1,206 @@
+{% import "partials/_stage_macros.html" as macros %}
+{# Shared paper picker (D-01..D-05, Phase 08.1 Plan 01). ONE partial + ONE
+   `GET /papers/picker` route serve Overview (Project), Overview
+   (Universal), and (later waves) Processing orchestration/retag.
+   ``scope`` selects the row shape (project stage-glyph table vs. universal
+   registry table when select_mode="display"); ``select_mode`` selects the
+   row-selection affordance (display/radio/checkbox).
+
+   The search input + page-size dropdown + prev/next pagination controls
+   live INSIDE this partial (not the parent page) so every filter/page-
+   size/page change round-trips through a fresh hx-get and swaps the whole
+   #picker-results container. This is why the search input echoes ``q``
+   back into its own value -- relying on Jinja2's default autoescape only,
+   never |safe (T-08.1-01-01). #}
+<div class="picker-controls">
+  <input type="search" name="q" value="{{ q }}"
+         placeholder="Search title, authors, journal, year..."
+         hx-get="/papers/picker"
+         hx-trigger="keyup changed delay:300ms"
+         hx-target="#picker-results"
+         hx-include="[name='page_size']"
+         hx-vals='{"page": 1, "scope": "{{ scope }}", "select_mode": "{{ select_mode }}"}'>
+  <select name="page_size"
+          hx-get="/papers/picker"
+          hx-trigger="change"
+          hx-target="#picker-results"
+          hx-include="[name='q']"
+          hx-vals='{"page": 1, "scope": "{{ scope }}", "select_mode": "{{ select_mode }}"}'>
+    <option value="25" {% if page_size == 25 %}selected{% endif %}>25</option>
+    <option value="50" {% if page_size == 50 %}selected{% endif %}>50</option>
+    <option value="100" {% if page_size == 100 %}selected{% endif %}>100</option>
+    <option value="200" {% if page_size == 200 %}selected{% endif %}>200</option>
+  </select>
+</div>
+
+{% if select_mode in ("radio", "checkbox") %}
+  {# Generic selection rows -- Processing per-paper orchestration (D-16) /
+     retag multi-select (D-09), wired in a later wave. Title/journal/year/
+     authors only; no stage-glyph richness, since this mode is a plain
+     selection target, not a status display. #}
+  {% if result.entries %}
+  <table class="picker-table">
+    <thead>
+      <tr>
+        <th></th>
+        <th>Title</th>
+        <th>Journal</th>
+        <th>Year</th>
+        <th>Authors</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in result.entries %}
+      {% set meta = e.get("metadata", {}) %}
+      {% set row_authors = e.get("authors") or meta.get("authors") %}
+      <tr>
+        <td>
+          {% if select_mode == "checkbox" %}
+          <input type="checkbox" name="registry_keys" value="{{ e.registry_key }}">
+          {% else %}
+          <input type="radio" name="registry_key" value="{{ e.registry_key }}">
+          {% endif %}
+        </td>
+        <td>{{ e.get("title") or meta.get("title") or "" }}</td>
+        <td>{{ e.get("journal") or meta.get("journal") or "" }}</td>
+        <td>{{ e.get("year") if e.get("year") is not none else (meta.get("year") or "") }}</td>
+        <td>{{ row_authors | join(", ") if row_authors else "" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-state-heading">{{ "No matching papers" if q else "No papers yet" }}</p>
+  {% endif %}
+
+{% elif scope == "universal" %}
+  {# Overview (Universal), display mode -- unchanged row/column shape from
+     the pre-08.1-01 inline table (D-11), now sourced from the filtered +
+     paginated slice instead of the full unfiltered list. #}
+  {% if result.entries %}
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Year</th>
+        <th>Projects</th>
+        <th>MinerU</th>
+        <th title="PaperJSON cache file exists on disk (analysis may or may not be filled yet)">PaperJSON Cached</th>
+        <th>Vault Note</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for entry in result.entries %}
+      <tr>
+        <td>{{ entry.title }}</td>
+        <td>{{ entry.year or "" }}</td>
+        <td>{{ entry.projects | join(", ") if entry.projects else "—" }}</td>
+        <td>{{ macros.stage_glyph(entry.mineru_present) }}</td>
+        <td>{{ macros.stage_glyph(entry.paperjson_present) }}</td>
+        <td>{{ entry.vault_note or "—" }}</td>
+        <td>
+          {% if not entry.in_this_project %}
+          <form hx-post="/jobs/enqueue"
+                hx-target="#import-status-{{ loop.index0 }}"
+                hx-swap="innerHTML">
+            <input type="hidden" name="action" value="ingest_doi">
+            <input type="hidden" name="doi" value="{{ entry.registry_key }}">
+            <button type="submit" class="btn">Import into This Project</button>
+          </form>
+          {% endif %}
+          <div id="import-status-{{ loop.index0 }}" class="section-gap"></div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-state-heading">{{ "No matching papers" if q else "No papers yet" }}</p>
+  <p class="empty-state-body">Papers ingested by any project clone sharing this registry will appear here.</p>
+  {% endif %}
+
+{% else %}
+  {# scope == "project", select_mode == "display": the stage-glyph table
+     (D-09/D-12 lineage) -- unchanged row/column shape and two-way
+     disclosure toggle from the pre-08.1-01 inline table, now sourced from
+     the filtered + paginated slice instead of the full unfiltered list. #}
+  {% if result.entries %}
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>Year</th>
+        <th>MinerU</th>
+        <th>Registry</th>
+        <th title="Analysis namespace filled (summary/claims/topics/etc. generated)">Analysis Filled</th>
+        <th>Note</th>
+        <th>Biblio</th>
+        <th>Embed</th>
+        <th>Linked by Topics</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for paper in result.entries %}
+      <tr class="paper-row"
+          data-detail-cell="paper-detail-{{ loop.index0 }}"
+          data-drilldown-url="/overview/project/paper/{{ paper.registry_key }}"
+          onclick="paperRowToggle(this)">
+        <td>{{ paper.title }}</td>
+        <td>{{ paper.metadata.year or "" }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.mineru) }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.registry) }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.paperjson_fill) }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.note) }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.biblio) }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.embed) }}</td>
+        <td>{{ macros.stage_glyph(paper.stages.topics) }}</td>
+      </tr>
+      <tr class="paper-detail-row">
+        <td colspan="9" id="paper-detail-{{ loop.index0 }}"></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-state-heading">{{ "No matching papers" if q else "No papers yet" }}</p>
+  <p class="empty-state-body">Ingest a PDF or URL from the Processing page to get started.</p>
+  {% endif %}
+
+  {# GUI-03/D-12: the row is a two-way disclosure toggle, not a one-way
+     htmx fill -- unchanged from the pre-08.1-01 inline implementation (see
+     git history for the full non-htmx-on-the-row rationale). htmx
+     re-executes <script> tags present in swapped content, so a
+     redefinition on an AJAX page-size/search refresh is harmless
+     (idempotent); the initial full-page render only includes this partial
+     once. #}
+  <script>
+    (function () {
+      window.paperRowToggle = function (row) {
+        var cellId = row.getAttribute("data-detail-cell");
+        var url = row.getAttribute("data-drilldown-url");
+        var cell = document.getElementById(cellId);
+        if (!cell) return;
+        if (cell.innerHTML.trim()) {
+          cell.innerHTML = "";
+          return;
+        }
+        htmx.ajax("GET", url, { target: "#" + cellId, swap: "innerHTML" });
+      };
+    })();
+  </script>
+{% endif %}
+
+<div class="picker-pagination section-gap">
+  <button type="button" class="btn"
+          hx-get="/papers/picker?page={{ result.page - 1 }}&scope={{ scope }}&select_mode={{ select_mode }}"
+          hx-target="#picker-results"
+          hx-include="[name='q'],[name='page_size']"
+          {% if result.page <= 1 %}disabled{% endif %}>Prev</button>
+  <span class="stage-label">Page {{ result.page }} &middot; {{ result.total }} total</span>
+  <button type="button" class="btn"
+          hx-get="/papers/picker?page={{ result.page + 1 }}&scope={{ scope }}&select_mode={{ select_mode }}"
+          hx-target="#picker-results"
+          hx-include="[name='q'],[name='page_size']"
+          {% if not result.has_next %}disabled{% endif %}>Next</button>
+</div>

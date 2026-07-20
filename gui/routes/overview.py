@@ -10,9 +10,20 @@ import re
 from fastapi import APIRouter, Request
 
 from gui.config import load_gui_config
-from gui.scan import scan_paper, scan_project_papers, scan_uningested, scan_universal
+from gui.scan import (
+    filter_and_paginate,
+    scan_paper,
+    scan_project_papers,
+    scan_uningested,
+    scan_universal,
+)
 
 router = APIRouter()
+
+# Server-side clamp for the picker's page_size (D-03/T-08.1-01-02) -- the
+# <select> options in partials/paper_picker.html are client-side only and
+# must never be trusted as-is.
+_PICKER_PAGE_SIZES = (25, 50, 100, 200)
 
 
 def _rerun_status_id_slug(registry_key: str) -> str:
@@ -28,7 +39,8 @@ def _rerun_status_id_slug(registry_key: str) -> str:
 
 @router.get("/overview/project")
 def overview_project(request: Request):
-    """Render the live-scanned per-paper stage table + drop-folder pending list.
+    """Render the live-scanned per-paper stage table (via the shared picker,
+    D-01..D-05) + drop-folder pending list.
 
     Plain ``def`` (not ``async def``, RESEARCH.md Pitfall 5): scan_project_papers
     and scan_uningested do blocking file/Chroma I/O, and FastAPI runs sync
@@ -39,14 +51,19 @@ def overview_project(request: Request):
     config = load_gui_config()
     papers = scan_project_papers(config)
     pending = scan_uningested(config)
+    result = filter_and_paginate(papers, "", 1, 25)
     return templates.TemplateResponse(
         request,
         "overview_project.html",
         {
             "active_page": "overview_project",
             "page_title": "Overview (Project)",
-            "papers": papers,
             "pending": pending,
+            "result": result,
+            "scope": "project",
+            "q": "",
+            "select_mode": "display",
+            "page_size": 25,
         },
     )
 
@@ -91,7 +108,8 @@ def overview_project_paper(request: Request, registry_key: str):
 
 @router.get("/overview/universal")
 def overview_universal(request: Request):
-    """Render the read-only universal registry table (D-11).
+    """Render the read-only universal registry table (D-11), via the shared
+    picker (D-01..D-05).
 
     Plain ``def`` (not ``async def``): scan_universal does blocking
     file/registry I/O, mirroring overview_project's Pitfall 5 rationale.
@@ -100,12 +118,68 @@ def overview_universal(request: Request):
 
     config = load_gui_config()
     entries = scan_universal(config)
+    result = filter_and_paginate(entries, "", 1, 25)
     return templates.TemplateResponse(
         request,
         "overview_universal.html",
         {
             "active_page": "overview_universal",
             "page_title": "Overview (Universal)",
-            "entries": entries,
+            "result": result,
+            "scope": "universal",
+            "q": "",
+            "select_mode": "display",
+            "page_size": 25,
+        },
+    )
+
+
+@router.get("/papers/picker")
+def papers_picker(
+    request: Request,
+    scope: str = "project",
+    q: str = "",
+    page: int = 1,
+    page_size: int = 25,
+    select_mode: str = "display",
+):
+    """Shared server-side-filtered, paginated paper picker (D-01..D-05).
+
+    ONE route serves Overview (Project), Overview (Universal), and (later
+    waves) Processing orchestration/retag: ``scope`` (``project``|
+    ``universal``) selects the source list, ``select_mode`` (``display``|
+    ``radio``|``checkbox``) selects the row-selection affordance.
+    ``page_size`` is clamped server-side to {25,50,100,200} -- the HTML
+    ``<select>`` is client-side only and is never trusted as-is
+    (T-08.1-01-02). ``page`` is clamped to >=1.
+
+    Plain ``def`` (not ``async def``): scan_project_papers/scan_universal do
+    blocking file/Chroma I/O, mirroring every other route in this module.
+    """
+    from gui.app import templates
+
+    config = load_gui_config()
+    if page_size not in _PICKER_PAGE_SIZES:
+        page_size = 25
+    if page < 1:
+        page = 1
+
+    if scope == "universal":
+        entries = scan_universal(config)
+    else:
+        scope = "project"
+        entries = scan_project_papers(config)
+
+    result = filter_and_paginate(entries, q, page, page_size)
+
+    return templates.TemplateResponse(
+        request,
+        "partials/paper_picker.html",
+        {
+            "result": result,
+            "scope": scope,
+            "q": q,
+            "select_mode": select_mode,
+            "page_size": page_size,
         },
     )
