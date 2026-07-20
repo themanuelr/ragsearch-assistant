@@ -27,9 +27,14 @@ Public API:
       without creating it.
   scan_universal(config) -> list[dict]
       One dict per registry entry, regardless of ``projects[]`` membership
-      (Phase 8 Plan 06, D-11) -- title/year/journal/projects,
+      (Phase 8 Plan 06, D-11) -- title/year/journal/authors/projects,
       ``in_this_project``, cache-presence booleans (mineru/paperjson), and
       the vault-note relative path (or ``None`` if no note exists yet).
+  filter_and_paginate(entries, q, page, page_size) -> dict
+      Case-insensitive substring match over title/authors/journal/year plus
+      pagination (Phase 08.1 Plan 01, D-01..D-03). Pure -- no I/O. Shared by
+      Overview (Project/Universal) and, in later waves, Processing
+      orchestration/retag (D-05).
 """
 
 import json
@@ -212,6 +217,51 @@ def scan_paper(config: dict, registry_key: str):
     return _build_paper_dict(config, registry_key, entry)
 
 
+def filter_and_paginate(entries: list, q: str, page: int, page_size: int) -> dict:
+    """Case-insensitive substring match over title/authors/journal/year
+    (D-02), then slice into pages (D-03). Pure, read-only -- no filesystem/
+    network/Chroma I/O; operates only on the already-scanned list passed in
+    (same "read-only, no side effects" contract as scan_project_papers/
+    scan_universal, Phase 08.1 Plan 01).
+
+    Reads title/authors/journal/year defensively from either the flat
+    universal shape (``scan_universal``'s per-entry dict, top-level keys) or
+    the nested project shape (``scan_project_papers``/``_build_paper_dict``,
+    fields under ``metadata``), so both dict shapes search identically.
+
+    ``page`` is 1-indexed. Resetting to page 1 on a filter/page-size change
+    is the CALLER's responsibility -- the route always receives page=1 from
+    the search input's/page-size dropdown's ``hx-vals``.
+    """
+    q_norm = (q or "").strip().lower()
+    if q_norm:
+
+        def _matches(e: dict) -> bool:
+            metadata = e.get("metadata") or {}
+            title = e.get("title") or metadata.get("title") or ""
+            authors = e.get("authors") or metadata.get("authors") or []
+            authors_str = " ".join(authors) if isinstance(authors, list) else str(authors)
+            journal = e.get("journal") or metadata.get("journal") or ""
+            year = e.get("year")
+            if year is None:
+                year = metadata.get("year")
+            hay = " ".join([title, authors_str, journal, str(year or "")]).lower()
+            return q_norm in hay
+
+        entries = [e for e in entries if _matches(e)]
+
+    total = len(entries)
+    start = (page - 1) * page_size
+    page_entries = entries[start : start + page_size]
+    return {
+        "entries": page_entries,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_next": start + page_size < total,
+    }
+
+
 def scan_universal(config: dict) -> list:
     """Return one dict per registry entry, regardless of ``projects[]``
     membership (Phase 8 Plan 06, D-11).
@@ -238,6 +288,7 @@ def scan_universal(config: dict) -> list:
                 "title": title,
                 "year": entry.get("year"),
                 "journal": entry.get("journal"),
+                "authors": entry.get("authors"),
                 "projects": projects,
                 "in_this_project": bool(project_name and project_name in projects),
                 "mineru_present": _stage_mineru(config, stem),
