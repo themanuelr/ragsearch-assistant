@@ -23,7 +23,7 @@
           {% include "partials/chat_messages.html" %}
         {% else %}
           <p class="empty-state-heading">Start a conversation</p>
-          <p class="empty-state-body">Ask a question below — optionally pick a retrieval scope on the left.</p>
+          <p class="empty-state-body">Ask a question below — optionally pick a retrieval scope.</p>
         {% endif %}
       </div>
 
@@ -98,7 +98,7 @@
           </script>
 
           <textarea name="message" class="chat-input"
-                    placeholder="Ask a question below — optionally pick a retrieval scope on the left."
+                    placeholder="Ask a question below — optionally pick a retrieval scope."
                     required></textarea>
           <button type="submit" class="btn">Send</button>
         </form>
