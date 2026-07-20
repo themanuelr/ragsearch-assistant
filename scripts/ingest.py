@@ -1434,6 +1434,44 @@ def _run_mineru(
         raise RuntimeError(f"MinerU exited with code {result.returncode}: {stderr}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 08.1 Plan 05 (D-19): defuddle failure classifier — paywall vs. network.
+#
+# A non-zero defuddle exit could mean two very different things: the site
+# actively rejected us (paywall / bot-block — a 4xx status genuinely came
+# back), or we never reached the site at all (timeout, DNS failure, refused
+# connection — no status code, because there was no HTTP response to carry
+# one). Only the status-code-present/absent signal is honest to classify on;
+# do NOT attempt literal "Cloudflare"/"login page" string-matching — defuddle
+# has no such detection and there is no stable string to match on.
+# ---------------------------------------------------------------------------
+_HTTP_STATUS_IN_STDERR = re.compile(r"Failed to fetch:\s*(\d{3})")
+
+
+def _classify_defuddle_failure(stderr: str) -> str:
+    """
+    Classify a non-zero defuddle exit's stderr as 'paywall' or 'network' (D-19).
+
+    Returns 'paywall' when a 4xx HTTP status (esp. 401/403) is present in
+    stderr — the site actively responded with an access-denied signal.
+    Returns 'network' for everything else: timeout, DNS-shaped "fetch failed",
+    connection-refused, a 5xx status, or any other failure that carries no
+    4xx status code — these are transport-layer failures by elimination
+    (this also folds rare content-type/oversized-page rejections into the
+    network bucket, since they carry no status code either).
+
+    Args:
+        stderr: Captured stderr text from the defuddle subprocess (may be empty).
+
+    Returns:
+        "paywall" or "network".
+    """
+    m = _HTTP_STATUS_IN_STDERR.search(stderr or "")
+    if m and m.group(1).startswith("4"):
+        return "paywall"
+    return "network"
+
+
 def _run_defuddle(url: str, defuddle_exe: str, timeout: int = 60) -> str:
     """
     Run defuddle on a URL and return the extracted markdown text (D-08 / T-03-02).
@@ -1441,8 +1479,11 @@ def _run_defuddle(url: str, defuddle_exe: str, timeout: int = 60) -> str:
     Invokes defuddle as an argv list (never shell=True) so the URL is passed as a
     single literal token without shell-metacharacter expansion.
 
-    Raises RuntimeError on non-zero exit (content gated or unreachable) or on empty
-    stdout (D-08 Pitfall 2: defuddle exits 0 but produced nothing).
+    Raises RuntimeError on non-zero exit, with a message classified by
+    _classify_defuddle_failure (D-19): a paywall/bot-block phrasing when a 4xx
+    status is present in stderr, else a network-unreachable phrasing. Also
+    raises RuntimeError on empty stdout (D-08 Pitfall 2: defuddle exits 0 but
+    produced nothing).
     Lets subprocess.TimeoutExpired propagate to the caller for clean error handling.
     """
     result = subprocess.run(
@@ -1454,9 +1495,14 @@ def _run_defuddle(url: str, defuddle_exe: str, timeout: int = 60) -> str:
     )
     if result.returncode != 0:
         stderr = result.stderr.strip() if result.stderr else "(no stderr)"
+        if _classify_defuddle_failure(stderr) == "paywall":
+            raise RuntimeError(
+                f"web extraction failed — looks paywalled or bot-blocked, try the PDF "
+                f"or arXiv version: {url} (defuddle exit {result.returncode}: {stderr})"
+            )
         raise RuntimeError(
-            f"web extraction failed — content gated or unreachable: {url} "
-            f"(defuddle exit {result.returncode}: {stderr})"
+            f"web extraction failed — network unreachable, could not reach the site: "
+            f"{url} (defuddle exit {result.returncode}: {stderr})"
         )
     md = result.stdout
     if not md.strip():
@@ -2698,8 +2744,11 @@ def ingest_url(url: str, config: dict) -> dict:
     try:
         md_text = _run_defuddle(rewritten_url, defuddle_exe, timeout=defuddle_timeout)
     except subprocess.TimeoutExpired:
+        # D-19: our own defuddle_timeout kill is a transport failure, not a
+        # paywall signal (no HTTP response was ever received) -- network bucket.
         print(
-            f"[ingest error: defuddle timed out after {defuddle_timeout}s]",
+            f"[ingest error: network unreachable — could not reach the site within "
+            f"{defuddle_timeout}s]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2754,9 +2803,12 @@ def ingest_url(url: str, config: dict) -> dict:
             for block in section.get("blocks", [])
             if block.get("type") == "text"
         )
+        # D-19: defuddle succeeded here (exit 0) -- this is never a network failure,
+        # so it stays in the paywall/bot-block bucket; copy aligned with the
+        # _run_defuddle non-zero-exit paywall message for consistency.
         print(
-            f"[ingest error: web content too short — likely paywalled or abstract-only: "
-            f"{url} (body chars: {total} < {min_chars})]",
+            f"[ingest error: web content too short — looks paywalled or bot-blocked, "
+            f"try the PDF or arXiv version: {url} (body chars: {total} < {min_chars})]",
             file=sys.stderr,
         )
         sys.exit(1)
