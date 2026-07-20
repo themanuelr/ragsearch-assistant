@@ -38,6 +38,9 @@ Thumbs.db
 .vscode/
 .obsidian/
 
+# Personal/local scratch runner (D-22)
+run-ingest-tests.ps1
+
 # Claude Code per-machine settings and worktree state (not shared)
 .claude/settings.json
 .claude/settings.local.json
