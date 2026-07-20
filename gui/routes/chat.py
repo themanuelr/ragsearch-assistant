@@ -190,7 +190,14 @@ def _format_registry_metadata_line(entry: dict) -> str:
     return lead
 
 
-def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple:
+def _resolve_scope(
+    scope: str,
+    message: str,
+    notes: list,
+    config: dict,
+    chroma_query: str | None = None,
+    n_results: int = 5,
+) -> tuple:
     """Resolve the D-14/D-15 retrieval scope into
     ``(context_messages, sources, banner, truncation_notes, blocked)``.
 
@@ -202,6 +209,16 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
     none for this message (fail-open, matching pipeline conventions) and is
     surfaced as a visible banner instead of raising. ``blocked`` is always
     False on this path -- see the fail-open-vs-hard-block note below.
+
+    ``chroma_query`` (08.1-03, D-10) is an OPTIONAL retrieval-only query,
+    separate from the chat ``message`` -- a blank/whitespace value falls
+    back to ``message`` (today's behavior byte-unchanged). ``n_results``
+    (D-13) threads straight to ``_search``'s second arg; the caller
+    (``chat_send``) is responsible for clamping it to 1..20 before this
+    function is called (Security Domain, T-08.1-03-01) -- this function
+    does not re-clamp so a directly-called out-of-range value is visible to
+    a caller that deliberately wants it (e.g. a future CLI/test harness),
+    while the one HTTP-facing entry point always clamps first.
 
     scope == "vault" (D-15): ``notes`` are vault-relative paths the client
     submitted, but only accepted when they match an already-scanned paper's
@@ -228,7 +245,11 @@ def _resolve_scope(scope: str, message: str, notes: list, config: dict) -> tuple
     outcome there.
     """
     if scope == "chroma":
-        result = _search(message, 5, config)
+        # D-10: blank/whitespace-only chroma_query falls back to the chat
+        # message itself -- today's behavior, byte-unchanged when the box
+        # is left empty.
+        query = (chroma_query or "").strip() or message
+        result = _search(query, n_results, config)
         if result.get("error"):
             # D-14 fail-open: a _search error falls back to scope none for
             # this message, surfaced as a visible banner -- never a silent
@@ -343,6 +364,8 @@ def chat_send(
     model: str = Form(...),
     scope: str = Form("none"),
     notes: list = Form([]),
+    chroma_query: str = Form(""),
+    n_results: int = Form(5),
 ):
     from gui.app import templates
 
@@ -363,8 +386,14 @@ def chat_send(
 
     config = load_gui_config()
 
+    # D-13/T-08.1-03-01: HTML min/max is advisory only -- clamp server-side
+    # before n_results ever reaches _resolve_scope/_search, mirroring the
+    # is_busy re-check above (never trust a client-supplied constraint
+    # alone).
+    n_results = min(max(int(n_results), 1), 20)
+
     context_messages, sources, banner, truncation_notes, blocked = _resolve_scope(
-        scope, message, notes, config
+        scope, message, notes, config, chroma_query=chroma_query, n_results=n_results
     )
 
     if blocked:
@@ -413,11 +442,20 @@ def chat_send(
     # ever injected.
     llm_messages = transcript[:-1] + context_messages + transcript[-1:]
 
+    # D-12: the effective retrieval query (same blank-fallback rule as
+    # _resolve_scope's chroma branch) is stashed here so _sse_stream can
+    # persist it on the assistant message -- None for any non-chroma scope,
+    # never overloaded into `sources` (a list of per-excerpt dicts).
+    effective_chroma_query = (
+        (chroma_query or "").strip() or message if scope == "chroma" else None
+    )
+
     _PENDING[conv] = {
         "llm_messages": llm_messages,
         "sources": sources,
         "banner": banner,
         "truncation_notes": truncation_notes,
+        "chroma_query": effective_chroma_query,
     }
 
     return templates.TemplateResponse(
