@@ -2989,6 +2989,135 @@ def _write_doi_fallback_note(entry: dict, config: dict) -> dict:
     return entry
 
 
+# ---------------------------------------------------------------------------
+# Phase 08.1 Plan 05 (D-17, D-18): standalone --backfill-metadata self-heal.
+#
+# The live fill cascade (Step 10a+/10a++ above) already backfills fresh
+# ingests. This entrypoint self-heals an EXISTING vault: registry-hit papers
+# never re-enter the fill cascade, so a paper ingested before crossref_validate
+# was enabled keeps blank year/journal forever without this.
+# ---------------------------------------------------------------------------
+
+def _run_metadata_backfill(config: dict) -> dict:
+    """
+    Self-heal missing year/journal on already-ingested DOI-bearing papers (D-17, D-18).
+
+    Gated behind config["crossref_validate"] (offline-by-default preserved): when
+    false/absent, returns immediately with ZERO Crossref calls. Otherwise scans
+    the registry for entries belonging to config["project_name"] that carry a DOI
+    and are missing year and/or journal, resolves the missing field(s) via the
+    existing _crossref_journal_full / _crossref_published_year helpers, mutates
+    the FULL entry dict in place (Pitfall 5 — never a partial dict, which would
+    null title/authors/doi/summary for that key), and writes it back via
+    _write_registry. When a field was actually resolved, also patches the
+    matching vault note's frontmatter with the same year/journal (Pitfall 6 —
+    both stores) via note._patch_frontmatter_fields + obsidian_cli.create_note
+    (overwrite=True) — the sole vault write, never a raw open()/write_text().
+
+    Fails open per-entry: a None Crossref result just skips that field, and a
+    registry-write or note-patch exception for one entry is logged and never
+    aborts the whole backfill run.
+
+    Args:
+        config: Loaded config.json dict.
+
+    Returns:
+        {"checked": int, "updated": int, "skipped": int, "note": str | None}
+        checked: candidate entries (has doi, missing year and/or journal) that
+                 a Crossref lookup was attempted for.
+        updated: candidates where at least one field was actually filled.
+        skipped: candidates where the Crossref lookup(s) resolved to nothing
+                 (fail-open — the paper stays as-is, no error raised).
+        note:    human-readable no-op explanation when crossref_validate is
+                 false, else None.
+    """
+    if not config.get("crossref_validate", False):
+        return {
+            "checked": 0,
+            "updated": 0,
+            "skipped": 0,
+            "note": "crossref_validate is false -- backfill is a no-op (offline-by-default preserved)",
+        }
+
+    # Local import — ingest.py never imports note.py at module level (note.py
+    # imports FROM ingest.py); mirrors the existing registry cache-hit branch's
+    # local-import idiom (~L2229 `from scripts import note as note`).
+    from scripts import note as note
+    from scripts.obsidian_cli import create_note, note_exists, _vault_root
+
+    registry_path = config.get("registry_path") or ""
+    project_name = config.get("project_name")
+    registry = _read_registry(registry_path) if registry_path else {}
+
+    checked = 0
+    updated = 0
+    skipped = 0
+
+    for key, entry in registry.items():
+        projects = entry.get("projects") or []
+        if project_name and project_name not in projects:
+            continue
+        doi = entry.get("doi")
+        if not doi:
+            continue
+        missing_year = entry.get("year") is None
+        missing_journal = not entry.get("journal")
+        if not missing_year and not missing_journal:
+            continue  # already complete — not a candidate, zero Crossref calls
+
+        checked += 1
+        changed = False
+
+        if missing_journal:
+            full = _crossref_journal_full(doi, config)
+            if full is not None:
+                entry["journal"] = full
+                changed = True
+
+        if missing_year:
+            year = _crossref_published_year(doi, config)
+            if year is not None:
+                entry["year"] = year
+                changed = True
+
+        if not changed:
+            skipped += 1
+            continue
+
+        try:
+            _write_registry(entry, registry_path, key)
+        except Exception as e:
+            _log(f"backfill registry write failed for {key!r}: {e}")
+            skipped += 1
+            continue
+
+        # Pitfall 6: patch the matching vault note frontmatter too, so the
+        # registry and the note never disagree. Only include fields the entry
+        # actually carries a non-None/non-empty value for -- never write a
+        # bare "year: None" into frontmatter.
+        title = entry.get("title") or "Untitled"
+        rel_path = f"Papers/{note._sanitize_filename(title)}.md"
+        if note_exists(rel_path, config):
+            try:
+                note_target = _vault_root(config) / rel_path
+                note_content = note_target.read_text(encoding="utf-8")
+                scalar_updates = {}
+                if entry.get("year") is not None:
+                    scalar_updates["year"] = entry["year"]
+                if entry.get("journal"):
+                    scalar_updates["journal"] = entry["journal"]
+                patched = note._patch_frontmatter_fields(
+                    note_content, scalar_updates=scalar_updates
+                )
+                create_note(rel_path, patched, config, overwrite=True)
+            except Exception as e:
+                _log(f"backfill note patch failed for {rel_path!r}: {e}")
+
+        updated += 1
+
+    return {"checked": checked, "updated": updated, "skipped": skipped, "note": None}
+
+
 def _ingest_by_doi(doi_arg: str, config: dict) -> dict | None:
     """
     Materialize a note for a paper already in the registry, without
@@ -3137,6 +3266,16 @@ if __name__ == "__main__":
             "(by DOI, arXiv id, or title) without re-processing the PDF."
         ),
     )
+    source_group.add_argument(
+        "--backfill-metadata",
+        action="store_true",
+        help=(
+            "Self-heal missing year/journal on already-ingested DOI-bearing papers "
+            "in the registry AND their vault notes (D-17/D-18). Gated behind "
+            "config.json's crossref_validate flag -- a no-op with zero network calls "
+            "when that flag is false (offline-by-default preserved)."
+        ),
+    )
     parser.add_argument(
         "--force-extract",
         action="store_true",
@@ -3196,6 +3335,12 @@ if __name__ == "__main__":
             result = _ingest_by_doi(args.doi, config)
             if result is None:
                 sys.exit(1)  # D-18: registry miss -- error already printed, no note, no fetch
+        elif args.backfill_metadata:
+            # Standalone self-heal entrypoint (D-17/D-18) -- no note-confirmation
+            # build, no ingest. Prints the {checked, updated, skipped, note} summary
+            # and exits immediately.
+            print(_run_metadata_backfill(config))
+            sys.exit(0)
 
         # Build a short confirmation: cache path + written note path.
         # Used by the default (non --print) stdout branch; never aborts the run on failure.
