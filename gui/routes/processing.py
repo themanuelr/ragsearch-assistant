@@ -21,7 +21,7 @@ never a second job-spawning path (T-08-02).
 """
 
 import pathlib
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import PlainTextResponse
@@ -176,6 +176,41 @@ def processing_ingest_url(request: Request, url: Optional[str] = Form(None)):
     argv = gui_jobs.build_action_argv("ingest_url", config, url=value)
     job_id = gui_jobs.enqueue("ingest_url", argv)
     return _job_status_response(request, gui_jobs.get(job_id))
+
+
+@router.post("/processing/retag")
+def processing_retag(
+    request: Request,
+    registry_keys: List[str] = Form([]),
+    context: Optional[str] = Form(None),
+):
+    """Enqueue one retag job per selected paper (D-09). ``registry_keys``
+    arrives as a multi-select from the shared checkbox picker
+    (``paper_picker.html``'s ``select_mode="checkbox"`` rows) -- resolved as
+    opaque registry dict keys via ``scan_paper``, never a filesystem path
+    (T-08-06-01). A key with no matching registry entry is skipped rather
+    than aborting the whole batch (mirrors ``scan_paper``'s own None-on-miss
+    contract). Order is preserved from the submitted list; the strict FIFO
+    queue (D-06) serializes execution. ``context`` (free text) is threaded
+    into every enqueued job identically (T-08.1-06-02: single argv element,
+    never a shell string)."""
+    config = load_gui_config()
+
+    if not registry_keys:
+        return _form_error_response(request, "Select at least one paper to retag.")
+
+    job_list = []
+    for key in registry_keys:
+        paper = scan_paper(config, key)
+        if paper is None:
+            continue
+        argv = gui_jobs.build_action_argv(
+            "retag", config, stem=paper["stem"], context=(context or None)
+        )
+        job_id = gui_jobs.enqueue("retag", argv)
+        job_list.append(gui_jobs.get(job_id))
+
+    return _job_status_list_response(request, job_list)
 
 
 @router.post("/processing/orchestrate")

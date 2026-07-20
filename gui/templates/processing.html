@@ -133,6 +133,37 @@
   </section>
 
   <section class="section-gap">
+    <h2>Retag</h2>
+    <p class="settings-hint">Re-tag one or more already-ingested papers along a new axis. Existing tags are never removed — only new distinct topics are appended (D-06).</p>
+    <form hx-post="/processing/retag" hx-target="#retag-status" hx-swap="innerHTML">
+      <div class="settings-field">
+        <label>Papers</label>
+        {# Shared paper picker (D-01..D-05, Phase 08.1 Plan 01), checkbox
+           mode (D-09/D-16): a SECOND mount of the same partial as
+           orchestration's radio picker above, distinguished by its own
+           ``target_id`` so search/page-size/pagination swaps never collide
+           with #orch-picker-results. Loaded via hx-trigger="load" (not a
+           synchronous {% include %}) since this section renders below the
+           already-synchronous orchestration picker and doesn't need to be
+           in the very first response byte. The rows (name="registry_keys")
+           land inside THIS <form> so all checked keys submit together. #}
+        <div id="retag-picker-results"
+             hx-get="/papers/picker?scope=project&select_mode=checkbox"
+             hx-trigger="load"
+             hx-vals='{"target_id": "retag-picker-results"}'>
+        </div>
+      </div>
+      <div class="settings-field">
+        <label for="retag-context">Context (optional)</label>
+        <input type="text" id="retag-context" name="context"
+               placeholder="Optional tagging axis, e.g. methods-focused tagging">
+      </div>
+      <button type="submit" class="btn">Retag Selected</button>
+    </form>
+    <div id="retag-status" class="section-gap"></div>
+  </section>
+
+  <section class="section-gap">
     <h2>Bulk Actions</h2>
     <div class="bulk-actions">
       <button type="button" class="btn"
