@@ -558,6 +558,89 @@ def test_processing_orchestration_leads_bulk_actions_with_radio_picker(gui_clien
     assert 'name="force_extract"' in text
 
 
+def _fake_scan_paper_by_key(stems_by_key):
+    """Fake gui.scan.scan_paper: returns {"stem": ...} for a known registry
+    key, None otherwise -- mirrors the real opaque-key-lookup contract
+    without touching the registry file on disk."""
+    def _fake(config, registry_key):
+        stem = stems_by_key.get(registry_key)
+        if stem is None:
+            return None
+        return {"stem": stem}
+    return _fake
+
+
+# ---------------------------------------------------------------------------
+# 08.1-06 (D-09, D-16): POST /processing/retag + Retag checkbox picker
+# section. RED until Tasks 2/3 add the "retag" argv branch and the route +
+# template section.
+# ---------------------------------------------------------------------------
+
+def test_retag_enqueues_one_job_per_selected_key_in_order(gui_client, gui_config, monkeypatch):
+    _patch_processing_config(monkeypatch, gui_config)
+    monkeypatch.setattr(
+        processing_routes, "scan_paper",
+        _fake_scan_paper_by_key({"key-a": "stem-a", "key-b": "stem-b"}),
+    )
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/retag",
+        data={"registry_keys": ["key-a", "key-b"]},
+    )
+
+    assert resp.status_code == 200
+    calls = captured["calls"]
+    assert len(calls) == 2
+    assert all(c["action"] == "retag" for c in calls)
+    assert "stem-a" in calls[0]["argv"]
+    assert "stem-b" in calls[1]["argv"]
+
+
+def test_retag_zero_selected_keys_returns_form_error_and_enqueues_nothing(gui_client, gui_config, monkeypatch):
+    _patch_processing_config(monkeypatch, gui_config)
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post("/processing/retag", data={})
+
+    assert resp.status_code == 200
+    assert captured["calls"] == []
+    assert "select" in resp.text.lower()
+
+
+def test_retag_context_field_threaded_into_each_job(gui_client, gui_config, monkeypatch):
+    _patch_processing_config(monkeypatch, gui_config)
+    monkeypatch.setattr(
+        processing_routes, "scan_paper",
+        _fake_scan_paper_by_key({"key-a": "stem-a", "key-b": "stem-b"}),
+    )
+    captured = _capturing_enqueue(monkeypatch)
+
+    resp = gui_client.post(
+        "/processing/retag",
+        data={"registry_keys": ["key-a", "key-b"], "context": "methods-focused tagging"},
+    )
+
+    assert resp.status_code == 200
+    assert len(captured["calls"]) == 2
+    for call in captured["calls"]:
+        assert "--context" in call["argv"]
+        assert "methods-focused tagging" in call["argv"]
+
+
+def test_processing_page_has_retag_checkbox_picker_section(gui_client, gui_config, monkeypatch):
+    gui_config["project_name"] = "proj-a"
+    _patch_processing_config(monkeypatch, gui_config)
+
+    resp = gui_client.get("/processing")
+
+    assert resp.status_code == 200
+    text = resp.text
+    assert "Retag" in text
+    assert 'id="retag-picker-results"' in text
+    assert "/papers/picker?scope=project&select_mode=checkbox" in text
+
+
 def test_orchestrate_enqueue_still_honors_note_force_flags_after_reorg(gui_client, gui_config, monkeypatch):
     """POST /processing/orchestrate keeps reading registry_key + note_force +
     note_force_analysis unchanged -- only the selector's markup source

@@ -85,6 +85,7 @@ def test_build_action_argv_all_actions_return_list_starting_with_python():
         ("embed_all", {}, "embed.py"),
         ("link_all", {}, "link.py"),
         ("setup", {}, "setup.py"),
+        ("retag", {"stem": "my-stem"}, "retag.py"),
     ]
     for action, params, script_name in cases:
         argv = jobs.build_action_argv(action, config, **params)
@@ -157,6 +158,36 @@ def test_build_action_argv_note_no_flags_matches_todays_argv_exactly():
     assert argv[0] == sys.executable
     assert argv[1].endswith("note.py")
     assert argv[2:] == ["--stem", "my-stem"]
+
+
+# ---------------------------------------------------------------------------
+# 08.1-06 (D-09): 'retag' argv branch -- mirrors the note/biblio branch shape
+# (build_action_argv is the single argv-building chokepoint, T-08-02).
+# ---------------------------------------------------------------------------
+
+def test_build_action_argv_retag_stem_targets_retag_script():
+    argv = jobs.build_action_argv("retag", {}, stem="X")
+    assert argv[0] == sys.executable
+    assert argv[1].endswith("retag.py")
+    assert argv[2:] == ["--stem", "X"]
+
+
+def test_build_action_argv_retag_paperjson_uses_paperjson_flag_not_stem():
+    argv = jobs.build_action_argv("retag", {}, paperjson="p.json")
+    assert "--paperjson" in argv
+    assert "p.json" in argv
+    assert argv.index("p.json") == argv.index("--paperjson") + 1
+    assert "--stem" not in argv
+
+
+def test_build_action_argv_retag_context_appends_context_flag():
+    argv = jobs.build_action_argv("retag", {}, stem="X", context="methods")
+    assert argv[-2:] == ["--context", "methods"]
+
+
+def test_build_action_argv_retag_no_context_omits_context_flag():
+    argv = jobs.build_action_argv("retag", {}, stem="X")
+    assert "--context" not in argv
 
 
 # ---------------------------------------------------------------------------
