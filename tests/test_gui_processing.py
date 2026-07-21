@@ -538,11 +538,22 @@ def test_processing_orchestration_leads_bulk_actions_with_radio_picker(gui_clien
     assert resp.status_code == 200
     text = resp.text
 
-    # (a) D-14: per-paper orchestration renders ABOVE Bulk Actions -- compare
-    # byte offsets of two stable section headings.
-    orchestration_idx = text.index("Per-Paper Orchestration")
-    bulk_idx = text.index("Bulk Actions")
-    assert orchestration_idx < bulk_idx, "Per-Paper Orchestration must render before Bulk Actions (D-14)"
+    # (a) D-14: per-paper orchestration leads Bulk Actions -- under the tabbed
+    # layout every panel coexists (hidden) in one document, so the literal
+    # "Bulk Actions" nav link necessarily precedes the "Per-Paper Orchestration"
+    # heading. The real "orchestration leads" signal is the tab STRUCTURE: the
+    # orchestration nav link/panel must precede the bulk nav link/panel in
+    # source order (both nav data-tab order and panel id order).
+    nav_orchestration_idx = text.index('data-tab="tab-orchestration"')
+    nav_bulk_idx = text.index('data-tab="tab-bulk"')
+    assert nav_orchestration_idx < nav_bulk_idx, (
+        "D-14: per-paper orchestration tab must lead Bulk Actions tab in nav order"
+    )
+    panel_orchestration_idx = text.index('id="tab-orchestration"')
+    panel_bulk_idx = text.index('id="tab-bulk"')
+    assert panel_orchestration_idx < panel_bulk_idx, (
+        "D-14: per-paper orchestration panel must lead Bulk Actions panel in source order"
+    )
 
     # (b) D-16: the orchestration selector IS the shared picker (radio mode),
     # not a divergent plain <select name="registry_key"> inline option list.
