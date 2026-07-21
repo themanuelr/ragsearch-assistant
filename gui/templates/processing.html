@@ -149,7 +149,7 @@
   <section class="tab-panel" id="tab-retag" hidden>
     <h2>Retag</h2>
     <p class="settings-hint">Re-tag one or more already-ingested papers along a new axis. Existing tags are never removed — only new distinct topics are appended (D-06).</p>
-    <form hx-post="/processing/retag" hx-target="#retag-status" hx-swap="innerHTML">
+    <form hx-post="/processing/retag" hx-target="#retag-status" hx-swap="innerHTML" hx-include="[name='registry_keys']">
       <div class="settings-field">
         <label>Papers</label>
         {# Shared paper picker (D-01..D-05, Phase 08.1 Plan 01), checkbox
