@@ -51,7 +51,7 @@
 
   <section class="tab-panel" id="tab-orchestration" hidden>
     <h2>Per-Paper Orchestration</h2>
-    <form hx-post="/processing/orchestrate" hx-target="#orchestrate-status" hx-swap="innerHTML">
+    <form hx-post="/processing/orchestrate" hx-target="#orchestrate-status" hx-swap="innerHTML" hx-include="[name='registry_key']">
       <div class="settings-field">
         <label>Paper</label>
         {# Shared paper picker (D-01..D-05, Phase 08.1 Plan 01), radio mode
