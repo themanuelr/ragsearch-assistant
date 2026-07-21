@@ -24,6 +24,7 @@
 {% set target_id = target_id | default("picker-results") %}
 <div class="picker-controls">
   <input type="search" name="q" value="{{ q }}"
+         id="{{ target_id }}-q" hx-preserve="true"
          placeholder="Search title, authors, journal, year..."
          hx-get="/papers/picker"
          hx-trigger="keyup changed delay:300ms"
