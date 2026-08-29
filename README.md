@@ -18,7 +18,7 @@ re-processed from scratch.
 |---|---|---|
 | Python | 3.10+ (3.14.4 tested) | Runs the main pipeline (`scripts/`) |
 | Ollama | running at `http://localhost:11434` | Local LLM server — analysis and embeddings |
-| MinerU | 3.2.3 | PDF structure extraction — needs its **own** Python env, see below |
+| [MinerU](https://github.com/opendatalab/MinerU) | 3.2.3 | PDF structure extraction — needs its **own** Python env, see below |
 | Node.js + defuddle | Node v24 tested, defuddle 0.19.1 | Web-page → markdown extraction for URL ingestion |
 | Obsidian desktop | any recent version | Optional — for viewing the vault only; notes are written directly as `.md` files |
 
