@@ -34,8 +34,9 @@ tokens by default (`ollama_num_ctx_cap`) to stay within that budget.
    pip install -r requirements.txt
    ```
 
-   This installs the runtime dependencies (`mcp`, `ddgs`, `filelock`, `chromadb`, `pydantic`) and
-   `pytest`, which the verification step below needs.
+   This installs the runtime dependencies (`mcp`, `ddgs`, `filelock`, `chromadb`, `pydantic`), the
+   local web GUI's stack (`fastapi`, `uvicorn`, `jinja2`, `markdown`, `httpx`), and `pytest`, which
+   the verification step below needs.
 
 3. **Install Ollama and pull the two required models:**
 
@@ -64,7 +65,22 @@ tokens by default (`ollama_num_ctx_cap`) to stay within that budget.
    `defuddle` is located automatically via `PATH`, or you can set `defuddle_path` explicitly in
    `config.json`.
 
-6. **Configure the project:**
+6. **Configure the project.** The repo ships an interactive bootstrap that does this step for you:
+
+   ```bash
+   python scripts/setup.py
+   ```
+
+   Run with no flags for interactive prompts (Enter-through defaults), or pass `--vault-path`,
+   `--registry-path`, and `--project-name` directly (`--non-interactive` to never prompt,
+   `--force` to proceed past a path-safety refusal). It writes `config.json`, scaffolds a working
+   Obsidian vault at `vault_path` from `obsidian-vault-template/` — the `Papers/`, `Stubs/`, and
+   `Topics/` folders, the `_Papers.base` table view, and a preconfigured Obsidian theme and plugin
+   setup, never overwriting a file that already exists there — pulls the two required Ollama
+   models, initializes ChromaDB, and creates an empty `papers_registry.json` if one isn't already
+   present. Finish by opening the vault folder in Obsidian ("Open folder as vault").
+
+   Alternatively, configure by hand:
 
    ```bash
    cp config.example.json config.json
@@ -83,10 +99,12 @@ keys, grouped by area:
 - `registry_path` — path to the shared global papers registry JSON (shared across all your project clones)
 - `vault_path` — path to this project's Obsidian vault
 - `project_name` — slug identifying this project in the global registry's `projects` list
+- `paperjson_cache_dir` — shared PaperJSON cache directory, a sibling of the registry reused across all your project clones (default: `~/research/paperjson_cache`)
 
 **PDF extraction**
 - `mineru_path` — path to the MinerU executable (in its own Python 3.10–3.13 env — see Setup step 4)
 - `mineru_timeout` — MinerU subprocess timeout in seconds (default: `1800`)
+- `mineru_output_dir` — shared MinerU extraction output directory, a sibling of the registry reused across all your project clones (default: `~/research/mineru_output`)
 
 **Web ingestion**
 - `defuddle_path` — path to the defuddle executable (empty = resolved via `PATH`)
@@ -109,6 +127,10 @@ keys, grouped by area:
 - `crossref_contact_email` — a real contact email, required by Crossref's API etiquette if you enable `crossref_validate`; a placeholder is treated as "skip Crossref" (default: `""`)
 - `crossref_timeout` — Crossref request timeout in seconds (default: `30`)
 - `crossref_retries` — number of retry attempts on transient Crossref errors (default: `1`)
+
+**Web GUI**
+- `gui_port` — port the local web GUI binds to at `127.0.0.1` (default: `8765`)
+- `uningested_dir` — drop-folder directory the GUI's Processing page scans for PDFs waiting to be ingested (default: `./uningestedPDFs`)
 
 ## Verify your setup
 
@@ -168,6 +190,23 @@ python scripts/ingest.py --pdf path/to/paper.pdf
 python scripts/ingest.py --url https://arxiv.org/abs/xxxx.xxxxx
 ```
 
+**Other pipeline commands.** `ingest.py` drives the full pipeline end to end, but each stage is
+also its own re-runnable script — useful for regenerating one stage without repeating the others.
+Pass `--help` to any of them for the full flag list.
+
+| Command | Purpose |
+|---|---|
+| `python scripts/note.py --stem <stem> [--force] [--force-analysis]` | Regenerate a note from its cached PaperJSON, optionally overwriting an existing note or re-running the analysis calls. |
+| `python scripts/biblio.py --stem <stem>` | Re-run bibliography linking for a cached PaperJSON. |
+| `python scripts/embed.py <paperjson-path>` | Embed one PaperJSON's sections into the ChromaDB index. |
+| `python scripts/embed.py --all` | Backfill: idempotently embed every not-yet-embedded registry paper, cache file, and stub. |
+| `python scripts/embed.py --query "..." [--n-results N]` | Run a semantic search query against the local ChromaDB index and print ranked results (default 5). |
+| `python scripts/link.py --stem <stem>` | Rebuild the topic graph for one paper; `--all`/`--refresh` rebuilds it for the whole vault. |
+| `python scripts/retag.py --stem <stem> [--context "..."]` | Additively re-tag an already-ingested paper along a new axis, then re-link. |
+
+`scripts/obsidian_cli.py` is the internal vault-write chokepoint every script above writes
+through — it has no CLI of its own.
+
 ## How it works
 
 - **PDF extraction:** MinerU parses the PDF's structure (title, sections, references, layout) via a subprocess call.
@@ -177,8 +216,36 @@ python scripts/ingest.py --url https://arxiv.org/abs/xxxx.xxxxx
 - **Semantic search:** each note's sections are embedded (`nomic-embed-text` via Ollama) and stored in a local ChromaDB collection for retrieval by meaning, not just keyword.
 - **Topic graph:** shared topics across papers are linked via Obsidian wikilinks, with per-topic index notes kept in sync.
 
-`mcp-ollama/` is the MCP server component exposing these capabilities to Claude Code; its own
-dependencies (`mcp`, `ddgs`) are already covered by the root `requirements.txt`.
+`mcp-ollama/` is the MCP server component exposing these capabilities to Claude Code, as five
+tools: `ask_local_model` (send a one-off prompt to the local LLM), `research` (autonomous
+multi-search web research synthesized by the local LLM), `check_ollama_status` (verify Ollama is
+reachable and list available models), `process_pdf` (run the ingest pipeline on a PDF and return
+its PaperJSON), and `search_similar` (run a semantic search query against the vault's embedded
+papers). Its own dependencies (`mcp`, `ddgs`) are already covered by the root `requirements.txt`.
+
+## Web GUI
+
+Everything above is also reachable through a local web interface — a front-end over the same
+scripts documented above, not a parallel implementation.
+
+```bash
+python scripts/gui.py
+# or: python scripts/gui.py --port 9000 --no-browser
+```
+
+It binds to `127.0.0.1` only, never `0.0.0.0` — reachable from this machine alone, never from the
+network. The listen port defaults to `gui_port` in `config.json` (`8765`) and can be overridden
+with `--port`; `--no-browser` skips auto-opening a browser tab.
+
+| Page | What it's for |
+|---|---|
+| Overview (Project) | Live per-paper pipeline-stage visibility for this project's vault, plus the drop-folder's pending PDFs. |
+| Overview (Universal) | Read-only view of the shared global papers registry across every clone, with an "Import into This Project" action. |
+| Processing | Ingest a PDF or URL, bulk-ingest a drop folder, re-run any subset of note/biblio/embed/link for a single paper in a chosen order, and retag papers along a new axis. |
+| Chat | Streaming chat against a local Ollama model, with retrieval scoped to the ChromaDB semantic index, a set of vault notes, or no retrieval at all. |
+| Logs & Activity | The live job queue and per-job log streaming for every pipeline action run from the GUI. |
+| Docs & Help | This README and the other project docs, rendered in-app. |
+| Settings | An in-browser editor for `config.json`, with confirmation before repointing any data path that already holds data. |
 
 ## Privacy
 
