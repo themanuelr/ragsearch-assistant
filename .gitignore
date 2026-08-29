@@ -72,3 +72,6 @@ STARTING_POINT.md
 
 # GUI drop folder (Phase 8, D-10) -- *.pdf already covers its contents
 uningestedPDFs/
+
+# GSD planning journal — kept local-only, not published in this public/CV-facing repo
+.planning/
