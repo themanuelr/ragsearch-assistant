@@ -3,8 +3,9 @@
 A local-first, AI-powered research management system that ingests scientific papers (PDF or web
 URL), transforms them into structured Obsidian notes, connects them through shared topics and
 citations, and enables semantic retrieval — all running on a local LLM with **zero per-query API
-cost**. Drop a PDF or arXiv URL and get a fully linked Obsidian note — summary, findings, topic
-connections, and bibliography — without touching the cloud.
+cost**, driven from the command line or a local web GUI. Drop a PDF or arXiv URL and get a fully
+linked Obsidian note — summary, findings, topic connections, and bibliography — without touching
+the cloud.
 
 This repo is a **GitHub template**: clone it once per research project, configure the vault path,
 and it's ready. Each project is fully isolated (its own vault, its own ChromaDB), but every clone
