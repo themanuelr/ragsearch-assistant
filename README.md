@@ -186,3 +186,9 @@ All paper content stays local. Nothing is sent to external APIs. The only option
 beyond Ollama (localhost) is Crossref metadata enrichment, which is off by default
 (`crossref_validate: false`) and, when enabled, sends only bibliographic metadata — never paper
 content.
+
+## License
+
+This project is released under the MIT License, copyright (c) 2026 Manuel Munevar — see the
+`LICENSE` file at the repository root for the full text. As a clone-per-project template, you
+are free to use, modify, and redistribute it under those terms.
